@@ -1,0 +1,5 @@
+.header-dropdown-trigger { display:flex; align-items:center; gap:5px; min-height:50px; padding:0 12px; border:0; background:transparent; color:inherit; font:inherit; cursor:pointer; white-space:nowrap; }
+.header-dropdown-trigger svg { font-size:18px; }
+.header-dropdown-trigger:hover,.header-dropdown-trigger.is-open { background:#102b46; color:#70c9fa; }
+.header-dropdown-trigger.is-open svg:last-child { transform:rotate(180deg); }
+.header-dropdown-trigger:focus-visible { outline:2px solid #19a9f5; outline-offset:-2px; }
