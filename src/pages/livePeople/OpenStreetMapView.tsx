@@ -23,7 +23,7 @@ const mapStyles: Record<OpenStreetMapStyle, { url: string; attribution: string }
 }
 
 export default function OpenStreetMapView({ devices, selectedId, showNames, aggregate, mapStyle }: {
-  devices: Device[]; selectedId: number | null; showNames: boolean; aggregate: boolean; mapStyle: OpenStreetMapStyle
+  devices: Device[]; selectedId: number | string | null; showNames: boolean; aggregate: boolean; mapStyle: OpenStreetMapStyle
 }) {
   const root = useRef<HTMLDivElement>(null)
   const canvas = useRef<HTMLDivElement>(null)
@@ -31,9 +31,17 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
   const markers = useRef<L.LayerGroup | null>(null)
   const tileLayer = useRef<L.TileLayer | null>(null)
 
+  const located = devices.filter(device => device.last_latitude != null && device.last_longitude != null && Number.isFinite(device.last_latitude) && Number.isFinite(device.last_longitude))
+
   useEffect(() => {
     if (!canvas.current) return
-    const instance = L.map(canvas.current, { zoomControl: false }).setView([17.4483, 78.3915], 14)
+    const first = located[0]
+    const initialCenter: [number, number] = first
+      ? [first.last_latitude!, first.last_longitude!]
+      : [20.5937, 78.9629]
+    const initialZoom = first ? 15 : 4
+
+    const instance = L.map(canvas.current, { zoomControl: false }).setView(initialCenter, initialZoom)
     L.control.zoom({ position: 'topright' }).addTo(instance)
     map.current = instance
     markers.current = L.layerGroup().addTo(instance)
@@ -68,6 +76,11 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
 
   return <Box ref={root} sx={{ position: 'relative', width: '100%', height: '100%', minHeight: 520, zIndex: 0, '&:fullscreen': { height: '100vh', width: '100vw' } }}>
     <Box ref={canvas} aria-label="Device location map" sx={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }} />
+    {located.length === 0 && (
+      <Box sx={{ position: 'absolute', top: 20, left: 20, zIndex: 1000, bgcolor: 'rgba(15, 23, 42, 0.85)', color: '#f8fafc', px: 2, py: 1, borderRadius: 1, fontSize: 13, border: '1px solid rgba(255,255,255,0.2)', boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
+        No GPS Fix Available
+      </Box>
+    )}
     <IconButton aria-label="Expand map to full screen" onClick={() => { if (document.fullscreenElement) void document.exitFullscreen().catch(() => {}); else void root.current?.requestFullscreen().catch(() => {}) }} sx={{ position: 'absolute', right: 10, top: 85, zIndex: 1000, bgcolor: '#fff', border: '1px solid #bbb', borderRadius: .5, '&:hover': { bgcolor: '#f4f4f4' } }}><FullscreenOutlined /></IconButton>
   </Box>
 }

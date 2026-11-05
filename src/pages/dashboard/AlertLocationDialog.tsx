@@ -32,9 +32,11 @@ export default function AlertLocationDialog({
   const [mapType, setMapType] = useState<'m' | 'k'>('m') // 'm' = Roadmap, 'k' = Satellite
   const [showLayerMenu, setShowLayerMenu] = useState<boolean>(false)
 
-  const latitude = alert?.latitude ?? device?.last_latitude ?? 17.446317
-  const longitude = alert?.longitude ?? device?.last_longitude ?? 78.368395
-  const hasLocation = latitude !== null && longitude !== null && Number.isFinite(latitude) && Number.isFinite(longitude)
+  const rawLat = alert?.latitude ?? device?.last_latitude
+  const rawLon = alert?.longitude ?? device?.last_longitude
+  const hasLocation = rawLat != null && rawLon != null && Number.isFinite(rawLat) && Number.isFinite(rawLon)
+  const latitude = hasLocation ? Number(rawLat) : 0
+  const longitude = hasLocation ? Number(rawLon) : 0
 
   const personOrDeviceName =
     (device as any)?.custody_person_name ||
@@ -43,12 +45,13 @@ export default function AlertLocationDialog({
     (alert as any)?.person_name ||
     device?.device_name ||
     alert?.device_name ||
-    (alert?.device_id ? 'prisoner2' : 'prisoner2')
+    device?.serial_number ||
+    (alert?.device_id ? `Device #${alert.device_id}` : 'N/A')
 
-  const imei = device?.imei || alert?.imei || '863758061830955'
+  const imei = device?.imei || alert?.imei || device?.serial_number || 'N/A'
   const batteryPct = device?.battery_pct ?? (alert as any)?.battery_pct ?? (alert as any)?.battery ?? null
-  const alertType = alert?.message || alert?.type || 'Warning! Device is offline'
-  const alertTime = alert?.created_at ? formatTime(alert.created_at) : '2026-10-22 19:31:45'
+  const alertType = alert?.message || alert?.type || 'Device Alert'
+  const alertTime = alert?.created_at ? formatTime(alert.created_at) : 'N/A'
 
   // Fetch human-readable street address via Nominatim
   useEffect(() => {
@@ -148,22 +151,29 @@ export default function AlertLocationDialog({
             overflow: 'hidden',
           }}
         >
-          {/* Real Google Map View */}
-          <iframe
-            key={googleMapsEmbedUrl}
-            title={'Location Map for ' + personOrDeviceName}
-            src={googleMapsEmbedUrl}
-            width="100%"
-            height="100%"
-            style={{
-              border: 0,
-              display: 'block',
-              width: '100%',
-              height: '100%',
-            }}
-            loading="eager"
-            allowFullScreen
-          />
+          {/* Real Google Map View or No GPS Notice */}
+          {hasLocation ? (
+            <iframe
+              key={googleMapsEmbedUrl}
+              title={'Location Map for ' + personOrDeviceName}
+              src={googleMapsEmbedUrl}
+              width="100%"
+              height="100%"
+              style={{
+                border: 0,
+                display: 'block',
+                width: '100%',
+                height: '100%',
+              }}
+              loading="eager"
+              allowFullScreen
+            />
+          ) : (
+            <Box sx={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', bgcolor: '#f8fafc', color: '#64748b', gap: 1 }}>
+              <Typography variant="body1" sx={{ fontWeight: 600 }}>No GPS Fix Available</Typography>
+              <Typography variant="body2" sx={{ color: '#94a3b8' }}>This device alert does not contain valid latitude/longitude coordinates.</Typography>
+            </Box>
+          )}
 
           {/* Reference Overlay Info Card (matches photo 2 exactly) */}
           {infoOpen && (

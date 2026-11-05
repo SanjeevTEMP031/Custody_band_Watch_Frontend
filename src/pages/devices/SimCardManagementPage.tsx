@@ -49,68 +49,7 @@ export interface SimCardRecord {
   locked: boolean
 }
 
-const initialSimCards: SimCardRecord[] = [
-  {
-    id: 1,
-    iccid: '8991404018309550012F',
-    phone_number: '+91 98765 43210',
-    imei: '863758061830955',
-    device_name: 'Custody Band #863758061830955',
-    company: 'Trackin360 Global',
-    carrier: 'Airtel IoT Enterprise',
-    plan_data_gb: 10,
-    used_data_gb: 2.4,
-    activation_date: '2026-01-15',
-    expiration_date: '2027-01-15',
-    status: 'Normal',
-    locked: true,
-  },
-  {
-    id: 2,
-    iccid: '8991404018309550013A',
-    phone_number: '+91 98765 43211',
-    imei: '863758061830956',
-    device_name: 'Band #863758061830956',
-    company: 'State Judicial Dept',
-    carrier: 'Jio Enterprise IoT',
-    plan_data_gb: 5,
-    used_data_gb: 4.8,
-    activation_date: '2026-02-01',
-    expiration_date: '2026-12-31',
-    status: 'Normal',
-    locked: false,
-  },
-  {
-    id: 3,
-    iccid: '8991404018309550014B',
-    phone_number: '+91 98765 43212',
-    imei: '',
-    device_name: 'Unassigned SIM Stock',
-    company: 'Trackin360 Global',
-    carrier: 'Vodafone Idea IoT',
-    plan_data_gb: 5,
-    used_data_gb: 0.0,
-    activation_date: '2026-03-10',
-    expiration_date: '2027-03-10',
-    status: 'Not Activated',
-    locked: false,
-  },
-  {
-    id: 4,
-    iccid: '8991404018309550015C',
-    phone_number: '+91 98765 43213',
-    imei: '863758061830958',
-    device_name: 'Custody Band #863758061830958',
-    company: 'Correctional Facility North',
-    carrier: 'Airtel IoT Enterprise',
-    plan_data_gb: 10,
-    used_data_gb: 10.0,
-    activation_date: '2025-10-01',
-    expiration_date: '2026-10-01',
-    status: 'Expired',
-    locked: true,
-  },
-]
+const initialSimCards: SimCardRecord[] = []
 
 export default function SimCardManagementPage() {
   const [simCards, setSimCards] = useState<SimCardRecord[]>(initialSimCards)

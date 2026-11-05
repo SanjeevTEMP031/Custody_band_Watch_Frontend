@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import LandingMap from './LandingMap';
 import HeroMapCard from './HeroMapCard';
+import { subscribeToDevices } from '../../lib/firebase';
+import type { Device } from '../../services/api';
 import './LandingPage.css';
 
 const navItems = [
@@ -124,37 +126,38 @@ function Brand({ light = false }) {
 
 function LandingPage() {
   const [menuOpen, setMenuOpen] = useState(false);
-  const [liveStats, setLiveStats] = useState({
-    total_devices: 2450,
-    online_devices: 2448,
-    battery: 92,
-    heartRate: 72,
-    steps: 4120,
-    wearer: 'Assigned Subject (Case #CASE-C05-01)',
-    lat: 47.6097,
-    lon: -122.3331
-  });
+  const [firstDevice, setFirstDevice] = useState<Device | null>(null);
+  const [fleetCounts, setFleetCounts] = useState({ total: 0, online: 0 });
 
   useEffect(() => {
-    fetch('/api/v1/devices')
-      .then(res => res.json())
-      .then(data => {
-        const list = Array.isArray(data) ? data : (data.value || []);
-        if (list.length > 0) {
-          const d = list[0];
-          setLiveStats({
-            total_devices: list.length,
-            online_devices: list.filter((x: any) => x.connection_status === 'online').length || 1,
-            battery: d.battery_percent ?? 63,
-            heartRate: d.heart_rate_bpm ?? 81,
-            steps: d.steps ?? 1834,
-            wearer: d.wearer_name ? `${d.wearer_name} (Case #${d.case_number || 'CASE-C05-01'})` : 'Assigned Subject (Case #CASE-C05-01)',
-            lat: 47.6097,
-            lon: -122.3331
-          });
-        }
-      })
-      .catch(() => { });
+    const unsubscribe = subscribeToDevices(
+      (deviceList) => {
+        const onlineCount = deviceList.filter(
+          d => d.status === 'active' || d.status === 'online' || (d as any).connection_status === 'online'
+        ).length;
+        setFleetCounts({ total: deviceList.length, online: onlineCount });
+        const located = deviceList.filter(d => d.last_latitude != null && d.last_longitude != null);
+        setFirstDevice(located[0] ?? deviceList[0] ?? null);
+      },
+      () => {
+        // Fallback to REST API if Firestore listener cannot connect
+        fetch('/api/v1/devices')
+          .then(res => res.json())
+          .then(data => {
+            const list = Array.isArray(data) ? data : (data.value || []);
+            const onlineCount = list.filter((x: any) => x.connection_status === 'online' || x.status === 'active').length;
+            setFleetCounts({ total: list.length, online: onlineCount });
+            if (list.length > 0) {
+              setFirstDevice(list[0]);
+            }
+          })
+          .catch(() => {});
+      }
+    );
+
+    return () => {
+      unsubscribe();
+    };
   }, []);
 
 
@@ -196,7 +199,7 @@ function LandingPage() {
           <div className="container hero-layout">
             <div className="hero-copy">
               <div className="eyebrow eyebrow-light">
-                <span className="eyebrow-line" /> CERTIFIED 4G LTE IoT  &amp; CUSTODY SUPERVISION
+                <span className="eyebrow-line" /> CERTIFIED 4G LTE IoT OFFENDER  &amp; CUSTODY SUPERVISION
               </div>
 
               <h1>Continuous Custody.<br /><span>Zero Tampering.</span></h1>
@@ -215,15 +218,15 @@ function LandingPage() {
               <div className="hero-visual-orb" />
 
               <HeroMapCard
-                lat={liveStats.lat}
-                lon={liveStats.lon}
-                wearer={liveStats.wearer}
-                caseNumber="CASE-2026-EM01"
-                deviceId="863758******420"
-                battery={liveStats.battery}
-                heartRate={liveStats.heartRate}
-                steps={liveStats.steps}
-                isOnline={true}
+                lat={firstDevice?.last_latitude ?? null}
+                lon={firstDevice?.last_longitude ?? null}
+                wearer={firstDevice?.device_name || (firstDevice as any)?.wearer_name || null}
+                caseNumber={null}
+                deviceId={firstDevice?.imei || firstDevice?.serial_number || null}
+                battery={firstDevice?.battery_pct ?? null}
+                heartRate={(firstDevice as any)?.heart_rate_bpm ?? firstDevice?.heart_rate ?? null}
+                steps={(firstDevice as any)?.steps ?? firstDevice?.step_counter ?? null}
+                isOnline={firstDevice ? (firstDevice.status === 'active' || firstDevice.status === 'online') : false}
               />
 
 
@@ -245,8 +248,8 @@ function LandingPage() {
         <section className="kpi-ticker-section">
           <div className="container kpi-ticker-grid">
             <div className="kpi-cell">
-              <span className="kpi-num">2,450+</span>
-              <span className="kpi-meta">SUPERVISED BANDS ACTIVE</span>
+              <span className="kpi-num">{fleetCounts.total > 0 ? fleetCounts.total.toLocaleString() : 'Live'}</span>
+              <span className="kpi-meta">SUPERVISED BANDS IN FLEET</span>
             </div>
             <div className="kpi-cell">
               <span className="kpi-num">&lt; 2.0s</span>

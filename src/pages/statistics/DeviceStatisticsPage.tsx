@@ -426,10 +426,10 @@ export default function DeviceStatisticsPage() {
                         }}
                       />
                     </TableCell>
-                    <TableCell sx={cell}>{device.created_at ? new Date(device.created_at).toLocaleDateString() : '2026-01-01'}</TableCell>
-                    <TableCell sx={cell}>{device.activation_time ? new Date(device.activation_time).toLocaleDateString() : '2026-01-15'}</TableCell>
-                    <TableCell sx={cell}>{(device as any).expire_time ? new Date((device as any).expire_time).toLocaleDateString() : '2027-01-15'}</TableCell>
-                    <TableCell sx={cell}>{device.last_seen ? new Date(device.last_seen).toLocaleString() : 'Just now'}</TableCell>
+                    <TableCell sx={cell}>{device.created_at ? new Date(device.created_at).toLocaleDateString() : 'N/A'}</TableCell>
+                    <TableCell sx={cell}>{device.activation_time ? new Date(device.activation_time).toLocaleDateString() : 'N/A'}</TableCell>
+                    <TableCell sx={cell}>{(device as any).expire_time ? new Date((device as any).expire_time).toLocaleDateString() : 'N/A'}</TableCell>
+                    <TableCell sx={cell}>{device.last_seen ? new Date(device.last_seen).toLocaleString() : 'N/A'}</TableCell>
                   </TableRow>
                 )
               })}

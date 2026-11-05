@@ -45,21 +45,27 @@ import {
 import type { Device } from '../../services/api'
 
 const columns: { label: string; value: (device: Device) => string | number }[] = [
-  { label: 'Device Name', value: d => d.device_name ?? d.serial_number },
-  { label: 'Company', value: d => d.company ?? 'Trackin360 Global' },
-  { label: 'Device SIM', value: d => d.device_sim ?? '+91 98765 43210' },
-  { label: 'Device Model', value: d => d.device_model ?? 'C05 Watch' },
-  { label: 'Activation Time', value: d => d.activation_time ?? '2026-01-15' },
-  { label: 'Last communication time', value: d => d.last_seen ? new Date(d.last_seen).toLocaleString() : '-' },
-  { label: 'Battery', value: d => d.battery_pct == null ? '-' : `${d.battery_pct}%` },
-  { label: 'Heart rate', value: d => (d as any).heart_rate_bpm ?? d.heart_rate ?? '72 bpm' },
-  { label: 'Blood pressure', value: d => d.blood_pressure ?? '120/80' },
-  { label: 'Temperature', value: d => d.temperature == null ? '36.6°C' : `${d.temperature}°C` },
-  { label: 'Step counter', value: d => (d as any).steps ?? d.step_counter ?? '1,842' },
-  { label: 'Sleep', value: d => d.sleep ?? '7h 20m' },
-  { label: 'Blood Oxygen', value: d => d.blood_oxygen == null ? '98%' : `${d.blood_oxygen}%` },
-  { label: 'Create Time', value: d => d.created_at ? new Date(d.created_at).toLocaleDateString() : '2026-01-01' },
-  { label: 'Status', value: d => d.status },
+  { label: 'Device Name', value: d => d.device_name || d.serial_number || 'N/A' },
+  { label: 'Company', value: d => d.company || 'N/A' },
+  { label: 'Device SIM', value: d => d.device_sim || 'N/A' },
+  { label: 'Device Model', value: d => d.device_model || 'C05' },
+  { label: 'Activation Time', value: d => d.activation_time ? new Date(d.activation_time).toLocaleDateString() : 'N/A' },
+  { label: 'Last communication time', value: d => d.last_seen ? new Date(d.last_seen).toLocaleString() : 'N/A' },
+  { label: 'Battery', value: d => d.battery_pct == null ? 'N/A' : `${d.battery_pct}%` },
+  { label: 'Heart rate', value: d => {
+    const hr = (d as any).heart_rate_bpm ?? d.heart_rate
+    return hr != null ? `${hr} bpm` : 'N/A'
+  } },
+  { label: 'Blood pressure', value: d => d.blood_pressure || 'N/A' },
+  { label: 'Temperature', value: d => d.temperature != null ? `${d.temperature}°C` : 'N/A' },
+  { label: 'Step counter', value: d => {
+    const st = (d as any).steps ?? d.step_counter
+    return st != null ? Number(st).toLocaleString() : 'N/A'
+  } },
+  { label: 'Sleep', value: d => d.sleep || 'N/A' },
+  { label: 'Blood Oxygen', value: d => d.blood_oxygen != null ? `${d.blood_oxygen}%` : 'N/A' },
+  { label: 'Create Time', value: d => d.created_at ? new Date(d.created_at).toLocaleDateString() : 'N/A' },
+  { label: 'Status', value: d => d.status || 'offline' },
   { label: 'Person ID', value: d => d.custody_person_id ?? 'Unassigned' },
 ]
 
@@ -101,10 +107,10 @@ export default function DeviceTable({
 
   const [personDevice, setPersonDevice] = useState<Device | null>(null)
   const [personName, setPersonName] = useState('')
-  const [personAge, setPersonAge] = useState('32')
-  const [personGender, setPersonGender] = useState('Male')
-  const [personHeight, setPersonHeight] = useState('175')
-  const [personWeight, setPersonWeight] = useState('70')
+  const [personAge, setPersonAge] = useState('')
+  const [personGender, setPersonGender] = useState('')
+  const [personHeight, setPersonHeight] = useState('')
+  const [personWeight, setPersonWeight] = useState('')
   const [personAddress, setPersonAddress] = useState('')
 
   const [cmdDevice, setCmdDevice] = useState<Device | null>(null)
@@ -186,9 +192,9 @@ export default function DeviceTable({
   const openEditModal = (dev: Device) => {
     setEditDevice(dev)
     setEditName(dev.device_name || dev.serial_number)
-    setEditPhone(dev.device_sim || '+91 98765 43210')
-    setEditContact('Officer in Charge')
-    setEditContactPhone('+91 98765 00000')
+    setEditPhone(dev.device_sim || '')
+    setEditContact((dev as any).contact || '')
+    setEditContactPhone((dev as any).phone || '')
     setEditOffset('no')
     setMenu(null)
   }
@@ -196,12 +202,12 @@ export default function DeviceTable({
   // Open Person Profile modal
   const openPersonModal = (dev: Device) => {
     setPersonDevice(dev)
-    setPersonName((dev as any).custody_person_name || dev.device_name || 'Demo Wearer')
-    setPersonAge('32')
-    setPersonGender('Male')
-    setPersonHeight('175')
-    setPersonWeight('70')
-    setPersonAddress('Phoenix Avance, HITEC City, Hyderabad')
+    setPersonName((dev as any).custody_person_name || (dev as any).wearer_name || dev.device_name || dev.serial_number || 'N/A')
+    setPersonAge((dev as any).age ? String((dev as any).age) : '')
+    setPersonGender((dev as any).gender || '')
+    setPersonHeight((dev as any).height ? String((dev as any).height) : '')
+    setPersonWeight((dev as any).weight ? String((dev as any).weight) : '')
+    setPersonAddress((dev as any).address || '')
     setMenu(null)
   }
 

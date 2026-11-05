@@ -29,13 +29,14 @@ import {
   LocationOnOutlined,
 } from '@mui/icons-material'
 import { useApiData } from '../../hooks/useApiData'
+import { useRealtimeDevices } from '../../hooks/useRealtimeDevices'
 import { getAccessToken, listDevices, type Device } from '../../services/api'
 import MonitoringMap from './MonitoringMap'
 import type { OpenStreetMapStyle } from './OpenStreetMapView'
 
 export default function LivePeoplePage() {
   const [params] = useSearchParams()
-  const [selectedId, setSelectedId] = useState<number | null>(() => (params.get('device') ? Number(params.get('device')) : null))
+  const [selectedId, setSelectedId] = useState<number | string | null>(() => (params.get('device') ?? null))
   const [provider, setProvider] = useState(import.meta.env.VITE_GOOGLE_MAPS_API_KEY ? 'google' : 'osm')
   const [mapStyle, setMapStyle] = useState<OpenStreetMapStyle>('standard')
   const [company, setCompany] = useState('')
@@ -46,7 +47,7 @@ export default function LivePeoplePage() {
   const [aggregate, setAggregate] = useState(true)
   const [refresh, setRefresh] = useState(false)
   const [page, setPage] = useState(0)
-  const [operation, setOperation] = useState<{ id: number; anchor: HTMLElement } | null>(null)
+  const [operation, setOperation] = useState<{ id: number | string; anchor: HTMLElement } | null>(null)
 
   // Section 3.2.7: Device Instruction state
   const [instructionOpen, setInstructionOpen] = useState(false)
@@ -56,8 +57,18 @@ export default function LivePeoplePage() {
   const [instructionNotice, setInstructionNotice] = useState('')
   const [instructionLoading, setInstructionLoading] = useState(false)
 
+  // Real-time Firestore devices
+  const { devices: realtimeDevices, loading: realtimeLoading } = useRealtimeDevices()
+
   const load = useCallback(() => (getAccessToken() ? listDevices(0, 500) : Promise.resolve([])), [])
-  const { data, loading, error, reload } = useApiData(load)
+  const { data: apiData, loading: apiLoading, error, reload } = useApiData(load)
+
+  const data = useMemo(() => {
+    if (realtimeDevices.length > 0) return realtimeDevices
+    return apiData ?? []
+  }, [realtimeDevices, apiData])
+
+  const loading = realtimeLoading && apiLoading && data.length === 0
 
   useEffect(() => {
     if (!refresh) return
@@ -419,14 +430,14 @@ export default function LivePeoplePage() {
                       <Typography component="span" sx={{ fontSize: 12, fontFamily: 'monospace' }}>
                         {selected.last_latitude != null && selected.last_longitude != null
                           ? `${selected.last_latitude.toFixed(4)}, ${selected.last_longitude.toFixed(4)}`
-                          : 'Location Pending'}
+                          : 'No GPS Fix'}
                       </Typography>
                     </Box>
 
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
                       <AccessTimeOutlined sx={{ fontSize: 15, color: '#64748b' }} />
                       <Typography component="span" sx={{ color: '#64748b', fontSize: 11 }}>
-                        {selected.last_seen ? new Date(selected.last_seen).toLocaleTimeString() : 'Just now'}
+                        {selected.last_seen ? new Date(selected.last_seen).toLocaleTimeString() : 'N/A'}
                       </Typography>
                     </Box>
                   </Box>
@@ -542,7 +553,7 @@ export default function LivePeoplePage() {
                 <Box>
                   <Typography variant="caption" sx={{ color: '#94a3b8' }}>IMEI Number:</Typography>
                   <Typography variant="body2" sx={{ fontFamily: 'monospace', fontWeight: 700 }}>
-                    {instructionDevice?.imei || instructionDevice?.serial_number || '863758061830955'}
+                    {instructionDevice?.imei || instructionDevice?.serial_number || 'N/A'}
                   </Typography>
                 </Box>
                 <Box>

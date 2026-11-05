@@ -23,6 +23,7 @@ import {
   type Device
 } from '../../services/api'
 import { useApiData } from '../../hooks/useApiData'
+import { useRealtimeDevices } from '../../hooks/useRealtimeDevices'
 import AlertLocationDialog from './AlertLocationDialog'
 import DashboardLiveMap from './DashboardLiveMap'
 import './dashboard.css'
@@ -36,7 +37,7 @@ function formatDate(value: string) {
 export default function DashboardPage() {
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedAlert, setSelectedAlert] = useState<ApiAlert | null>(null)
-  const [selectedMapDeviceId, setSelectedMapDeviceId] = useState<number | null>(null)
+  const [selectedMapDeviceId, setSelectedMapDeviceId] = useState<number | string | null>(null)
   const [actionError, setActionError] = useState('')
   const [busyAlerts, setBusyAlerts] = useState<number[]>([])
   const [sound, setSound] = useState(() => {
@@ -48,16 +49,25 @@ export default function DashboardPage() {
   })
   const [saved, setSaved] = useState(false)
 
-  // Load live data from FastAPI backend
+  // Subscribe to real-time Firestore device updates
+  const { devices: realtimeDevices, loading: realtimeLoading } = useRealtimeDevices()
+
+  // Load alerts and fallback device data from backend API
   const loadDashboard = useCallback(async () => {
     if (!getAccessToken()) return { devices: [] as Device[], alerts: [] as ApiAlert[] }
     const [devices, alerts] = await Promise.all([listDevices(0, 500), listAlerts(0, 500)])
     return { devices, alerts }
   }, [])
 
-  const { data, loading, error, reload } = useApiData(loadDashboard)
+  const { data, loading: apiLoading, error, reload } = useApiData(loadDashboard)
 
-  const devices = useMemo(() => data?.devices ?? [], [data])
+  // Prioritize real-time Firestore devices when available; otherwise use API devices
+  const devices = useMemo(() => {
+    if (realtimeDevices.length > 0) return realtimeDevices
+    return data?.devices ?? []
+  }, [realtimeDevices, data])
+
+  const loading = (realtimeLoading && apiLoading) && devices.length === 0
   const alerts = useMemo(
     () => [...(data?.alerts ?? [])].sort(
       (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()

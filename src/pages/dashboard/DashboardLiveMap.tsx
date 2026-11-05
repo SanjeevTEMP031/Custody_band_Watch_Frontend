@@ -13,7 +13,7 @@ import { Link } from 'react-router-dom'
 interface DashboardLiveMapProps {
   devices: Device[]
   onSelectDevice?: (device: Device) => void
-  selectedDeviceId?: number | null
+  selectedDeviceId?: number | string | null
 }
 
 export default function DashboardLiveMap({
@@ -57,12 +57,15 @@ export default function DashboardLiveMap({
   useEffect(() => {
     if (!mapContainerRef.current) return
 
-    // Default center: India / Hyderabad tech hub or first valid device
-    const defaultCenter: [number, number] = [17.4483, 78.3915]
-    const initialZoom = 12
+    // Center on first valid device or default to regional overview without fake city lock
+    const firstLocated = locatedDevices[0]
+    const initialCenter: [number, number] = firstLocated
+      ? [Number(firstLocated.last_latitude ?? (firstLocated as any).latitude), Number(firstLocated.last_longitude ?? (firstLocated as any).longitude)]
+      : [20.5937, 78.9629]
+    const initialZoom = firstLocated ? 13 : 4
 
     const map = L.map(mapContainerRef.current, {
-      center: defaultCenter,
+      center: initialCenter,
       zoom: initialZoom,
       zoomControl: false,
     })
@@ -150,22 +153,30 @@ export default function DashboardLiveMap({
 
       const popupContent = document.createElement('div')
       popupContent.className = 'map-popup-card'
+      const hasFix = (device as any).has_gps_fix !== false
+      const lastSeenFormatted = device.last_seen ? new Date(device.last_seen).toLocaleString() : 'N/A'
       popupContent.innerHTML = `
-        <div style="font-family: inherit; font-size: 13px; line-height: 1.4; min-width: 200px;">
+        <div style="font-family: inherit; font-size: 13px; line-height: 1.4; min-width: 210px;">
           <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; border-bottom: 1px solid #e2e8f0; padding-bottom: 5px;">
-            <strong style="color: #0f172a; font-size: 14px;">${device.device_name || 'Custody Band'}</strong>
+            <strong style="color: #0f172a; font-size: 14px;">${device.device_name || (device as any).wearer_name || device.serial_number || 'N/A'}</strong>
             <span style="font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 9999px; background: ${isOnline ? '#dcfce7' : '#f1f5f9'}; color: ${isOnline ? '#15803d' : '#64748b'};">
               ${isOnline ? 'ONLINE' : 'OFFLINE'}
             </span>
           </div>
           <div style="color: #475569; font-size: 11px; margin-bottom: 4px;">
-            <strong>IMEI:</strong> ${device.imei || 'N/A'}
+            <strong>IMEI:</strong> ${device.imei || device.serial_number || 'N/A'}
           </div>
           <div style="color: #475569; font-size: 11px; margin-bottom: 4px;">
-            <strong>Battery:</strong> ${device.battery_pct != null ? device.battery_pct + '%' : '—'}
+            <strong>Battery:</strong> ${device.battery_pct != null ? device.battery_pct + '%' : 'N/A'}
+          </div>
+          <div style="color: #475569; font-size: 11px; margin-bottom: 4px;">
+            <strong>GPS Status:</strong> <span style="font-weight: 600; color: ${hasFix ? '#16a34a' : '#d97706'};">${hasFix ? 'GPS Locked' : 'No GPS Fix'}</span>
+          </div>
+          <div style="color: #64748b; font-size: 10px; margin-bottom: 4px;">
+            <strong>Coordinates:</strong> ${lat.toFixed(5)}, ${lng.toFixed(5)}
           </div>
           <div style="color: #64748b; font-size: 10px; margin-bottom: 8px;">
-            <strong>Coordinates:</strong> ${lat.toFixed(5)}, ${lng.toFixed(5)}
+            <strong>Last Update:</strong> ${lastSeenFormatted}
           </div>
           <a href="/admin/monitoring-center?device=${device.id}" style="display: block; text-align: center; background: #0284c7; color: #ffffff; text-decoration: none; padding: 5px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;">
             Track in Monitoring Center &rarr;
@@ -197,12 +208,10 @@ export default function DashboardLiveMap({
     if (locatedDevices.length > 0) {
       const bounds: [number, number][] = locatedDevices.map(d => [Number(d.last_latitude ?? (d as any).latitude), Number(d.last_longitude ?? (d as any).longitude)])
       if (bounds.length === 1) {
-        mapInstanceRef.current.setView(bounds[0], 14)
+        mapInstanceRef.current.setView(bounds[0], 15)
       } else {
         mapInstanceRef.current.fitBounds(bounds, { padding: [40, 40] })
       }
-    } else {
-      mapInstanceRef.current.setView([17.4483, 78.3915], 12)
     }
   }
 
