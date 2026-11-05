@@ -11,7 +11,7 @@ const navItems = [
   ['Services', '#services'],
   ['Platform & API', '#platform'],
   ['FAQ', '#faq'],
-  ];
+];
 
 const capabilities = [
   {
@@ -154,10 +154,10 @@ function LandingPage() {
           });
         }
       })
-      .catch(() => {});
+      .catch(() => { });
   }, []);
 
-  
+
   return (
     <div className="landing-page">
       <a className="skip-link" href="#main">Skip to content</a>
@@ -177,7 +177,7 @@ function LandingPage() {
               <a key={label} href={href} onClick={() => setMenuOpen(false)}>{label}</a>
             ))}
 
-            
+
 
             <a className="nav-cta" href="#solutions" onClick={() => setMenuOpen(false)}>
               Explore Solutions <Icon name="arrow" size={15} />
@@ -196,24 +196,24 @@ function LandingPage() {
           <div className="container hero-layout">
             <div className="hero-copy">
               <div className="eyebrow eyebrow-light">
-                <span className="eyebrow-line" /> CERTIFIED 4G LTE IoT OFFENDER &amp; CUSTODY SUPERVISION
+                <span className="eyebrow-line" /> CERTIFIED 4G LTE IoT  &amp; CUSTODY SUPERVISION
               </div>
 
               <h1>Continuous Custody.<br /><span>Zero Tampering.</span></h1>
 
               <p className="hero-description">
-                The enterprise standard in electronic offender monitoring and secure parole enforcement. 
-                Powered by the <strong>Trackin360 C05 4G Non-Removable GPS Tracking Bracelet</strong> with 
+                The enterprise standard in electronic offender monitoring and secure parole enforcement.
+                Powered by the <strong>Trackin360 C05 4G Non-Removable GPS Tracking Bracelet</strong> with
                 dual-circuit optical cut detection, quad-layer hybrid positioning, and continuous biometric vital signs.
               </p>
 
-              
+
             </div>
 
             {/* Tactical Watch Visual Stage */}
             <div className="hero-visual">
               <div className="hero-visual-orb" />
-              
+
               <HeroMapCard
                 lat={liveStats.lat}
                 lon={liveStats.lon}
@@ -226,7 +226,7 @@ function LandingPage() {
                 isOnline={true}
               />
 
-              
+
             </div>
           </div>
 
@@ -314,7 +314,7 @@ function LandingPage() {
               <div className="eyebrow"><span className="eyebrow-line" /> TRACKIN360 HARDWARE PROFILE</div>
               <h2>Trackin360 C05 4G Tamper-Proof<br />Tracking Bracelet.</h2>
               <p>
-                Engineered by Trackin360 specifically for criminal justice parole, 
+                Engineered by Trackin360 specifically for criminal justice parole,
                 court-ordered electronic monitoring, dementia wandering safeguards, and hospital prisoner transfers.
               </p>
 
@@ -337,7 +337,7 @@ function LandingPage() {
                 </div>
               </div>
 
-              
+
             </div>
 
             <div className="hardware-visual-col">
@@ -448,7 +448,7 @@ function LandingPage() {
               <div className="eyebrow"><span className="eyebrow-line" /> ENTERPRISE BACKEND ARCHITECTURE</div>
               <h2>High-Throughput FastAPI &amp;<br />Raw Socket Gateway.</h2>
               <p>
-                Directly connects with law enforcement dispatch CAD systems, court databases, and agency records 
+                Directly connects with law enforcement dispatch CAD systems, court databases, and agency records
                 via high-performance asynchronous REST endpoints and Google Firebase cloud synchronization.
               </p>
 
@@ -467,7 +467,7 @@ function LandingPage() {
                 </div>
               </div>
 
-              
+
             </div>
 
             <div className="platform-terminal">
@@ -523,7 +523,7 @@ function LandingPage() {
           </div>
         </section>
 
-        
+
 
       </main>
 
@@ -534,7 +534,7 @@ function LandingPage() {
             <div className="footer-brand">
               <Brand light />
               <p>
-                Continuous electronic custody monitoring &amp; judicial supervision platforms. 
+                Continuous electronic custody monitoring &amp; judicial supervision platforms.
                 Integrating the Trackin360 C05 4G Tamper-Proof Smartwatch with enterprise cloud dispatch.
               </p>
               <span className="footer-disclaimer">
