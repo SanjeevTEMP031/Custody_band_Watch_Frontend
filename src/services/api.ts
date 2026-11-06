@@ -52,6 +52,61 @@ export interface Device {
   custody_person_id: number | null
 }
 
+export interface JourneyLocation {
+  latitude: number
+  longitude: number
+  timestamp?: string
+  address?: string | null
+}
+
+export interface JourneyPoint {
+  latitude: number
+  longitude: number
+  timestamp: string
+  speed_kmh?: number | null
+  heading?: number | null
+  accuracy_m?: number | null
+  battery_pct?: number | null
+}
+
+export interface Journey {
+  journey_id?: string | number
+  id?: string | number
+  device_id: string | number
+  wearer_name?: string | null
+  status: 'active' | 'in_progress' | 'completed' | 'ended'
+  start_time: string
+  end_time?: string | null
+  start_location?: JourneyLocation | null
+  end_location?: JourneyLocation | null
+  current_location?: (JourneyLocation & { speed_kmh?: number | null; heading?: number | null }) | null
+  total_distance_km?: number
+  distance_km?: number
+  distance_meters?: number
+  duration_seconds?: number
+  point_count?: number
+  route_points?: JourneyPoint[]
+  points?: JourneyPoint[]
+  created_at?: string
+  updated_at?: string
+}
+
+export interface StartJourneyRequest {
+  device_id: string | number
+  wearer_name?: string | null
+  start_latitude?: number | null
+  start_longitude?: number | null
+  timestamp?: string
+}
+
+export interface EndJourneyRequest {
+  journey_id?: string | number
+  device_id?: string | number
+  end_latitude?: number | null
+  end_longitude?: number | null
+  timestamp?: string
+}
+
 export interface LocationRecord {
   id: number
   device_id: number
@@ -263,3 +318,34 @@ export const listLocationHistory = (deviceId: number | string, limit = 500) =>
 export const getLatestLocation = (deviceId: number | string) =>
   request<LocationRecord>(`/locations/device/${deviceId}/latest`)
 export const getDashboardSummary = () => request<unknown>('/dashboard')
+
+// ============================================================================
+// JOURNEYS API (POST /journeys/start, POST /journeys/end, GET /journeys/...)
+// ============================================================================
+
+export const startJourney = async (body: StartJourneyRequest): Promise<Journey> => {
+  return request<Journey>('/journeys/start', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+export const endJourney = async (body: EndJourneyRequest): Promise<Journey> => {
+  return request<Journey>('/journeys/end', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+export const getActiveJourney = async (deviceId: string | number): Promise<Journey | null> => {
+  return request<Journey | null>(`/journeys/active/${deviceId}`).catch(() => null)
+}
+
+export const getDeviceJourneys = async (deviceId: string | number): Promise<Journey[]> => {
+  const res = await request<Journey[] | { items: Journey[] }>(`/journeys/device/${deviceId}`).catch(() => [])
+  return Array.isArray(res) ? res : res.items || []
+}
+
+export const getJourney = async (journeyId: string | number): Promise<Journey> => {
+  return request<Journey>(`/journeys/${journeyId}`)
+}

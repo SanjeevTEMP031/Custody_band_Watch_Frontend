@@ -31,7 +31,18 @@ import {
 import ApiFeedback from '../../components/common/ApiFeedback'
 import { useApiData } from '../../hooks/useApiData'
 import { useRealtimeDevices } from '../../hooks/useRealtimeDevices'
-import { listDevices, listLocationHistory, type Device } from '../../services/api'
+import {
+  listDevices,
+  listLocationHistory,
+  startJourney,
+  endJourney,
+  getActiveJourney,
+  getDeviceJourneys,
+  getJourney,
+  type Device,
+  type Journey,
+  type JourneyPoint,
+} from '../../services/api'
 import {
   startTrip,
   endTrip,
@@ -42,16 +53,127 @@ import {
   haversineDistanceKm,
   isValidGpsCoord,
   type TripRecord,
-  type TripPoint,
 } from '../../lib/firebase'
 import RouteTrackingMap from './RouteTrackingMap'
 import TripSummaryCard from './TripSummaryCard'
+
+/**
+ * Normalizes backend Journey or Firestore TripRecord into a uniform TripRecord structure
+ * so all components (Leaflet Map, Summary Card, Table) consume identical fields seamlessly.
+ */
+function normalizeToTripRecord(raw: any, deviceId: string, fallbackWearer?: string | null): TripRecord | null {
+  if (!raw) return null
+
+  const id = String(raw.journey_id ?? raw.id ?? `journey_${deviceId}_${Date.now()}`)
+  const rawPoints = raw.route_points || raw.points || raw.locations || []
+
+  const route_points: JourneyPoint[] = rawPoints.map((p: any) => {
+    if (Array.isArray(p)) {
+      return { latitude: Number(p[0]), longitude: Number(p[1]), timestamp: new Date().toISOString() }
+    }
+    return {
+      latitude: Number(p.latitude ?? p.lat),
+      longitude: Number(p.longitude ?? p.lng ?? p.lon),
+      timestamp: p.timestamp ?? p.device_timestamp ?? p.recorded_at ?? new Date().toISOString(),
+      speed_kmh: p.speed_kmh ?? p.speed ?? null,
+      heading: p.heading ?? p.bearing ?? p.course ?? null,
+      accuracy_m: p.accuracy_m ?? p.accuracy_meters ?? null,
+      battery_pct: p.battery_pct ?? p.battery_level ?? p.battery ?? null,
+    }
+  }).filter((p: JourneyPoint) => isValidGpsCoord(p.latitude, p.longitude))
+
+  let total_distance_km = Number(raw.total_distance_km ?? raw.distance_km ?? 0)
+  if (!total_distance_km && raw.distance_meters) {
+    total_distance_km = Number((raw.distance_meters / 1000).toFixed(3))
+  }
+  if (!total_distance_km && route_points.length > 1) {
+    let running = 0
+    for (let i = 1; i < route_points.length; i++) {
+      running += haversineDistanceKm(
+        route_points[i - 1].latitude,
+        route_points[i - 1].longitude,
+        route_points[i].latitude,
+        route_points[i].longitude
+      )
+    }
+    total_distance_km = Number(running.toFixed(3))
+  }
+
+  const startPt = route_points.length > 0 ? route_points[0] : null
+  const endPt = route_points.length > 1 ? route_points[route_points.length - 1] : null
+
+  const rawStatus = String(raw.status || '').toLowerCase()
+  const isCompleted = ['completed', 'ended', 'finished', 'closed'].includes(rawStatus)
+
+  const start_location = raw.start_location && isValidGpsCoord(raw.start_location.latitude, raw.start_location.longitude)
+    ? {
+        latitude: Number(raw.start_location.latitude),
+        longitude: Number(raw.start_location.longitude),
+        timestamp: raw.start_location.timestamp ?? raw.start_time,
+      }
+    : startPt
+    ? {
+        latitude: startPt.latitude,
+        longitude: startPt.longitude,
+        timestamp: startPt.timestamp,
+      }
+    : { latitude: 0, longitude: 0, timestamp: raw.start_time }
+
+  const end_location = raw.end_location && isValidGpsCoord(raw.end_location.latitude, raw.end_location.longitude)
+    ? {
+        latitude: Number(raw.end_location.latitude),
+        longitude: Number(raw.end_location.longitude),
+        timestamp: raw.end_location.timestamp ?? raw.end_time,
+      }
+    : isCompleted && endPt
+    ? {
+        latitude: endPt.latitude,
+        longitude: endPt.longitude,
+        timestamp: endPt.timestamp,
+      }
+    : null
+
+  const current_location = raw.current_location && isValidGpsCoord(raw.current_location.latitude, raw.current_location.longitude)
+    ? {
+        latitude: Number(raw.current_location.latitude),
+        longitude: Number(raw.current_location.longitude),
+        timestamp: raw.current_location.timestamp,
+        speed_kmh: raw.current_location.speed_kmh,
+        heading: raw.current_location.heading,
+      }
+    : endPt
+    ? {
+        latitude: endPt.latitude,
+        longitude: endPt.longitude,
+        timestamp: endPt.timestamp,
+        speed_kmh: endPt.speed_kmh,
+        heading: endPt.heading,
+      }
+    : undefined
+
+  return {
+    id,
+    device_id: String(raw.device_id ?? deviceId),
+    wearer_name: raw.wearer_name ?? fallbackWearer ?? null,
+    status: isCompleted ? 'completed' : 'in_progress',
+    start_time: raw.start_time ?? (startPt ? startPt.timestamp : new Date().toISOString()),
+    end_time: raw.end_time ?? (isCompleted ? endPt?.timestamp ?? null : null),
+    start_location,
+    end_location,
+    current_location,
+    total_distance_km,
+    point_count: route_points.length,
+    route_points,
+    created_at: raw.created_at ?? raw.start_time,
+    updated_at: raw.updated_at ?? new Date().toISOString(),
+  }
+}
 
 function LocationHistoryPage() {
   const [params, setParams] = useSearchParams()
   const initialDeviceParam = params.get('device') ?? ''
 
-  // Real-time devices from Firestore
+  // Devices: real-time Firestore + REST API fallback
   const { devices: realtimeDevices } = useRealtimeDevices()
   const loadApiDevices = useCallback(() => listDevices(0, 500), [])
   const { data: apiDevices, loading: apiLoading, error: devicesError } = useApiData(loadApiDevices)
@@ -65,7 +187,7 @@ function LocationHistoryPage() {
     return initialDeviceParam || ''
   })
 
-  // Keep selectedDeviceId synced if not yet chosen
+  // Synchronize initial device selection
   useEffect(() => {
     if (!selectedDeviceId && devices.length > 0) {
       const matched = initialDeviceParam
@@ -83,26 +205,68 @@ function LocationHistoryPage() {
     )
   }, [devices, selectedDeviceId])
 
-  // --- TRIP STATE ---
-  const [deviceTrips, setDeviceTrips] = useState<TripRecord[]>([])
-  const [selectedTripId, setSelectedTripId] = useState<string>('active_or_latest')
-  const [rawHistoryPoints, setRawHistoryPoints] = useState<TripPoint[]>([])
-  const [loadingHistory, setLoadingHistory] = useState<boolean>(false)
-  const [isSubmittingTrip, setIsSubmittingTrip] = useState<boolean>(false)
-  const [tripActionNotice, setTripActionNotice] = useState<{ message: string; severity: 'success' | 'error' | 'info' } | null>(null)
+  // --- JOURNEYS STATE ---
+  const [backendJourneys, setBackendJourneys] = useState<TripRecord[]>([])
+  const [activeBackendJourney, setActiveBackendJourney] = useState<TripRecord | null>(null)
+  const [firestoreTrips, setFirestoreTrips] = useState<TripRecord[]>([])
+  const [selectedJourneyId, setSelectedJourneyId] = useState<string>('active_or_latest')
+  const [rawHistoryPoints, setRawHistoryPoints] = useState<JourneyPoint[]>([])
+  const [loadingJourneys, setLoadingJourneys] = useState<boolean>(false)
+  const [isSubmittingJourney, setIsSubmittingJourney] = useState<boolean>(false)
+  const [journeyNotice, setJourneyNotice] = useState<{ message: string; severity: 'success' | 'error' | 'info' } | null>(null)
   const [viewTab, setViewTab] = useState<'map' | 'table'>('map')
 
-  // Subscribe to real-time trips for selected device
+  // 1. Fetch from backend journeys APIs (GET /api/v1/journeys/active/{id} & GET /api/v1/journeys/device/{id})
+  const refreshBackendJourneys = useCallback(async () => {
+    if (!selectedDeviceId) return
+    setLoadingJourneys(true)
+
+    const wearer = selectedDevice?.device_name ?? (selectedDevice as any)?.wearer_name
+
+    try {
+      // A. Check for currently active journey from backend
+      // Endpoint: GET /api/v1/journeys/active/{device_id}
+      const activeRes = await getActiveJourney(selectedDeviceId)
+      if (activeRes) {
+        const normalized = normalizeToTripRecord(activeRes, selectedDeviceId, wearer)
+        setActiveBackendJourney(normalized)
+      } else {
+        setActiveBackendJourney(null)
+      }
+
+      // B. Fetch Journey History from backend
+      // Endpoint: GET /api/v1/journeys/device/{device_id}
+      const historyRes = await getDeviceJourneys(selectedDeviceId)
+      if (Array.isArray(historyRes) && historyRes.length > 0) {
+        const normalizedList = historyRes
+          .map((j) => normalizeToTripRecord(j, selectedDeviceId, wearer))
+          .filter((j): j is TripRecord => j !== null)
+        setBackendJourneys(normalizedList)
+      } else {
+        setBackendJourneys([])
+      }
+    } catch (err) {
+      console.warn('Backend journeys API returned error, relying on real-time Firestore sync:', err)
+    } finally {
+      setLoadingJourneys(false)
+    }
+  }, [selectedDeviceId, selectedDevice])
+
+  useEffect(() => {
+    refreshBackendJourneys()
+  }, [refreshBackendJourneys])
+
+  // 2. Real-time Firestore trip/journey listener for live coordinates
   useEffect(() => {
     if (!selectedDeviceId) return
 
     const unsubscribe = subscribeToDeviceTrips(
       selectedDeviceId,
       (trips) => {
-        setDeviceTrips(trips)
+        setFirestoreTrips(trips)
       },
       (err) => {
-        console.error('Error subscribing to trips:', err)
+        console.error('Firestore trip subscription error:', err)
       }
     )
 
@@ -111,22 +275,18 @@ function LocationHistoryPage() {
     }
   }, [selectedDeviceId])
 
-  // Fetch raw history points when selected device changes
-  const refreshRawHistory = useCallback(async () => {
+  // 3. Fallback raw location history points
+  const refreshRawTelemetry = useCallback(async () => {
     if (!selectedDeviceId) return
-    setLoadingHistory(true)
     try {
-      // 1. Fetch from Firestore history / locations
       const fsPoints = await fetchFirestoreLocationHistory(selectedDeviceId, 500)
       if (fsPoints.length > 0) {
         setRawHistoryPoints(fsPoints)
-        setLoadingHistory(false)
         return
       }
 
-      // 2. Fallback to REST API
       const apiLocs = await listLocationHistory(selectedDeviceId, 500)
-      const mapped: TripPoint[] = (apiLocs || [])
+      const mapped: JourneyPoint[] = (apiLocs || [])
         .filter((l) => isValidGpsCoord(l.latitude, l.longitude))
         .map((l) => ({
           latitude: Number(l.latitude),
@@ -140,24 +300,56 @@ function LocationHistoryPage() {
         .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
 
       setRawHistoryPoints(mapped)
-    } catch (err) {
-      console.warn('Error fetching location history:', err)
-    } finally {
-      setLoadingHistory(false)
+    } catch {
+      // Continue
     }
   }, [selectedDeviceId])
 
   useEffect(() => {
-    refreshRawHistory()
-  }, [refreshRawHistory])
+    refreshRawTelemetry()
+  }, [refreshRawTelemetry])
 
-  // Active in-progress trip (if any)
-  const activeTrip = useMemo(() => {
-    return deviceTrips.find((t) => t.status === 'in_progress') ?? null
-  }, [deviceTrips])
+  // Combine backend journeys with Firestore journeys (deduplicated by id)
+  const combinedJourneys: TripRecord[] = useMemo(() => {
+    const map = new Map<string, TripRecord>()
 
-  // Synthesized trip from raw history points
-  const rawHistoryTrip = useMemo(() => {
+    // Prioritize backend journeys
+    backendJourneys.forEach((j) => map.set(j.id, j))
+
+    // Merge in Firestore trips
+    firestoreTrips.forEach((t) => {
+      if (!map.has(t.id)) {
+        map.set(t.id, t)
+      } else {
+        // If Firestore has more route points, merge route points
+        const existing = map.get(t.id)!
+        if ((t.route_points?.length || 0) > (existing.route_points?.length || 0)) {
+          map.set(t.id, {
+            ...existing,
+            route_points: t.route_points,
+            point_count: t.point_count,
+            total_distance_km: t.total_distance_km || existing.total_distance_km,
+          })
+        }
+      }
+    })
+
+    const list = Array.from(map.values())
+    list.sort((a, b) => new Date(b.start_time).getTime() - new Date(a.start_time).getTime())
+    return list
+  }, [backendJourneys, firestoreTrips])
+
+  // Active in-progress journey
+  const activeJourney = useMemo(() => {
+    return (
+      activeBackendJourney ??
+      combinedJourneys.find((j) => j.status === 'in_progress') ??
+      null
+    )
+  }, [activeBackendJourney, combinedJourneys])
+
+  // Synthesized journey from raw telemetry points
+  const rawTelemetryJourney = useMemo(() => {
     return buildTripFromPoints(
       selectedDeviceId,
       rawHistoryPoints,
@@ -165,17 +357,55 @@ function LocationHistoryPage() {
     )
   }, [selectedDeviceId, rawHistoryPoints, selectedDevice])
 
-  // Determine current active display trip
-  const currentDisplayTrip: TripRecord | null = useMemo(() => {
-    if (selectedTripId === 'raw_telemetry') {
-      return rawHistoryTrip
+  // Current display journey based on user's Journey History selection
+  const [specificSelectedJourney, setSpecificSelectedJourney] = useState<TripRecord | null>(null)
+
+  // When selectedJourneyId changes, load specific journey if needed
+  useEffect(() => {
+    if (selectedJourneyId === 'active_or_latest' || selectedJourneyId === 'raw_telemetry') {
+      setSpecificSelectedJourney(null)
+      return
     }
-    if (selectedTripId === 'active_or_latest') {
-      return activeTrip ?? (deviceTrips.length > 0 ? deviceTrips[0] : rawHistoryTrip)
+
+    // Try finding in combined list
+    const found = combinedJourneys.find((j) => j.id === selectedJourneyId)
+    if (found && found.route_points && found.route_points.length > 0) {
+      setSpecificSelectedJourney(found)
+      return
     }
-    const matched = deviceTrips.find((t) => t.id === selectedTripId)
-    return matched ?? activeTrip ?? (deviceTrips.length > 0 ? deviceTrips[0] : rawHistoryTrip)
-  }, [selectedTripId, activeTrip, deviceTrips, rawHistoryTrip])
+
+    // Otherwise fetch directly from backend: GET /api/v1/journeys/{journey_id}
+    let isCurrent = true
+    getJourney(selectedJourneyId)
+      .then((res) => {
+        if (!isCurrent) return
+        const normalized = normalizeToTripRecord(
+          res,
+          selectedDeviceId,
+          selectedDevice?.device_name ?? (selectedDevice as any)?.wearer_name
+        )
+        setSpecificSelectedJourney(normalized)
+      })
+      .catch(() => {
+        if (isCurrent && found) {
+          setSpecificSelectedJourney(found)
+        }
+      })
+
+    return () => {
+      isCurrent = false
+    }
+  }, [selectedJourneyId, combinedJourneys, selectedDeviceId, selectedDevice])
+
+  const currentDisplayJourney: TripRecord | null = useMemo(() => {
+    if (selectedJourneyId === 'raw_telemetry') {
+      return rawTelemetryJourney
+    }
+    if (selectedJourneyId === 'active_or_latest') {
+      return activeJourney ?? (combinedJourneys.length > 0 ? combinedJourneys[0] : rawTelemetryJourney)
+    }
+    return specificSelectedJourney ?? activeJourney ?? (combinedJourneys.length > 0 ? combinedJourneys[0] : rawTelemetryJourney)
+  }, [selectedJourneyId, specificSelectedJourney, activeJourney, combinedJourneys, rawTelemetryJourney])
 
   // Live Location of selected device
   const liveLocation = useMemo(() => {
@@ -193,10 +423,10 @@ function LocationHistoryPage() {
     }
   }, [selectedDevice])
 
-  // Auto-record live points if a trip is currently in progress
+  // Continuous live route updates when journey is in progress
   useEffect(() => {
-    if (!activeTrip || !liveLocation) return
-    const route = activeTrip.route_points || []
+    if (!activeJourney || !liveLocation) return
+    const route = activeJourney.route_points || []
     const lastPoint = route[route.length - 1]
 
     if (
@@ -205,7 +435,7 @@ function LocationHistoryPage() {
       lastPoint.longitude !== liveLocation.longitude
     ) {
       addTripPoint(
-        activeTrip.id,
+        activeJourney.id,
         {
           latitude: liveLocation.latitude,
           longitude: liveLocation.longitude,
@@ -213,85 +443,124 @@ function LocationHistoryPage() {
           speed_kmh: liveLocation.speed_kmh,
           heading: liveLocation.heading,
         },
-        activeTrip
-      ).catch((err) => {
-        console.error('Failed auto-recording trip point:', err)
-      })
+        activeJourney
+      ).catch(() => {})
     }
-  }, [activeTrip?.id, liveLocation?.latitude, liveLocation?.longitude, liveLocation?.timestamp])
+  }, [activeJourney?.id, liveLocation?.latitude, liveLocation?.longitude, liveLocation?.timestamp])
 
-  // --- ACTIONS: START TRIP ---
-  const handleStartTrip = async () => {
+  // --- 1. START JOURNEY (POST /api/v1/journeys/start) ---
+  const handleStartJourney = async () => {
     if (!selectedDevice) return
-    setIsSubmittingTrip(true)
-    setTripActionNotice(null)
+    setIsSubmittingJourney(true)
+    setJourneyNotice(null)
+
+    const lat = selectedDevice.last_latitude ?? (selectedDevice as any).latitude
+    const lon = selectedDevice.last_longitude ?? (selectedDevice as any).longitude
+    const hasCoords = isValidGpsCoord(lat, lon)
+    const wearer = (selectedDevice as any)?.wearer_name ?? selectedDevice.device_name ?? `Device ${selectedDevice.id}`
 
     try {
-      const lat = selectedDevice.last_latitude ?? (selectedDevice as any).latitude
-      const lon = selectedDevice.last_longitude ?? (selectedDevice as any).longitude
-      const hasCoords = isValidGpsCoord(lat, lon)
+      // 1. Call backend API: POST /api/v1/journeys/start
+      let startedFromBackend: Journey | null = null
+      try {
+        startedFromBackend = await startJourney({
+          device_id: selectedDevice.id,
+          wearer_name: wearer,
+          start_latitude: hasCoords ? Number(lat) : null,
+          start_longitude: hasCoords ? Number(lon) : null,
+          timestamp: new Date().toISOString(),
+        })
+      } catch (apiErr) {
+        console.warn('Backend POST /journeys/start failed, persisting through Firestore:', apiErr)
+      }
 
-      const wearer = (selectedDevice as any)?.wearer_name ?? selectedDevice.device_name ?? `Device ${selectedDevice.id}`
-      const created = await startTrip(
+      // 2. Real-time Firestore persistence
+      const fsTrip = await startTrip(
         String(selectedDevice.id),
         wearer,
         hasCoords ? Number(lat) : null,
         hasCoords ? Number(lon) : null
       )
 
-      setSelectedTripId(created.id)
-      setTripActionNotice({
+      const activeRecord = startedFromBackend
+        ? normalizeToTripRecord(startedFromBackend, String(selectedDevice.id), wearer) ?? fsTrip
+        : fsTrip
+
+      setActiveBackendJourney(activeRecord)
+      setSelectedJourneyId(activeRecord.id)
+
+      setJourneyNotice({
         message: hasCoords
-          ? `Journey tracking started! Green START marker recorded at [${Number(lat).toFixed(4)}, ${Number(lon).toFixed(4)}].`
-          : 'Journey tracking started! Awaiting first valid GPS lock from device.',
+          ? `Journey started! Green START marker placed at [${Number(lat).toFixed(4)}, ${Number(lon).toFixed(4)}].`
+          : 'Journey started! Awaiting initial GPS fix from device.',
         severity: 'success',
       })
+
+      // Refresh list
+      refreshBackendJourneys()
     } catch (err) {
-      console.error('Error starting trip:', err)
-      setTripActionNotice({
-        message: err instanceof Error ? err.message : 'Failed to start trip in Firestore.',
+      console.error('Error starting journey:', err)
+      setJourneyNotice({
+        message: err instanceof Error ? err.message : 'Failed to start journey.',
         severity: 'error',
       })
     } finally {
-      setIsSubmittingTrip(false)
+      setIsSubmittingJourney(false)
     }
   }
 
-  // --- ACTIONS: END TRIP ---
-  const handleEndTrip = async () => {
-    if (!activeTrip) return
-    setIsSubmittingTrip(true)
-    setTripActionNotice(null)
+  // --- 2. END JOURNEY (POST /api/v1/journeys/end) ---
+  const handleEndJourney = async () => {
+    if (!activeJourney) return
+    setIsSubmittingJourney(true)
+    setJourneyNotice(null)
+
+    const lat = selectedDevice?.last_latitude ?? (selectedDevice as any)?.latitude
+    const lon = selectedDevice?.last_longitude ?? (selectedDevice as any)?.longitude
 
     try {
-      const lat = selectedDevice?.last_latitude ?? (selectedDevice as any)?.latitude
-      const lon = selectedDevice?.last_longitude ?? (selectedDevice as any)?.longitude
+      // 1. Call backend API: POST /api/v1/journeys/end
+      try {
+        await endJourney({
+          journey_id: activeJourney.id,
+          device_id: selectedDevice?.id,
+          end_latitude: isValidGpsCoord(lat, lon) ? Number(lat) : null,
+          end_longitude: isValidGpsCoord(lat, lon) ? Number(lon) : null,
+          timestamp: new Date().toISOString(),
+        })
+      } catch (apiErr) {
+        console.warn('Backend POST /journeys/end failed, closing in Firestore:', apiErr)
+      }
 
+      // 2. Close in Firestore
       await endTrip(
-        activeTrip.id,
-        String(activeTrip.device_id),
+        activeJourney.id,
+        String(activeJourney.device_id),
         isValidGpsCoord(lat, lon) ? Number(lat) : null,
         isValidGpsCoord(lat, lon) ? Number(lon) : null
       )
 
-      setTripActionNotice({
-        message: `Journey completed! Red END marker recorded. Total travelled distance saved.`,
+      setActiveBackendJourney(null)
+      setJourneyNotice({
+        message: 'Journey completed! Red END marker recorded. Total travelled distance saved.',
         severity: 'success',
       })
+
+      refreshBackendJourneys()
     } catch (err) {
-      console.error('Error ending trip:', err)
-      setTripActionNotice({
-        message: err instanceof Error ? err.message : 'Failed to end trip.',
+      console.error('Error ending journey:', err)
+      setJourneyNotice({
+        message: err instanceof Error ? err.message : 'Failed to end journey.',
         severity: 'error',
       })
     } finally {
-      setIsSubmittingTrip(false)
+      setIsSubmittingJourney(false)
     }
   }
 
-  // Calculate incremental distances for table display
+  // Table calculations
   const tableDataWithDistance = useMemo(() => {
-    const pts = currentDisplayTrip?.route_points || rawHistoryPoints
+    const pts = currentDisplayJourney?.route_points || rawHistoryPoints
     let runningDist = 0
 
     return pts.map((pt, idx) => {
@@ -305,7 +574,7 @@ function LocationHistoryPage() {
         accumulatedDistanceKm: runningDist,
       }
     })
-  }, [currentDisplayTrip?.route_points, rawHistoryPoints])
+  }, [currentDisplayJourney?.route_points, rawHistoryPoints])
 
   return (
     <Stack spacing={3}>
@@ -323,15 +592,15 @@ function LocationHistoryPage() {
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
             <Route size={28} color="#2563eb" />
             <Typography variant="h4" sx={{ fontWeight: 800, color: '#0f172a' }}>
-              Travel Distance & Route Playback
+              Travel Distance & Route Tracking
             </Typography>
           </Box>
           <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-            Real-time GPS route highlighting, point-by-point Haversine distance, and trip history
+            Real-time GPS journey tracking, thick Leaflet route highlighting, point-by-point Haversine distance
           </Typography>
         </Box>
 
-        {/* Device & Trip Controls */}
+        {/* Action Controls */}
         <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1.5 }}>
           {/* Device Selector */}
           <TextField
@@ -343,7 +612,7 @@ function LocationHistoryPage() {
               const val = event.target.value
               setSelectedDeviceId(val)
               setParams({ device: val })
-              setSelectedTripId('active_or_latest')
+              setSelectedJourneyId('active_or_latest')
             }}
             sx={{ minWidth: 230, bgcolor: 'background.paper', borderRadius: 1 }}
             disabled={!devices.length}
@@ -356,36 +625,36 @@ function LocationHistoryPage() {
             ))}
           </TextField>
 
-          {/* Trip Selector */}
+          {/* Journey History Selector (Requirement 8 & 9) */}
           <TextField
             select
             size="small"
-            label="Journey Selection"
-            value={selectedTripId}
-            onChange={(event) => setSelectedTripId(event.target.value)}
-            sx={{ minWidth: 260, bgcolor: 'background.paper', borderRadius: 1 }}
+            label="Journey History"
+            value={selectedJourneyId}
+            onChange={(event) => setSelectedJourneyId(event.target.value)}
+            sx={{ minWidth: 280, bgcolor: 'background.paper', borderRadius: 1 }}
             disabled={!selectedDeviceId}
           >
-            {activeTrip && (
-              <MenuItem value={activeTrip.id} sx={{ fontWeight: 700, color: '#16a34a' }}>
+            {activeJourney && (
+              <MenuItem value={activeJourney.id} sx={{ fontWeight: 700, color: '#16a34a' }}>
                 🟢 Active Journey (In Progress)
               </MenuItem>
             )}
             <MenuItem value="active_or_latest">
-              {activeTrip ? 'Current In-Progress Trip' : 'Latest Recorded Trip'}
+              {activeJourney ? 'Active Journey in Progress' : 'Latest Completed Journey'}
             </MenuItem>
-            {deviceTrips
-              .filter((t) => t.id !== activeTrip?.id)
-              .map((trip) => {
-                const dateStr = new Date(trip.start_time).toLocaleDateString(undefined, {
+            {combinedJourneys
+              .filter((j) => j.id !== activeJourney?.id)
+              .map((journey) => {
+                const dateStr = new Date(journey.start_time).toLocaleDateString(undefined, {
                   month: 'short',
                   day: 'numeric',
                   hour: '2-digit',
                   minute: '2-digit',
                 })
                 return (
-                  <MenuItem key={trip.id} value={trip.id}>
-                    Trip: {dateStr} ({trip.total_distance_km.toFixed(1)} km)
+                  <MenuItem key={journey.id} value={journey.id}>
+                    Journey: {dateStr} ({journey.total_distance_km.toFixed(1)} km)
                   </MenuItem>
                 )
               })}
@@ -394,30 +663,30 @@ function LocationHistoryPage() {
             </MenuItem>
           </TextField>
 
-          {/* Start / End Trip Buttons */}
-          {activeTrip ? (
+          {/* Start Journey / End Journey Buttons (Requirement 1) */}
+          {activeJourney ? (
             <Button
               variant="contained"
               color="error"
               size="medium"
-              startIcon={isSubmittingTrip ? <CircularProgress size={16} color="inherit" /> : <Square size={16} />}
-              onClick={handleEndTrip}
-              disabled={isSubmittingTrip}
+              startIcon={isSubmittingJourney ? <CircularProgress size={16} color="inherit" /> : <Square size={16} />}
+              onClick={handleEndJourney}
+              disabled={isSubmittingJourney}
               sx={{ fontWeight: 700, textTransform: 'none', px: 2.5 }}
             >
-              End Active Trip
+              End Journey
             </Button>
           ) : (
             <Button
               variant="contained"
               color="primary"
               size="medium"
-              startIcon={isSubmittingTrip ? <CircularProgress size={16} color="inherit" /> : <Play size={16} />}
-              onClick={handleStartTrip}
-              disabled={isSubmittingTrip || !selectedDeviceId}
+              startIcon={isSubmittingJourney ? <CircularProgress size={16} color="inherit" /> : <Play size={16} />}
+              onClick={handleStartJourney}
+              disabled={isSubmittingJourney || !selectedDeviceId}
               sx={{ fontWeight: 700, textTransform: 'none', px: 2.5 }}
             >
-              Start New Trip
+              Start Journey
             </Button>
           )}
 
@@ -425,8 +694,11 @@ function LocationHistoryPage() {
             variant="outlined"
             size="medium"
             startIcon={<RotateCw size={16} />}
-            onClick={() => refreshRawHistory()}
-            disabled={loadingHistory}
+            onClick={() => {
+              refreshBackendJourneys()
+              refreshRawTelemetry()
+            }}
+            disabled={loadingJourneys}
             sx={{ textTransform: 'none' }}
           >
             Refresh
@@ -434,14 +706,14 @@ function LocationHistoryPage() {
         </Box>
       </Box>
 
-      {/* Notifications / Alerts */}
-      {tripActionNotice && (
+      {/* Action / Error Notice */}
+      {journeyNotice && (
         <Alert
-          severity={tripActionNotice.severity}
-          onClose={() => setTripActionNotice(null)}
+          severity={journeyNotice.severity}
+          onClose={() => setJourneyNotice(null)}
           sx={{ borderRadius: 2 }}
         >
-          {tripActionNotice.message}
+          {journeyNotice.message}
         </Alert>
       )}
 
@@ -456,13 +728,13 @@ function LocationHistoryPage() {
         />
       )}
 
-      {/* TRIP SUMMARY CARD */}
+      {/* JOURNEY SUMMARY CARD (Requirements 6 & 7: Distance in KM, Start Time, End Time, Duration) */}
       <TripSummaryCard
-        trip={currentDisplayTrip}
+        trip={currentDisplayJourney}
         currentSpeed={liveLocation?.speed_kmh}
       />
 
-      {/* View Switcher: Route Map vs Raw Table */}
+      {/* View Switcher: Interactive Journey Map vs Points Table */}
       <Box sx={{ borderBottom: 1, borderColor: 'divider', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <Tabs
           value={viewTab}
@@ -490,7 +762,7 @@ function LocationHistoryPage() {
           />
         </Tabs>
 
-        {currentDisplayTrip?.status === 'in_progress' && (
+        {currentDisplayJourney?.status === 'in_progress' && (
           <Chip
             icon={<Radio size={14} className="animate-pulse" />}
             label="Live Real-Time Journey Tracking Active"
@@ -501,12 +773,12 @@ function LocationHistoryPage() {
         )}
       </Box>
 
-      {/* TAB 1: INTERACTIVE MAP */}
+      {/* TAB 1: INTERACTIVE MAP (Requirements 2, 3, 4, 5 & 10: Green START, Red END, Thick Polyline, Auto Fit Bounds) */}
       {viewTab === 'map' && (
         <Card elevation={0} sx={{ borderRadius: 2.5, border: '1px solid #cbd5e1', overflow: 'hidden' }}>
           <RouteTrackingMap
-            trip={currentDisplayTrip}
-            points={currentDisplayTrip?.route_points || rawHistoryPoints}
+            trip={currentDisplayJourney}
+            points={currentDisplayJourney?.route_points || rawHistoryPoints}
             currentLocation={liveLocation}
             height={580}
             autoFitOnUpdate={true}
@@ -534,7 +806,7 @@ function LocationHistoryPage() {
               <TableBody>
                 {tableDataWithDistance.map((pt, idx) => {
                   const isStart = idx === 0
-                  const isEnd = idx === tableDataWithDistance.length - 1 && currentDisplayTrip?.status === 'completed'
+                  const isEnd = idx === tableDataWithDistance.length - 1 && currentDisplayJourney?.status === 'completed'
                   const prev = idx > 0 ? tableDataWithDistance[idx - 1] : null
                   const legDist = prev ? haversineDistanceKm(prev.latitude, prev.longitude, pt.latitude, pt.longitude) : 0
 
@@ -572,7 +844,7 @@ function LocationHistoryPage() {
                   <TableRow>
                     <TableCell colSpan={8} align="center" sx={{ py: 4 }}>
                       <Typography variant="body2" color="text.secondary">
-                        No recorded GPS telemetry points found for this trip.
+                        No recorded GPS telemetry points found for this journey.
                       </Typography>
                     </TableCell>
                   </TableRow>

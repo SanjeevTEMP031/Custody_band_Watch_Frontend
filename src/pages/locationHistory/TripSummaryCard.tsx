@@ -128,7 +128,7 @@ export default function TripSummaryCard({ trip, currentSpeed }: TripSummaryCardP
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
           <Activity size={18} color={isInProgress ? theme.palette.primary.main : '#64748b'} />
           <Typography variant="subtitle2" sx={{ fontWeight: 700, color: '#1e293b' }}>
-            Trip Summary
+            Journey Summary
             {trip.wearer_name ? ` — ${trip.wearer_name}` : ` — Device ${trip.device_id}`}
           </Typography>
         </Box>
@@ -137,7 +137,7 @@ export default function TripSummaryCard({ trip, currentSpeed }: TripSummaryCardP
           {isInProgress ? (
             <Chip
               icon={<Radio size={14} className="animate-pulse" />}
-              label="Trip In Progress"
+              label="Journey In Progress"
               color="primary"
               size="small"
               sx={{ fontWeight: 600, px: 0.5 }}

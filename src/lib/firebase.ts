@@ -434,6 +434,10 @@ export interface TripRecord {
   updated_at?: string
 }
 
+// Aliases for Journey terminology
+export type JourneyRecord = TripRecord
+export type JourneyPoint = TripPoint
+
 /**
  * Validates whether a coordinate pair is a genuine GPS fix.
  * Rejects (0, 0), NaN, non-finite, and out-of-bounds coordinates.

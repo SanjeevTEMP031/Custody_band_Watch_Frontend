@@ -222,12 +222,12 @@ export default function RouteTrackingMap({
 
     const markers = L.layerGroup().addTo(map)
 
-    // Polyline layers
-    // Halo underneath for high contrast
+    // Polyline layers: thick, clearly visible Leaflet polyline
+    // Halo underneath for high contrast on all map styles
     const halo = L.polyline([], {
       color: '#1e40af',
-      weight: 8,
-      opacity: 0.35,
+      weight: 10,
+      opacity: 0.45,
       lineCap: 'round',
       lineJoin: 'round',
     }).addTo(map)
@@ -235,7 +235,7 @@ export default function RouteTrackingMap({
     // Main vibrant blue polyline
     const mainLine = L.polyline([], {
       color: '#2563eb',
-      weight: 5,
+      weight: 6,
       opacity: 0.95,
       lineCap: 'round',
       lineJoin: 'round',

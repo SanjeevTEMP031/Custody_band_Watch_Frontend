@@ -89,7 +89,7 @@ export default function Sidebar({
       label: 'Monitoring Center',
       to: '/admin/monitoring-center',
       icon: Radio,
-      subPaths: ['/admin/monitoring-center', '/admin/live-people', '/admin/location-history']
+      subPaths: ['/admin/monitoring-center', '/admin/live-people', '/admin/location-history', '/admin/journeys']
     },
     {
       id: 'geofence',
