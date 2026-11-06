@@ -1,4 +1,17 @@
-import { getFirestore, collection, onSnapshot, doc, type Unsubscribe } from 'firebase/firestore'
+import {
+  getFirestore,
+  collection,
+  onSnapshot,
+  doc,
+  setDoc,
+  updateDoc,
+  getDoc,
+  getDocs,
+  query,
+  where,
+  limit as firestoreLimit,
+  type Unsubscribe,
+} from 'firebase/firestore'
 import { getAuth } from 'firebase/auth'
 import { app, firebaseConfig, analytics } from '../firebase/config'
 import type { Device } from '../services/api'
@@ -378,5 +391,573 @@ export function subscribeToDevice(
       if (onError) onError(err)
     }
   )
+}
+
+// ============================================================================
+// TRIP TRACKING, HAVERSINE DISTANCE & ROUTE HIGHLIGHTING
+// ============================================================================
+
+export interface TripPoint {
+  latitude: number
+  longitude: number
+  timestamp: string
+  speed_kmh?: number | null
+  heading?: number | null
+  accuracy_m?: number | null
+  battery_pct?: number | null
+}
+
+export interface TripLocation {
+  latitude: number
+  longitude: number
+  timestamp?: string
+  address?: string | null
+}
+
+export interface TripRecord {
+  id: string
+  device_id: string
+  wearer_name?: string | null
+  status: 'in_progress' | 'completed'
+  start_time: string
+  end_time?: string | null
+  start_location: TripLocation
+  end_location?: TripLocation | null
+  current_location?: TripLocation & {
+    speed_kmh?: number | null
+    heading?: number | null
+  }
+  total_distance_km: number
+  point_count: number
+  route_points: TripPoint[]
+  created_at?: string
+  updated_at?: string
+}
+
+/**
+ * Validates whether a coordinate pair is a genuine GPS fix.
+ * Rejects (0, 0), NaN, non-finite, and out-of-bounds coordinates.
+ */
+export function isValidGpsCoord(lat: unknown, lon: unknown): boolean {
+  if (lat == null || lon == null) return false
+  const nLat = Number(lat)
+  const nLon = Number(lon)
+  if (!Number.isFinite(nLat) || !Number.isFinite(nLon)) return false
+  if (nLat === 0 && nLon === 0) return false
+  return nLat >= -90 && nLat <= 90 && nLon >= -180 && nLon <= 180
+}
+
+/**
+ * Calculates the great-circle distance between two valid GPS coordinates
+ * using the strict Haversine formula.
+ *
+ * Formula:
+ *   a = sin²(Δφ/2) + cos φ1 · cos φ2 · sin²(Δλ/2)
+ *   c = 2 · atan2( √a, √(1−a) )
+ *   d = R · c
+ *
+ * @returns Distance in kilometres.
+ */
+export function haversineDistanceKm(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number
+): number {
+  if (!isValidGpsCoord(lat1, lon1) || !isValidGpsCoord(lat2, lon2)) return 0
+  if (lat1 === lat2 && lon1 === lon2) return 0
+
+  const R = 6371.0 // Earth radius in kilometers
+  const toRad = Math.PI / 180.0
+
+  const phi1 = lat1 * toRad
+  const phi2 = lat2 * toRad
+  const deltaPhi = (lat2 - lat1) * toRad
+  const deltaLambda = (lon2 - lon1) * toRad
+
+  const a =
+    Math.sin(deltaPhi / 2.0) * Math.sin(deltaPhi / 2.0) +
+    Math.cos(phi1) * Math.cos(phi2) * Math.sin(deltaLambda / 2.0) * Math.sin(deltaLambda / 2.0)
+
+  // Clamp a to [0, 1] to prevent floating point inaccuracies causing NaN
+  const clampedA = Math.max(0, Math.min(1, a))
+  const c = 2.0 * Math.atan2(Math.sqrt(clampedA), Math.sqrt(1.0 - clampedA))
+
+  return R * c
+}
+
+/**
+ * Validates consecutive GPS points, filtering duplicate jitter and unrealistic GPS jumps.
+ *
+ * Rules:
+ * - Both points must be valid coordinates.
+ * - Distance must be at least 3 meters (0.003 km) to discard micro-jitter when stationary.
+ * - If timestamps are present and realistic: speed must not exceed 250 km/h (unrealistic for wearable tracker).
+ *   If teleportation jump (> 10 km within 10 seconds), reject as outlier fix.
+ */
+export function isValidPointProgression(
+  prevPoint: TripPoint,
+  nextPoint: TripPoint
+): { valid: boolean; distanceKm: number } {
+  if (!isValidGpsCoord(prevPoint.latitude, prevPoint.longitude)) {
+    return { valid: false, distanceKm: 0 }
+  }
+  if (!isValidGpsCoord(nextPoint.latitude, nextPoint.longitude)) {
+    return { valid: false, distanceKm: 0 }
+  }
+
+  const distKm = haversineDistanceKm(
+    prevPoint.latitude,
+    prevPoint.longitude,
+    nextPoint.latitude,
+    nextPoint.longitude
+  )
+
+  // 1. Stationary micro-jitter filter: ignore movement under 3 meters (0.003 km)
+  if (distKm < 0.003) {
+    return { valid: false, distanceKm: 0 }
+  }
+
+  // 2. Unrealistic jump filter: verify against delta time if timestamps exist
+  const t1 = parseTimestamp(prevPoint.timestamp)
+  const t2 = parseTimestamp(nextPoint.timestamp)
+
+  if (t1 != null && t2 != null && t2 > t1) {
+    const deltaSeconds = (t2 - t1) / 1000.0
+    if (deltaSeconds > 0) {
+      const impliedSpeedKmh = (distKm / deltaSeconds) * 3600.0
+      // 250 km/h threshold for human wearable tracker
+      if (impliedSpeedKmh > 250) {
+        console.warn(
+          `[GPS Filter] Rejected jump: ${distKm.toFixed(2)} km in ${deltaSeconds.toFixed(1)}s (${impliedSpeedKmh.toFixed(0)} km/h)`
+        )
+        return { valid: false, distanceKm: 0 }
+      }
+    }
+  } else if (distKm > 50) {
+    // If no valid timestamps but distance is > 50km in consecutive packets, reject
+    return { valid: false, distanceKm: 0 }
+  }
+
+  return { valid: true, distanceKm: distKm }
+}
+
+/**
+ * Calculates total travelled distance by incrementally summing distances
+ * between consecutive valid GPS points using the Haversine formula.
+ *
+ * Does NOT calculate distance using straight-line distance between start and end.
+ */
+export function calculateRouteDistance(points: TripPoint[]): number {
+  if (!points || points.length < 2) return 0
+
+  let totalKm = 0
+  let lastAcceptedPoint = points[0]
+
+  for (let i = 1; i < points.length; i++) {
+    const currentPoint = points[i]
+    const { valid, distanceKm } = isValidPointProgression(lastAcceptedPoint, currentPoint)
+    if (valid) {
+      totalKm += distanceKm
+      lastAcceptedPoint = currentPoint
+    }
+  }
+
+  return Number(totalKm.toFixed(3))
+}
+
+/**
+ * Starts a new trip for a device.
+ * Captures start coordinates, marks status 'in_progress', and stores in Firestore.
+ */
+export async function startTrip(
+  deviceId: string,
+  wearerName?: string | null,
+  startLat?: number | null,
+  startLon?: number | null
+): Promise<TripRecord> {
+  const tripId = `trip_${deviceId}_${Date.now()}`
+  const nowIso = new Date().toISOString()
+
+  const hasValidStart = isValidGpsCoord(startLat, startLon)
+  const initialPoint: TripPoint[] = hasValidStart
+    ? [
+        {
+          latitude: Number(startLat),
+          longitude: Number(startLon),
+          timestamp: nowIso,
+        },
+      ]
+    : []
+
+  const newTrip: TripRecord = {
+    id: tripId,
+    device_id: deviceId,
+    wearer_name: wearerName ?? null,
+    status: 'in_progress',
+    start_time: nowIso,
+    end_time: null,
+    start_location: {
+      latitude: hasValidStart ? Number(startLat) : 0,
+      longitude: hasValidStart ? Number(startLon) : 0,
+      timestamp: nowIso,
+    },
+    end_location: null,
+    current_location: hasValidStart
+      ? {
+          latitude: Number(startLat),
+          longitude: Number(startLon),
+          timestamp: nowIso,
+        }
+      : undefined,
+    total_distance_km: 0,
+    point_count: initialPoint.length,
+    route_points: initialPoint,
+    created_at: nowIso,
+    updated_at: nowIso,
+  }
+
+  // 1. Save trip to Firestore `trips` collection
+  const tripRef = doc(db, 'trips', tripId)
+  await setDoc(tripRef, newTrip)
+
+  // 2. Mark active trip on the device document
+  try {
+    const deviceRef = doc(db, 'devices', deviceId)
+    await updateDoc(deviceRef, {
+      active_trip_id: tripId,
+      updated_at: nowIso,
+    })
+  } catch (err) {
+    console.warn(`Could not update active_trip_id on device ${deviceId}:`, err)
+  }
+
+  return newTrip
+}
+
+/**
+ * Appends a new valid GPS coordinate to an in-progress trip,
+ * recalculating distance incrementally and updating Firestore.
+ */
+export async function addTripPoint(
+  tripId: string,
+  newPoint: TripPoint,
+  currentTrip: TripRecord
+): Promise<TripRecord> {
+  if (!isValidGpsCoord(newPoint.latitude, newPoint.longitude)) {
+    return currentTrip
+  }
+
+  const existingPoints = currentTrip.route_points || []
+  let updatedDistance = currentTrip.total_distance_km || 0
+  let shouldAdd = false
+
+  if (existingPoints.length === 0) {
+    shouldAdd = true
+  } else {
+    const lastPoint = existingPoints[existingPoints.length - 1]
+    const { valid, distanceKm } = isValidPointProgression(lastPoint, newPoint)
+    if (valid) {
+      updatedDistance = Number((updatedDistance + distanceKm).toFixed(3))
+      shouldAdd = true
+    }
+  }
+
+  if (!shouldAdd) {
+    return currentTrip
+  }
+
+  const updatedPoints = [...existingPoints, newPoint]
+  const nowIso = new Date().toISOString()
+
+  const updatedTrip: TripRecord = {
+    ...currentTrip,
+    route_points: updatedPoints,
+    point_count: updatedPoints.length,
+    total_distance_km: updatedDistance,
+    current_location: {
+      latitude: newPoint.latitude,
+      longitude: newPoint.longitude,
+      timestamp: newPoint.timestamp,
+      speed_kmh: newPoint.speed_kmh,
+      heading: newPoint.heading,
+    },
+    // If trip started without valid coords, set start_location from first valid fix
+    start_location:
+      currentTrip.start_location.latitude === 0 && currentTrip.start_location.longitude === 0
+        ? {
+            latitude: newPoint.latitude,
+            longitude: newPoint.longitude,
+            timestamp: newPoint.timestamp,
+          }
+        : currentTrip.start_location,
+    updated_at: nowIso,
+  }
+
+  try {
+    const tripRef = doc(db, 'trips', tripId)
+    await updateDoc(tripRef, {
+      route_points: updatedPoints,
+      point_count: updatedPoints.length,
+      total_distance_km: updatedDistance,
+      current_location: updatedTrip.current_location,
+      start_location: updatedTrip.start_location,
+      updated_at: nowIso,
+    })
+  } catch (err) {
+    console.error(`Failed to update trip ${tripId} in Firestore:`, err)
+  }
+
+  return updatedTrip
+}
+
+/**
+ * Ends an active trip.
+ * Captures final valid coordinate, marks status 'completed', saves end timestamp,
+ * and clears active_trip_id from the device document.
+ */
+export async function endTrip(
+  tripId: string,
+  deviceId: string,
+  endLat?: number | null,
+  endLon?: number | null
+): Promise<void> {
+  const nowIso = new Date().toISOString()
+  const tripRef = doc(db, 'trips', tripId)
+  const tripSnap = await getDoc(tripRef)
+
+  let endLocation: TripLocation | null = null
+  let finalPoints: TripPoint[] = []
+  let finalDistance = 0
+
+  if (tripSnap.exists()) {
+    const data = tripSnap.data() as TripRecord
+    finalPoints = data.route_points || []
+    finalDistance = data.total_distance_km || 0
+
+    if (isValidGpsCoord(endLat, endLon)) {
+      const finalPt: TripPoint = {
+        latitude: Number(endLat),
+        longitude: Number(endLon),
+        timestamp: nowIso,
+      }
+      if (finalPoints.length > 0) {
+        const lastPt = finalPoints[finalPoints.length - 1]
+        const { valid, distanceKm } = isValidPointProgression(lastPt, finalPt)
+        if (valid) {
+          finalPoints.push(finalPt)
+          finalDistance = Number((finalDistance + distanceKm).toFixed(3))
+        }
+      } else {
+        finalPoints.push(finalPt)
+      }
+      endLocation = {
+        latitude: Number(endLat),
+        longitude: Number(endLon),
+        timestamp: nowIso,
+      }
+    } else if (finalPoints.length > 0) {
+      const last = finalPoints[finalPoints.length - 1]
+      endLocation = {
+        latitude: last.latitude,
+        longitude: last.longitude,
+        timestamp: last.timestamp,
+      }
+    }
+  }
+
+  await updateDoc(tripRef, {
+    status: 'completed',
+    end_time: nowIso,
+    end_location: endLocation,
+    route_points: finalPoints,
+    point_count: finalPoints.length,
+    total_distance_km: finalDistance,
+    updated_at: nowIso,
+  })
+
+  // Clear active_trip_id on the device document
+  try {
+    const deviceRef = doc(db, 'devices', deviceId)
+    await updateDoc(deviceRef, {
+      active_trip_id: null,
+      updated_at: nowIso,
+    })
+  } catch (err) {
+    console.warn(`Could not clear active_trip_id on device ${deviceId}:`, err)
+  }
+}
+
+/**
+ * Subscribes in real-time to a single trip document.
+ */
+export function subscribeToTrip(
+  tripId: string,
+  onUpdate: (trip: TripRecord | null) => void,
+  onError?: (err: Error) => void
+): Unsubscribe {
+  const tripRef = doc(db, 'trips', tripId)
+
+  return onSnapshot(
+    tripRef,
+    (snap) => {
+      if (!snap.exists()) {
+        onUpdate(null)
+        return
+      }
+      onUpdate({ id: snap.id, ...snap.data() } as TripRecord)
+    },
+    (err) => {
+      console.error(`Firestore trip subscription error (${tripId}):`, err)
+      if (onError) onError(err)
+    }
+  )
+}
+
+/**
+ * Subscribes in real-time to all trips for a given device, ordered descending by start_time.
+ */
+export function subscribeToDeviceTrips(
+  deviceId: string,
+  onUpdate: (trips: TripRecord[]) => void,
+  onError?: (err: Error) => void
+): Unsubscribe {
+  const tripsCol = collection(db, 'trips')
+  const q = query(tripsCol, where('device_id', '==', deviceId))
+
+  return onSnapshot(
+    q,
+    (snap) => {
+      const list: TripRecord[] = []
+      snap.forEach((d) => {
+        list.push({ id: d.id, ...d.data() } as TripRecord)
+      })
+      // Sort descending by start_time or created_at in memory
+      list.sort((a, b) => {
+        const ta = parseTimestamp(a.start_time ?? a.created_at) ?? 0
+        const tb = parseTimestamp(b.start_time ?? b.created_at) ?? 0
+        return tb - ta
+      })
+      onUpdate(list)
+    },
+    (err) => {
+      console.error(`Firestore device trips subscription error (${deviceId}):`, err)
+      if (onError) onError(err)
+    }
+  )
+}
+
+/**
+ * Retrieves raw GPS telemetry history from Firestore (`devices/{id}/history` or `locations`).
+ * Maps them into sorted, valid TripPoints.
+ */
+export async function fetchFirestoreLocationHistory(
+  deviceId: string,
+  maxPoints: number = 500
+): Promise<TripPoint[]> {
+  const points: TripPoint[] = []
+
+  // 1. Try devices/{id}/history subcollection first
+  try {
+    const subCol = collection(db, 'devices', deviceId, 'history')
+    const subSnap = await getDocs(query(subCol, firestoreLimit(maxPoints)))
+    subSnap.forEach((docSnap) => {
+      const data = docSnap.data()
+      const lat = data.latitude ?? data.lat
+      const lon = data.longitude ?? data.lon ?? data.lng
+      if (isValidGpsCoord(lat, lon)) {
+        points.push({
+          latitude: Number(lat),
+          longitude: Number(lon),
+          timestamp: data.timestamp ?? data.received_at ?? new Date().toISOString(),
+          speed_kmh: data.speed_kmh ?? data.speed ?? null,
+          heading: data.heading ?? data.bearing ?? data.course ?? null,
+          accuracy_m: data.accuracy_meters ?? null,
+          battery_pct: data.battery ?? data.battery_percent ?? null,
+        })
+      }
+    })
+  } catch (err) {
+    // Continue to next source
+  }
+
+  // 2. If subcollection was empty, query top-level `locations` collection
+  if (points.length === 0) {
+    try {
+      const locCol = collection(db, 'locations')
+      const q = query(locCol, where('device_id', '==', deviceId), firestoreLimit(maxPoints))
+      const locSnap = await getDocs(q)
+      locSnap.forEach((docSnap) => {
+        const data = docSnap.data()
+        const lat = data.latitude ?? data.lat
+        const lon = data.longitude ?? data.lon ?? data.lng
+        if (isValidGpsCoord(lat, lon)) {
+          points.push({
+            latitude: Number(lat),
+            longitude: Number(lon),
+            timestamp: data.device_timestamp ?? data.timestamp ?? data.received_at ?? new Date().toISOString(),
+            speed_kmh: data.speed_kmh ?? null,
+            heading: data.heading_degrees ?? data.heading ?? null,
+            accuracy_m: data.accuracy_meters ?? null,
+            battery_pct: data.battery_level ?? null,
+          })
+        }
+      })
+    } catch (err) {
+      // Continue
+    }
+  }
+
+  // Sort ascending by timestamp
+  points.sort((a, b) => {
+    const ta = parseTimestamp(a.timestamp) ?? 0
+    const tb = parseTimestamp(b.timestamp) ?? 0
+    return ta - tb
+  })
+
+  return points
+}
+
+/**
+ * Builds a synthesized TripRecord from raw historical GPS points.
+ */
+export function buildTripFromPoints(
+  deviceId: string,
+  points: TripPoint[],
+  wearerName?: string | null
+): TripRecord | null {
+  if (!points || points.length === 0) return null
+
+  // Filter valid points
+  const validPoints = points.filter((p) => isValidGpsCoord(p.latitude, p.longitude))
+  if (validPoints.length === 0) return null
+
+  const startPt = validPoints[0]
+  const endPt = validPoints[validPoints.length - 1]
+  const totalKm = calculateRouteDistance(validPoints)
+
+  return {
+    id: `history_${deviceId}_${Date.now()}`,
+    device_id: deviceId,
+    wearer_name: wearerName ?? null,
+    status: 'completed',
+    start_time: startPt.timestamp,
+    end_time: endPt.timestamp,
+    start_location: {
+      latitude: startPt.latitude,
+      longitude: startPt.longitude,
+      timestamp: startPt.timestamp,
+    },
+    end_location: {
+      latitude: endPt.latitude,
+      longitude: endPt.longitude,
+      timestamp: endPt.timestamp,
+    },
+    total_distance_km: totalKm,
+    point_count: validPoints.length,
+    route_points: validPoints,
+    created_at: startPt.timestamp,
+    updated_at: endPt.timestamp,
+  }
 }
 

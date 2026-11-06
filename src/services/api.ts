@@ -258,8 +258,8 @@ export const resolveAlert = (id: number, resolutionNotes = 'Incident cleared and
     method: 'POST',
     body: JSON.stringify({ resolution_notes: resolutionNotes }),
   })
-export const listLocationHistory = (deviceId: number, limit = 500) =>
+export const listLocationHistory = (deviceId: number | string, limit = 500) =>
   request<LocationRecord[]>(`/locations/device/${deviceId}?limit=${limit}`)
-export const getLatestLocation = (deviceId: number) =>
+export const getLatestLocation = (deviceId: number | string) =>
   request<LocationRecord>(`/locations/device/${deviceId}/latest`)
 export const getDashboardSummary = () => request<unknown>('/dashboard')
