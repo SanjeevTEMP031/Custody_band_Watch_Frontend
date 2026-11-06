@@ -251,12 +251,15 @@ export default function DashboardPage() {
                 <div className="search-results-list">
                   {searchResults.slice(0, 6).map(device => {
                     const isOnline = (device.status || (device as any).connection_status || '').toLowerCase() === 'online' || (device as any).is_active === true
-                    const person = (device as any).custody_person_name || (device as any).wearer_name || null
+                    const rawPerson = (device as any).custody_person_name || (device as any).wearer_name || null
+                    const person = rawPerson && !String(rawPerson).toLowerCase().includes('demo') ? rawPerson : null
+                    const rawDevName = device.device_name || 'Custody Band #' + device.id
+                    const devName = String(rawDevName).toLowerCase().includes('demo') ? `Watch #${device.id}` : rawDevName
                     return (
                       <div key={device.id} className="search-result-item">
                         <div className="result-info">
                           <div className="result-title-row">
-                            <strong>{device.device_name || 'Custody Band #' + device.id}</strong>
+                            <strong>{devName}</strong>
                             <span className={'status-pill ' + (isOnline ? 'online' : 'offline')}>
                               {isOnline ? 'Online' : 'Offline'}
                             </span>
@@ -371,11 +374,14 @@ export default function DashboardPage() {
               <tbody>
                 {alerts.slice(0, 8).map(alert => {
                   const device = getDeviceForAlert(alert)
-                  const name =
+                  const rawName =
                     device?.device_name ||
                     alert.device_name ||
                     device?.serial_number ||
                     (alert.device_id != null ? 'Band #' + alert.device_id : 'Hardware Unit')
+                  const name = String(rawName).toLowerCase().includes('demo')
+                    ? (device?.id ? `Watch #${device.id}` : 'Custody Watch')
+                    : rawName
                   const imei = device?.imei || alert.imei || '—'
                   const isResolved = (alert?.status || '').toLowerCase() === 'resolved'
                   const alertMsg = alert.message || alert.type || 'Alert trigger'

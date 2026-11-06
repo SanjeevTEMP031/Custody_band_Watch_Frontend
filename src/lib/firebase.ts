@@ -132,6 +132,47 @@ export interface ExtractedGps {
 /**
  * Extracts the latest valid GPS coordinates from Firestore device document.
  * If gps_fix is false, does NOT replace previous valid coordinates with 0,0 or null.
+/**
+ * Parses raw hardware packet from Huateng C05 GPS wristband.
+ * Format: [MNYD*ID*LEN*CMD, date, time, status, lat, lat_dir, lon, lon_dir, speed, ...]
+ */
+export function parseRawGpsPacket(rawStr?: string | null): {
+  latitude: number
+  longitude: number
+  speed_kmh: number | null
+  battery_pct: number | null
+  gps_fix: boolean
+} | null {
+  if (!rawStr || typeof rawStr !== 'string') return null
+  const cleaned = rawStr.replace(/^\[+|\]+$/g, '')
+  const parts = cleaned.split(',')
+  if (parts.length >= 8) {
+    const status = parts[3]?.trim().toUpperCase() // 'A' = valid active fix, 'V' = void
+    const rawLat = parseFloat(parts[4])
+    const latDir = parts[5]?.trim().toUpperCase()
+    const rawLon = parseFloat(parts[6])
+    const lonDir = parts[7]?.trim().toUpperCase()
+
+    if (Number.isFinite(rawLat) && Number.isFinite(rawLon) && rawLat !== 0 && rawLon !== 0) {
+      const lat = latDir === 'S' ? -Math.abs(rawLat) : Math.abs(rawLat)
+      const lon = lonDir === 'W' ? -Math.abs(rawLon) : Math.abs(rawLon)
+      const speed = parts[8] ? parseFloat(parts[8]) : null
+      const battery = parts[13] ? parseInt(parts[13], 10) : null
+
+      return {
+        latitude: lat,
+        longitude: lon,
+        speed_kmh: Number.isFinite(speed) ? speed : null,
+        battery_pct: Number.isFinite(battery) ? battery : null,
+        gps_fix: status === 'A',
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * Extracts the most recent valid GPS location from multiple potential fields.
  * Retains the last valid GPS coordinates.
  */
 export function extractLatestGps(
@@ -156,65 +197,80 @@ export function extractLatestGps(
     return nLat >= -90 && nLat <= 90 && nLon >= -180 && nLon <= 180
   }
 
-  // 1. Check nested latest.location
-  if (data.latest?.location) {
+  // 1. Highest Priority: Parse actual hardware GPS packet directly from watch
+  const rawLoc = data.latest?.location || data.latest?.location_on_demand || data.latest?.other
+  if (rawLoc?.raw) {
+    const parsed = parseRawGpsPacket(rawLoc.raw)
+    if (parsed && isValidCoord(parsed.latitude, parsed.longitude)) {
+      lat = parsed.latitude
+      lon = parsed.longitude
+      hasGpsFix = parsed.gps_fix
+      speed = parsed.speed_kmh
+      timeStr = rawLoc.received_at ?? rawLoc.gps_time ?? null
+    }
+  }
+
+  // 2. Check nested latest.location (lat / lon from real packet)
+  if (lat == null && data.latest?.location) {
     const loc = data.latest.location
+    // Prioritize lat/lon (real packet) over latitude/longitude (which might be demo/seed copy)
     const cLat = loc.lat ?? loc.latitude
     const cLon = loc.lon ?? loc.lng ?? loc.longitude
     const fixFlag = loc.gps_fix !== false && loc.gps_valid !== false && loc.gps_status !== 'V'
 
     if (isValidCoord(cLat, cLon)) {
-      if (fixFlag) {
-        lat = Number(cLat)
-        lon = Number(cLon)
-        hasGpsFix = true
-      }
-      timeStr = loc.received_at ?? loc.device_timestamp ?? null
-      speed = loc.speed_kmh ?? loc.speed ?? null
-      heading = loc.heading ?? loc.bearing ?? loc.course_degrees ?? null
+      lat = Number(cLat)
+      lon = Number(cLon)
+      hasGpsFix = fixFlag
+      timeStr = loc.received_at ?? loc.device_timestamp ?? loc.gps_time ?? null
+      speed = loc.speed_kmh ?? loc.speed ?? speed
+      heading = loc.heading ?? loc.bearing ?? loc.course ?? null
     }
   }
 
-  // 2. Check last_location
+  // 3. Check location_on_demand
+  if (lat == null && data.latest?.location_on_demand) {
+    const loc = data.latest.location_on_demand
+    const cLat = loc.lat ?? loc.latitude
+    const cLon = loc.lon ?? loc.lng ?? loc.longitude
+    if (isValidCoord(cLat, cLon)) {
+      lat = Number(cLat)
+      lon = Number(cLon)
+      hasGpsFix = loc.gps_fix !== false
+      timeStr = loc.received_at ?? loc.gps_time ?? null
+      speed = loc.speed_kmh ?? speed
+    }
+  }
+
+  // 4. Check last_location
   if (lat == null && data.last_location) {
     const loc = data.last_location
-    const cLat = loc.latitude ?? loc.lat
-    const cLon = loc.longitude ?? loc.lng ?? loc.lon
-    const fixFlag = loc.gps_valid !== false && loc.location_source === 'gps'
-
+    const cLat = loc.lat ?? loc.latitude
+    const cLon = loc.lon ?? loc.lng ?? loc.longitude
     if (isValidCoord(cLat, cLon)) {
       lat = Number(cLat)
       lon = Number(cLon)
-      hasGpsFix = fixFlag
+      hasGpsFix = loc.gps_valid !== false && loc.location_source === 'gps'
       timeStr = loc.received_at ?? loc.device_timestamp ?? null
-      speed = loc.speed_kmh ?? null
-      heading = loc.heading_degrees ?? null
     }
   }
 
-  // 3. Check root level fields
+  // 5. Root level fields (fallback only)
   if (lat == null) {
-    const cLat = data.last_latitude ?? data.latitude
-    const cLon = data.last_longitude ?? data.longitude
-    const fixFlag = data.gps_valid !== false && data.gps_fix !== false && data.gps_status !== 'V'
-
+    const cLat = data.lat ?? data.last_latitude ?? data.latitude
+    const cLon = data.lon ?? data.last_longitude ?? data.longitude
     if (isValidCoord(cLat, cLon)) {
       lat = Number(cLat)
       lon = Number(cLon)
-      hasGpsFix = fixFlag
+      hasGpsFix = data.gps_valid !== false && data.gps_fix !== false
       timeStr = data.device_timestamp ?? data.last_seen ?? data.updated_at ?? null
-      speed = data.speed_kmh ?? null
-      heading = data.course_degrees ?? data.heading ?? null
     }
   }
 
-  // CRITICAL REQUIREMENT:
-  // If current fix is invalid/false, retain the last known valid GPS coordinates!
-  // Do NOT replace previous valid location with 0,0 or null!
+  // Retain previous valid GPS fix if current update has no fix (e.g. watch went indoors)
   if ((lat == null || !hasGpsFix) && isValidCoord(prevLat, prevLon)) {
     lat = prevLat!
     lon = prevLon!
-    // hasGpsFix remains whatever was determined from the latest packet
   }
 
   return {
@@ -280,12 +336,16 @@ export function mapFirestoreDocToDevice(
         : new Date(parseTimestamp(rawLastSeen) ?? 0).toISOString())
     : null
 
-  const deviceName =
+  const rawWearer =
     data.name ||
     data.device_name ||
     data.wearer_name ||
     data.assigned_person_name ||
     null
+
+  // Never display "Demo Wearer"
+  const isDemo = rawWearer && String(rawWearer).toLowerCase().includes('demo')
+  const deviceName = isDemo || !rawWearer ? `Watch #${id.slice(-6)}` : rawWearer
 
   const imei = data.imei || data.device_id || data.vendor_device_id || id
 
@@ -320,7 +380,7 @@ export function mapFirestoreDocToDevice(
       gps_update_time: gps.gpsUpdateTime,
       speed_kmh: gps.speed_kmh,
       heading: gps.heading,
-      wearer_name: data.wearer_name ?? data.assigned_person_name ?? null,
+      wearer_name: isDemo ? null : (data.wearer_name ?? data.assigned_person_name ?? null),
       connection_status: online ? 'online' : 'offline',
       tamper_status: data.tamper_status ?? 'normal',
       sos_status: data.sos_status ?? 'normal',

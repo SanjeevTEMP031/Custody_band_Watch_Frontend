@@ -131,7 +131,8 @@ function createPopupHtml(device: Device, lat: number, lng: number): string {
   const speed = (device as any).speed_kmh ?? (device as any).speed ?? null
   const heading = (device as any).heading ?? null
   const battery = device.battery_pct ?? (device as any).battery_percent ?? (device as any).battery ?? null
-  const wearer = device.device_name || (device as any).wearer_name || device.serial_number || 'Custody Watch'
+  const rawWearer = device.device_name || (device as any).wearer_name || device.serial_number || `Watch #${device.id}`
+  const wearer = String(rawWearer).toLowerCase().includes('demo') ? `Watch #${device.id}` : rawWearer
 
   return `
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 13px; line-height: 1.4; min-width: 220px; padding: 4px;">
@@ -367,7 +368,8 @@ export default function DashboardLiveMap({
         String(device.status || (device as any).connection_status || '').toLowerCase() === 'online' ||
         String(device.status || '').toLowerCase() === 'active'
 
-      const deviceName = device.device_name || (device as any).wearer_name || `Watch #${device.id}`
+      const rawName = device.device_name || (device as any).wearer_name || `Watch #${device.id}`
+      const deviceName = String(rawName).toLowerCase().includes('demo') ? `Watch #${device.id}` : rawName
       const heading = (device as any).heading ?? null
 
       const icon = createDeviceIcon({
@@ -518,10 +520,10 @@ export default function DashboardLiveMap({
                   isOnline: true,
                   isSelected: String(selectedDeviceId) === String(dev.id),
                   heading: latestGps.heading,
-                  deviceName:
-                    updatedDev.device_name ||
-                    (updatedDev as any).wearer_name ||
-                    `Watch #${updatedDev.id}`,
+                  deviceName: (() => {
+                    const n = updatedDev.device_name || (updatedDev as any).wearer_name || `Watch #${updatedDev.id}`
+                    return String(n).toLowerCase().includes('demo') ? `Watch #${updatedDev.id}` : n
+                  })(),
                 })
               )
 

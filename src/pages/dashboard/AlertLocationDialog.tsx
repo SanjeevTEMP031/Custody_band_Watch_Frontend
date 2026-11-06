@@ -38,7 +38,7 @@ export default function AlertLocationDialog({
   const latitude = hasLocation ? Number(rawLat) : 0
   const longitude = hasLocation ? Number(rawLon) : 0
 
-  const personOrDeviceName =
+  const rawPersonOrDevice =
     (device as any)?.custody_person_name ||
     (device as any)?.wearer_name ||
     (device as any)?.person_name ||
@@ -47,6 +47,10 @@ export default function AlertLocationDialog({
     alert?.device_name ||
     device?.serial_number ||
     (alert?.device_id ? `Device #${alert.device_id}` : 'N/A')
+
+  const personOrDeviceName = String(rawPersonOrDevice).toLowerCase().includes('demo')
+    ? (device?.id ? `Watch #${device.id}` : 'Custody Watch')
+    : rawPersonOrDevice
 
   const imei = device?.imei || alert?.imei || device?.serial_number || 'N/A'
   const batteryPct = device?.battery_pct ?? (alert as any)?.battery_pct ?? (alert as any)?.battery ?? null

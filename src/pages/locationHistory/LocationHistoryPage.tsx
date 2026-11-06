@@ -155,7 +155,10 @@ function normalizeToTripRecord(raw: any, deviceId: string, fallbackWearer?: stri
   return {
     id,
     device_id: String(raw.device_id ?? deviceId),
-    wearer_name: raw.wearer_name ?? fallbackWearer ?? null,
+    wearer_name: (() => {
+      const w = raw.wearer_name ?? fallbackWearer ?? null
+      return w && String(w).toLowerCase().includes('demo') ? `Watch #${deviceId}` : w
+    })(),
     status: isCompleted ? 'completed' : 'in_progress',
     start_time: raw.start_time ?? (startPt ? startPt.timestamp : new Date().toISOString()),
     end_time: raw.end_time ?? (isCompleted ? endPt?.timestamp ?? null : null),

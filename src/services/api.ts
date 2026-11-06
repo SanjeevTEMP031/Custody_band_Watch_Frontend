@@ -264,12 +264,17 @@ export const listDevices = async (skip = 0, limit = 100): Promise<Device[]> => {
       }
     }
 
+    const rawDevName = d.device_name ?? d.wearer_name ?? d.name ?? `Watch #${d.device_id ?? idx + 1}`
+    const cleanDevName = String(rawDevName).toLowerCase().includes('demo') ? `Watch #${d.device_id ?? idx + 1}` : rawDevName
+    const rawPerson = d.custody_person_name ?? d.wearer_name ?? null
+    const cleanPerson = rawPerson && !String(rawPerson).toLowerCase().includes('demo') ? rawPerson : null
+
     return {
       ...d,
       id: typeof d.id === 'number' ? d.id : (Number(d.device_id) || (idx + 1)),
       serial_number: d.serial_number ?? d.device_id ?? String(d.id ?? idx + 1),
       imei: d.imei ?? d.device_id ?? null,
-      device_name: d.device_name ?? d.wearer_name ?? d.name ?? `Band #${d.device_id ?? idx + 1}`,
+      device_name: cleanDevName,
       status: rawStatus,
       connection_status: rawStatus,
       online: isOnline,
@@ -284,7 +289,7 @@ export const listDevices = async (skip = 0, limit = 100): Promise<Device[]> => {
       latitude: lat != null ? Number(lat) : null,
       longitude: lng != null ? Number(lng) : null,
       custody_person_id: d.custody_person_id ?? null,
-      custody_person_name: d.custody_person_name ?? d.wearer_name ?? null,
+      custody_person_name: cleanPerson,
     }
   })
 }
@@ -327,6 +332,45 @@ export const resolveAlert = (id: number, resolutionNotes = 'Incident cleared and
   })
 export const listLocationHistory = (deviceId: number | string, limit = 500) =>
   request<LocationRecord[]>(`/locations/device/${deviceId}?limit=${limit}`)
+/**
+ * Parses raw hardware packet from Huateng C05 GPS wristband.
+ * Format: [MNYD*ID*LEN*CMD, date, time, status, lat, lat_dir, lon, lon_dir, speed, ...]
+ */
+export function parseRawGpsPacket(rawStr?: string | null): {
+  latitude: number
+  longitude: number
+  speed_kmh: number | null
+  battery_pct: number | null
+  gps_fix: boolean
+} | null {
+  if (!rawStr || typeof rawStr !== 'string') return null
+  const cleaned = rawStr.replace(/^\[+|\]+$/g, '')
+  const parts = cleaned.split(',')
+  if (parts.length >= 8) {
+    const status = parts[3]?.trim().toUpperCase() // 'A' = valid fix, 'V' = void
+    const rawLat = parseFloat(parts[4])
+    const latDir = parts[5]?.trim().toUpperCase()
+    const rawLon = parseFloat(parts[6])
+    const lonDir = parts[7]?.trim().toUpperCase()
+
+    if (Number.isFinite(rawLat) && Number.isFinite(rawLon) && rawLat !== 0 && rawLon !== 0) {
+      const lat = latDir === 'S' ? -Math.abs(rawLat) : Math.abs(rawLat)
+      const lon = lonDir === 'W' ? -Math.abs(rawLon) : Math.abs(rawLon)
+      const speed = parts[8] ? parseFloat(parts[8]) : null
+      const battery = parts[13] ? parseInt(parts[13], 10) : null
+
+      return {
+        latitude: lat,
+        longitude: lon,
+        speed_kmh: Number.isFinite(speed) ? speed : null,
+        battery_pct: Number.isFinite(battery) ? battery : null,
+        gps_fix: status === 'A',
+      }
+    }
+  }
+  return null
+}
+
 export const getLatestGpsLocation = async (deviceId: string | number): Promise<LatestGpsLocation | null> => {
   try {
     const response = await request<any>(`/gps/${deviceId}/latest`)
@@ -335,8 +379,28 @@ export const getLatestGpsLocation = async (deviceId: string | number): Promise<L
     // Support flat object or enveloped response ({ data: ... }, { location: ... }, { gps: ... })
     const raw = response.data ?? response.location ?? response.gps ?? response
 
-    const latVal = raw.latitude ?? raw.lat ?? raw.last_latitude
-    const lonVal = raw.longitude ?? raw.lon ?? raw.lng ?? raw.last_longitude
+    // Check for actual hardware packet or nested live location
+    const rawLoc = raw.latest?.location ?? response.latest?.location ?? raw
+    const rawStr = rawLoc.raw ?? raw.raw ?? ''
+    const parsedPacket = parseRawGpsPacket(rawStr)
+
+    // Prioritize actual hardware packet coordinates over demo values
+    const latVal =
+      parsedPacket?.latitude ??
+      rawLoc.lat ??
+      (rawLoc.gps_fix ? rawLoc.latitude : null) ??
+      raw.lat ??
+      raw.latitude ??
+      raw.last_latitude
+
+    const lonVal =
+      parsedPacket?.longitude ??
+      rawLoc.lon ??
+      (rawLoc.gps_fix ? rawLoc.longitude : null) ??
+      raw.lon ??
+      raw.lng ??
+      raw.longitude ??
+      raw.last_longitude
 
     if (latVal == null || lonVal == null) return null
     const latitude = Number(latVal)
@@ -346,18 +410,26 @@ export const getLatestGpsLocation = async (deviceId: string | number): Promise<L
     if (latitude === 0 && longitude === 0) return null
     if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null
 
-    const speed = raw.speed_kmh ?? raw.speed ?? null
-    const heading = raw.heading ?? raw.bearing ?? raw.course ?? raw.direction_deg ?? null
-    const battery = raw.battery_pct ?? raw.battery_percent ?? raw.battery_level ?? raw.battery ?? null
+    const speed = parsedPacket?.speed_kmh ?? rawLoc.speed_kmh ?? raw.speed_kmh ?? raw.speed ?? null
+    const heading = rawLoc.heading ?? rawLoc.bearing ?? raw.heading ?? raw.bearing ?? raw.course ?? raw.direction_deg ?? null
+    const battery =
+      parsedPacket?.battery_pct ??
+      rawLoc.battery_percent ??
+      raw.battery_pct ??
+      raw.battery_percent ??
+      raw.battery_level ??
+      raw.battery ??
+      null
     const recordedAt =
+      rawLoc.received_at ??
       raw.recorded_at ??
       raw.device_timestamp ??
       raw.timestamp ??
       raw.received_at ??
       raw.last_seen ??
       new Date().toISOString()
-    const sats = raw.satellites ?? raw.sat_count ?? null
-    const fix = raw.gps_fix !== false && raw.gps_valid !== false
+    const sats = rawLoc.satellites ?? raw.satellites ?? raw.sat_count ?? null
+    const fix = parsedPacket?.gps_fix ?? (rawLoc.gps_fix !== false && rawLoc.gps_valid !== false)
 
     return {
       latitude,
