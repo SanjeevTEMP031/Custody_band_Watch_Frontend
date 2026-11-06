@@ -25,8 +25,6 @@ interface MarkerEntry {
   targetLat: number
   targetLng: number
   animFrameId?: number
-  trailPolyline?: L.Polyline
-  trailCoords: [number, number][]
 }
 
 /**
@@ -212,10 +210,6 @@ function animateMarker(
     entry.currentLat = lat
     entry.currentLng = lng
 
-    if (entry.trailPolyline) {
-      entry.trailPolyline.setLatLngs([...entry.trailCoords, [lat, lng]])
-    }
-
     if (progress < 1) {
       entry.animFrameId = requestAnimationFrame(step)
     } else {
@@ -223,14 +217,6 @@ function animateMarker(
       entry.currentLat = toLat
       entry.currentLng = toLng
       entry.animFrameId = undefined
-
-      if (entry.trailPolyline) {
-        entry.trailCoords.push([toLat, toLng])
-        if (entry.trailCoords.length > 25) {
-          entry.trailCoords.shift()
-        }
-        entry.trailPolyline.setLatLngs(entry.trailCoords)
-      }
     }
   }
 
@@ -316,10 +302,9 @@ export default function DashboardLiveMap({
     return () => {
       resizeObserver.disconnect()
 
-      // Clean up any running marker animations & layers
+      // Clean up any running marker animations
       for (const entry of markersMapRef.current.values()) {
         if (entry.animFrameId) cancelAnimationFrame(entry.animFrameId)
-        if (entry.trailPolyline) entry.trailPolyline.remove()
       }
       markersMapRef.current.clear()
 
@@ -395,15 +380,6 @@ export default function DashboardLiveMap({
           onSelectDevice?.(device)
         })
 
-        // Subtle live breadcrumb trail showing direction of motion
-        const trail = L.polyline([[lat, lng]], {
-          color: '#2563eb',
-          weight: 4,
-          opacity: 0.65,
-          dashArray: '6, 6',
-          lineCap: 'round',
-        }).addTo(map)
-
         marker.addTo(markersGroup)
 
         entry = {
@@ -413,8 +389,6 @@ export default function DashboardLiveMap({
           currentLng: lng,
           targetLat: lat,
           targetLng: lng,
-          trailPolyline: trail,
-          trailCoords: [[lat, lng]],
         }
         markersMapRef.current.set(key, entry)
       } else {
@@ -440,7 +414,6 @@ export default function DashboardLiveMap({
     for (const [key, entry] of markersMapRef.current.entries()) {
       if (!currentDeviceKeys.has(key)) {
         if (entry.animFrameId) cancelAnimationFrame(entry.animFrameId)
-        if (entry.trailPolyline) entry.trailPolyline.remove()
         entry.marker.remove()
         markersMapRef.current.delete(key)
       }
