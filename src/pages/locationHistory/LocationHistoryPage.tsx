@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
   Alert,
@@ -39,6 +39,7 @@ import {
   getActiveJourney,
   getDeviceJourneys,
   getJourney,
+  getLatestGpsLocation,
   type Device,
   type Journey,
   type JourneyPoint,
@@ -407,46 +408,172 @@ function LocationHistoryPage() {
     return specificSelectedJourney ?? activeJourney ?? (combinedJourneys.length > 0 ? combinedJourneys[0] : rawTelemetryJourney)
   }, [selectedJourneyId, specificSelectedJourney, activeJourney, combinedJourneys, rawTelemetryJourney])
 
-  // Live Location of selected device
-  const liveLocation = useMemo(() => {
-    if (!selectedDevice) return null
+  // --- REAL-TIME LIVE GPS & TELEMETRY STATE (Requirement 2 & 5) ---
+  interface LiveLocationState {
+    latitude: number
+    longitude: number
+    speed_kmh: number | null
+    heading: number | null
+    battery_pct: number | null
+    timestamp: string
+    satellites?: number | null
+    gps_fix?: boolean
+  }
+
+  const [liveLocation, setLiveLocation] = useState<LiveLocationState | null>(null)
+  const [lastGpsUpdateTime, setLastGpsUpdateTime] = useState<Date | null>(null)
+  const isFetchingGpsRef = useRef(false)
+  const activeJourneyRef = useRef<TripRecord | null>(null)
+  activeJourneyRef.current = activeJourney
+
+  // Sync baseline live location from selected device if available
+  useEffect(() => {
+    if (!selectedDevice) {
+      setLiveLocation(null)
+      setLastGpsUpdateTime(null)
+      return
+    }
     const lat = selectedDevice.last_latitude ?? (selectedDevice as any).latitude
     const lon = selectedDevice.last_longitude ?? (selectedDevice as any).longitude
-    if (!isValidGpsCoord(lat, lon)) return null
-
-    return {
-      latitude: Number(lat),
-      longitude: Number(lon),
-      speed_kmh: (selectedDevice as any).speed_kmh ?? null,
-      heading: (selectedDevice as any).heading ?? null,
-      timestamp: selectedDevice.last_seen ?? new Date().toISOString(),
+    if (isValidGpsCoord(lat, lon)) {
+      setLiveLocation((prev) => {
+        if (prev) return prev
+        return {
+          latitude: Number(lat),
+          longitude: Number(lon),
+          speed_kmh: (selectedDevice as any).speed_kmh ?? null,
+          heading: (selectedDevice as any).heading ?? null,
+          battery_pct: selectedDevice.battery_pct ?? (selectedDevice as any).battery_percent ?? null,
+          timestamp: selectedDevice.last_seen ?? new Date().toISOString(),
+          gps_fix: true,
+        }
+      })
+      if (selectedDevice.last_seen) {
+        setLastGpsUpdateTime(new Date(selectedDevice.last_seen))
+      }
+    } else {
+      setLiveLocation(null)
+      setLastGpsUpdateTime(null)
     }
   }, [selectedDevice])
 
-  // Continuous live route updates when journey is in progress
+  // Real-Time GPS Polling: 5-second interval for selected device (Requirement 2)
   useEffect(() => {
-    if (!activeJourney || !liveLocation) return
-    const route = activeJourney.route_points || []
-    const lastPoint = route[route.length - 1]
+    if (!selectedDeviceId) return
 
-    if (
-      !lastPoint ||
-      lastPoint.latitude !== liveLocation.latitude ||
-      lastPoint.longitude !== liveLocation.longitude
-    ) {
-      addTripPoint(
-        activeJourney.id,
-        {
-          latitude: liveLocation.latitude,
-          longitude: liveLocation.longitude,
-          timestamp: liveLocation.timestamp,
-          speed_kmh: liveLocation.speed_kmh,
-          heading: liveLocation.heading,
-        },
-        activeJourney
-      ).catch(() => {})
+    let isCancelled = false
+    const pollDeviceId = selectedDeviceId
+
+    const pollLatestGps = async () => {
+      // Prevent overlapping API requests
+      if (isFetchingGpsRef.current) return
+      isFetchingGpsRef.current = true
+
+      try {
+        // Backend endpoint: GET /api/v1/gps/{device_id}/latest
+        const gps = await getLatestGpsLocation(pollDeviceId)
+        if (isCancelled || pollDeviceId !== selectedDeviceId) return
+
+        if (gps && isValidGpsCoord(gps.latitude, gps.longitude)) {
+          // Do not reject valid coordinates just because satellite count is zero
+          const recordedIso = gps.recorded_at || new Date().toISOString()
+          const newPoint: JourneyPoint = {
+            latitude: gps.latitude,
+            longitude: gps.longitude,
+            timestamp: recordedIso,
+            speed_kmh: gps.speed_kmh,
+            heading: gps.heading,
+            battery_pct: gps.battery_pct,
+          }
+
+          setLiveLocation({
+            latitude: gps.latitude,
+            longitude: gps.longitude,
+            speed_kmh: gps.speed_kmh,
+            heading: gps.heading,
+            battery_pct: gps.battery_pct,
+            timestamp: recordedIso,
+            satellites: gps.satellites,
+            gps_fix: gps.gps_fix,
+          })
+          setLastGpsUpdateTime(new Date(recordedIso))
+
+          // Append new GPS points to the currently active journey ONLY
+          const currentActive = activeJourneyRef.current
+          if (
+            currentActive &&
+            currentActive.status === 'in_progress' &&
+            String(currentActive.device_id) === String(pollDeviceId)
+          ) {
+            const existingPoints = currentActive.route_points || []
+            let isDuplicate = false
+
+            if (existingPoints.length > 0) {
+              const lastPoint = existingPoints[existingPoints.length - 1]
+              // Check distance: avoid duplicate GPS points (< 3m micro-jitter considered stationary)
+              const distFromLast = haversineDistanceKm(
+                lastPoint.latitude,
+                lastPoint.longitude,
+                newPoint.latitude,
+                newPoint.longitude
+              )
+              if (distFromLast < 0.003) {
+                isDuplicate = true
+              }
+              // Avoid duplicate identical timestamp coordinates
+              if (
+                lastPoint.latitude === newPoint.latitude &&
+                lastPoint.longitude === newPoint.longitude &&
+                lastPoint.timestamp === newPoint.timestamp
+              ) {
+                isDuplicate = true
+              }
+            }
+
+            if (!isDuplicate) {
+              try {
+                const updated = await addTripPoint(currentActive.id, newPoint, currentActive)
+                if (activeBackendJourney && activeBackendJourney.id === updated.id) {
+                  setActiveBackendJourney(updated)
+                }
+              } catch (addErr) {
+                console.warn('[GPS Polling] Error adding GPS point to trip:', addErr)
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`[GPS Polling] Error fetching GPS for device ${pollDeviceId}:`, err)
+      } finally {
+        isFetchingGpsRef.current = false
+      }
     }
-  }, [activeJourney?.id, liveLocation?.latitude, liveLocation?.longitude, liveLocation?.timestamp])
+
+    // Start polling immediately when device is selected
+    pollLatestGps()
+
+    // 5-second interval
+    const intervalId = window.setInterval(pollLatestGps, 5000)
+
+    // Stop polling when component unmounts or selected device changes
+    return () => {
+      isCancelled = true
+      window.clearInterval(intervalId)
+      isFetchingGpsRef.current = false
+    }
+  }, [selectedDeviceId])
+
+  // Staleness check (> 5 minutes without update)
+  const isGpsStale = useMemo(() => {
+    if (!lastGpsUpdateTime) return false
+    return Date.now() - lastGpsUpdateTime.getTime() > 300000
+  }, [lastGpsUpdateTime, liveLocation])
+
+  // GPS Fix status
+  const hasGpsFix = useMemo(() => {
+    if (!liveLocation) return false
+    return isValidGpsCoord(liveLocation.latitude, liveLocation.longitude) && liveLocation.gps_fix !== false
+  }, [liveLocation])
 
   // --- 1. START JOURNEY (POST /api/v1/journeys/start) ---
   const handleStartJourney = async () => {
@@ -731,7 +858,13 @@ function LocationHistoryPage() {
       {/* JOURNEY SUMMARY CARD (Requirements 6 & 7: Distance in KM, Start Time, End Time, Duration) */}
       <TripSummaryCard
         trip={currentDisplayJourney}
+        currentLocation={liveLocation}
         currentSpeed={liveLocation?.speed_kmh}
+        currentHeading={liveLocation?.heading}
+        batteryPct={liveLocation?.battery_pct ?? selectedDevice?.battery_pct}
+        latestGpsTime={lastGpsUpdateTime}
+        isGpsStale={isGpsStale}
+        hasGpsFix={hasGpsFix}
       />
 
       {/* View Switcher: Interactive Journey Map vs Points Table */}
@@ -799,6 +932,7 @@ function LocationHistoryPage() {
                   <TableCell sx={{ fontWeight: 700 }}>Longitude</TableCell>
                   <TableCell sx={{ fontWeight: 700 }}>Speed</TableCell>
                   <TableCell sx={{ fontWeight: 700 }}>Heading</TableCell>
+                  <TableCell sx={{ fontWeight: 700 }}>Battery</TableCell>
                   <TableCell sx={{ fontWeight: 700 }}>Point Leg</TableCell>
                   <TableCell sx={{ fontWeight: 700 }}>Cumulative Distance</TableCell>
                 </TableRow>
@@ -828,6 +962,7 @@ function LocationHistoryPage() {
                       <TableCell sx={{ fontFamily: 'monospace' }}>{pt.longitude.toFixed(6)}</TableCell>
                       <TableCell>{pt.speed_kmh != null ? `${pt.speed_kmh} km/h` : '—'}</TableCell>
                       <TableCell>{pt.heading != null ? `${pt.heading}°` : '—'}</TableCell>
+                      <TableCell>{pt.battery_pct != null ? `${pt.battery_pct}%` : '—'}</TableCell>
                       <TableCell sx={{ color: legDist > 0 ? '#2563eb' : 'text.secondary' }}>
                         {legDist >= 1 ? `${legDist.toFixed(2)} km` : legDist > 0 ? `${Math.round(legDist * 1000)} m` : '—'}
                       </TableCell>
@@ -842,7 +977,7 @@ function LocationHistoryPage() {
 
                 {tableDataWithDistance.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={8} align="center" sx={{ py: 4 }}>
+                    <TableCell colSpan={9} align="center" sx={{ py: 4 }}>
                       <Typography variant="body2" color="text.secondary">
                         No recorded GPS telemetry points found for this journey.
                       </Typography>

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Box, Card, CardContent, Chip, Typography, useTheme } from '@mui/material'
+import { Box, Card, CardContent, Chip, Tooltip, Typography, useTheme } from '@mui/material'
 import {
   MapPin,
   Flag,
@@ -8,12 +8,51 @@ import {
   Activity,
   CheckCircle2,
   Radio,
+  Battery,
+  Gauge,
+  AlertTriangle,
+  Wifi,
+  WifiOff,
 } from 'lucide-react'
 import type { TripRecord } from '../../lib/firebase'
 
 interface TripSummaryCardProps {
   trip: TripRecord | null
+  currentLocation?: {
+    latitude: number
+    longitude: number
+    speed_kmh?: number | null
+    heading?: number | null
+    battery_pct?: number | null
+    timestamp?: string
+  } | null
   currentSpeed?: number | null
+  currentHeading?: number | null
+  batteryPct?: number | null
+  latestGpsTime?: Date | string | null
+  isGpsStale?: boolean
+  hasGpsFix?: boolean
+}
+
+function getCompassDirection(deg?: number | null): string {
+  if (deg == null || !Number.isFinite(deg)) return ''
+  const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+  const idx = Math.round((((deg % 360) + 360) % 360) / 45) % 8
+  return dirs[idx]
+}
+
+function getRelativeTimeAgo(target?: Date | string | null, nowMs = Date.now()): string {
+  if (!target) return 'Waiting for fix'
+  const time = typeof target === 'string' ? new Date(target).getTime() : target.getTime()
+  if (isNaN(time)) return 'Waiting for fix'
+
+  const diffSec = Math.max(0, Math.floor((nowMs - time) / 1000))
+  if (diffSec < 5) return 'Just now'
+  if (diffSec < 60) return `${diffSec}s ago`
+  const diffMin = Math.floor(diffSec / 60)
+  if (diffMin < 60) return `${diffMin}m ${diffSec % 60}s ago`
+  const diffHours = Math.floor(diffMin / 60)
+  return `${diffHours}h ${diffMin % 60}m ago`
 }
 
 function formatCoords(lat?: number | null, lon?: number | null): string {
@@ -63,7 +102,16 @@ function formatDuration(startTime?: string | null, endTime?: string | null, nowM
   return parts.join(' ')
 }
 
-export default function TripSummaryCard({ trip, currentSpeed }: TripSummaryCardProps) {
+export default function TripSummaryCard({
+  trip,
+  currentLocation,
+  currentSpeed,
+  currentHeading,
+  batteryPct,
+  latestGpsTime,
+  isGpsStale,
+  hasGpsFix = true,
+}: TripSummaryCardProps) {
   const theme = useTheme()
   const [nowMs, setNowMs] = useState<number>(Date.now())
 
@@ -83,7 +131,7 @@ export default function TripSummaryCard({ trip, currentSpeed }: TripSummaryCardP
       <Card variant="outlined" sx={{ borderRadius: 2, bgcolor: '#f8fafc', borderStyle: 'dashed' }}>
         <CardContent sx={{ py: 3, textAlign: 'center' }}>
           <Typography variant="body2" color="text.secondary">
-            Select a device and trip or start a new journey to view route details and distance.
+            Select a device and journey or start a new journey to view route details and live distance.
           </Typography>
         </CardContent>
       </Card>
@@ -95,6 +143,20 @@ export default function TripSummaryCard({ trip, currentSpeed }: TripSummaryCardP
   const distanceDisplay = distanceKm >= 1
     ? `${distanceKm.toFixed(2)} km`
     : `${Math.round(distanceKm * 1000)} m`
+
+  const effectiveSpeed = currentSpeed ?? currentLocation?.speed_kmh ?? trip.current_location?.speed_kmh
+  const effectiveHeading = currentHeading ?? currentLocation?.heading ?? trip.current_location?.heading
+  const effectiveBattery = batteryPct ?? currentLocation?.battery_pct
+
+  const latestTimeStr = latestGpsTime
+    ? typeof latestGpsTime === 'string'
+      ? formatDateTime(latestGpsTime)
+      : latestGpsTime.toLocaleTimeString()
+    : trip.current_location?.timestamp
+    ? formatDateTime(trip.current_location.timestamp)
+    : 'Waiting for fix'
+
+  const relativeTimeStr = getRelativeTimeAgo(latestGpsTime ?? trip.current_location?.timestamp, nowMs)
 
   return (
     <Card
@@ -133,7 +195,8 @@ export default function TripSummaryCard({ trip, currentSpeed }: TripSummaryCardP
           </Typography>
         </Box>
 
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1 }}>
+          {/* Status Chip */}
           {isInProgress ? (
             <Chip
               icon={<Radio size={14} className="animate-pulse" />}
@@ -155,6 +218,69 @@ export default function TripSummaryCard({ trip, currentSpeed }: TripSummaryCardP
               }}
             />
           )}
+
+          {/* GPS Freshness / Stale Indicator */}
+          {isInProgress && (
+            isGpsStale ? (
+              <Tooltip title="No GPS update received in past 5 minutes">
+                <Chip
+                  icon={<AlertTriangle size={14} color="#b45309" />}
+                  label={`Stale GPS (${relativeTimeStr})`}
+                  size="small"
+                  sx={{ bgcolor: '#fef3c7', color: '#92400e', fontWeight: 600, border: '1px solid #fde68a' }}
+                />
+              </Tooltip>
+            ) : hasGpsFix ? (
+              <Chip
+                icon={<Wifi size={14} color="#16a34a" />}
+                label={`GPS Live (${relativeTimeStr})`}
+                size="small"
+                sx={{ bgcolor: '#dcfce7', color: '#166534', fontWeight: 600, border: '1px solid #bbf7d0' }}
+              />
+            ) : (
+              <Chip
+                icon={<WifiOff size={14} color="#64748b" />}
+                label="No GPS Fix"
+                size="small"
+                sx={{ bgcolor: '#f1f5f9', color: '#475569', fontWeight: 600 }}
+              />
+            )
+          )}
+
+          {/* Battery Indicator */}
+          {effectiveBattery != null && (
+            <Chip
+              icon={<Battery size={14} color={effectiveBattery <= 20 ? '#dc2626' : '#16a34a'} />}
+              label={`${effectiveBattery}%`}
+              size="small"
+              variant="outlined"
+              sx={{ fontWeight: 600, fontSize: 12 }}
+            />
+          )}
+
+          {/* Speed Indicator */}
+          {effectiveSpeed != null && effectiveSpeed > 0 && (
+            <Chip
+              icon={<Gauge size={14} color="#2563eb" />}
+              label={`${effectiveSpeed} km/h`}
+              size="small"
+              variant="outlined"
+              sx={{ fontWeight: 600, fontSize: 12 }}
+            />
+          )}
+
+          {/* Heading Indicator */}
+          {effectiveHeading != null && effectiveHeading >= 0 && (
+            <Chip
+              icon={<Navigation size={14} color="#0284c7" style={{ transform: `rotate(${effectiveHeading}deg)` }} />}
+              label={`${Math.round(effectiveHeading)}° ${getCompassDirection(effectiveHeading)}`}
+              size="small"
+              variant="outlined"
+              sx={{ fontWeight: 600, fontSize: 12 }}
+            />
+          )}
+
+          {/* Point Count Chip */}
           <Chip
             label={`${trip.point_count || trip.route_points?.length || 0} GPS Fixes`}
             size="small"
@@ -188,7 +314,7 @@ export default function TripSummaryCard({ trip, currentSpeed }: TripSummaryCardP
               {distanceDisplay}
             </Typography>
             <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
-              Point-by-point Haversine calculation
+              Consecutive Haversine calculation
             </Typography>
           </Box>
 
@@ -204,7 +330,7 @@ export default function TripSummaryCard({ trip, currentSpeed }: TripSummaryCardP
               {durationStr}
             </Typography>
             <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
-              {isInProgress ? 'Live journey elapsed time' : 'Total completed duration'}
+              {isInProgress ? 'Live journey elapsed time' : 'Total journey duration'}
             </Typography>
           </Box>
 
@@ -224,7 +350,7 @@ export default function TripSummaryCard({ trip, currentSpeed }: TripSummaryCardP
             </Typography>
           </Box>
 
-          {/* 4. END LOCATION & TIME */}
+          {/* 4. CURRENT POSITION / END LOCATION */}
           <Box
             sx={{
               p: 2,
@@ -246,7 +372,7 @@ export default function TripSummaryCard({ trip, currentSpeed }: TripSummaryCardP
                   letterSpacing: 0.5,
                 }}
               >
-                {isInProgress ? 'Current Position' : 'End Location'}
+                {isInProgress ? 'Current Live Position' : 'End Location'}
               </Typography>
             </Box>
             <Typography
@@ -258,7 +384,10 @@ export default function TripSummaryCard({ trip, currentSpeed }: TripSummaryCardP
               }}
             >
               {isInProgress
-                ? formatCoords(trip.current_location?.latitude, trip.current_location?.longitude)
+                ? formatCoords(
+                    currentLocation?.latitude ?? trip.current_location?.latitude,
+                    currentLocation?.longitude ?? trip.current_location?.longitude
+                  )
                 : formatCoords(trip.end_location?.latitude, trip.end_location?.longitude)}
             </Typography>
             <Typography
@@ -270,7 +399,7 @@ export default function TripSummaryCard({ trip, currentSpeed }: TripSummaryCardP
               }}
             >
               {isInProgress
-                ? (currentSpeed != null ? `Speed: ${currentSpeed} km/h` : 'In Transit')
+                ? `Last update: ${latestTimeStr} (${relativeTimeStr})`
                 : formatDateTime(trip.end_time)}
             </Typography>
           </Box>

@@ -107,6 +107,18 @@ export interface EndJourneyRequest {
   timestamp?: string
 }
 
+export interface LatestGpsLocation {
+  latitude: number
+  longitude: number
+  speed_kmh: number | null
+  heading: number | null
+  battery_pct: number | null
+  recorded_at: string
+  satellites?: number | null
+  gps_fix?: boolean
+  raw?: unknown
+}
+
 export interface LocationRecord {
   id: number
   device_id: number
@@ -315,6 +327,54 @@ export const resolveAlert = (id: number, resolutionNotes = 'Incident cleared and
   })
 export const listLocationHistory = (deviceId: number | string, limit = 500) =>
   request<LocationRecord[]>(`/locations/device/${deviceId}?limit=${limit}`)
+export const getLatestGpsLocation = async (deviceId: string | number): Promise<LatestGpsLocation | null> => {
+  try {
+    const response = await request<any>(`/gps/${deviceId}/latest`)
+    if (!response) return null
+
+    // Support flat object or enveloped response ({ data: ... }, { location: ... }, { gps: ... })
+    const raw = response.data ?? response.location ?? response.gps ?? response
+
+    const latVal = raw.latitude ?? raw.lat ?? raw.last_latitude
+    const lonVal = raw.longitude ?? raw.lon ?? raw.lng ?? raw.last_longitude
+
+    if (latVal == null || lonVal == null) return null
+    const latitude = Number(latVal)
+    const longitude = Number(lonVal)
+
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null
+    if (latitude === 0 && longitude === 0) return null
+    if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null
+
+    const speed = raw.speed_kmh ?? raw.speed ?? null
+    const heading = raw.heading ?? raw.bearing ?? raw.course ?? raw.direction_deg ?? null
+    const battery = raw.battery_pct ?? raw.battery_percent ?? raw.battery_level ?? raw.battery ?? null
+    const recordedAt =
+      raw.recorded_at ??
+      raw.device_timestamp ??
+      raw.timestamp ??
+      raw.received_at ??
+      raw.last_seen ??
+      new Date().toISOString()
+    const sats = raw.satellites ?? raw.sat_count ?? null
+    const fix = raw.gps_fix !== false && raw.gps_valid !== false
+
+    return {
+      latitude,
+      longitude,
+      speed_kmh: speed != null && Number.isFinite(Number(speed)) ? Number(speed) : null,
+      heading: heading != null && Number.isFinite(Number(heading)) ? Number(heading) : null,
+      battery_pct: battery != null && Number.isFinite(Number(battery)) ? Number(battery) : null,
+      recorded_at: typeof recordedAt === 'string' ? recordedAt : new Date(recordedAt).toISOString(),
+      satellites: sats != null ? Number(sats) : null,
+      gps_fix: fix,
+      raw,
+    }
+  } catch {
+    return null
+  }
+}
+
 export const getLatestLocation = (deviceId: number | string) =>
   request<LocationRecord>(`/locations/device/${deviceId}/latest`)
 export const getDashboardSummary = () => request<unknown>('/dashboard')

@@ -174,6 +174,7 @@ export default function RouteTrackingMap({
   const polylineHaloRef = useRef<L.Polyline | null>(null)
   const polylineMainRef = useRef<L.Polyline | null>(null)
   const markerGroupRef = useRef<L.LayerGroup | null>(null)
+  const lastFittedTripIdRef = useRef<string | null>(null)
 
   const [mapStyle, setMapStyle] = useState<MapTileProvider>('standard')
   const [isFullscreen, setIsFullscreen] = useState(false)
@@ -284,6 +285,14 @@ export default function RouteTrackingMap({
 
     const latLngs: L.LatLngTuple[] = validRoute.map((p) => [p.latitude, p.longitude])
 
+    // In-progress journey: extend live polyline to the current live coordinate
+    if (!isTripCompleted && liveCoord && latLngs.length > 0) {
+      const lastPt = latLngs[latLngs.length - 1]
+      if (lastPt[0] !== liveCoord.latitude || lastPt[1] !== liveCoord.longitude) {
+        latLngs.push([liveCoord.latitude, liveCoord.longitude])
+      }
+    }
+
     halo.setLatLngs(latLngs)
     mainLine.setLatLngs(latLngs)
 
@@ -354,16 +363,34 @@ export default function RouteTrackingMap({
       markers.addLayer(currentMarker)
     }
 
-    // --- D. AUTO FIT BOUNDS TO ENTIRE ROUTE ---
-    if (autoFitOnUpdate && latLngs.length > 0) {
+    // --- D. AUTO FIT BOUNDS (Only on journey selection or initial load) ---
+    // Avoids jarring zoom resets on every 5-second GPS packet update!
+    const tripId = trip?.id ?? 'default'
+    const isNewJourney = lastFittedTripIdRef.current !== tripId
+
+    if (autoFitOnUpdate && latLngs.length > 0 && isNewJourney) {
+      lastFittedTripIdRef.current = tripId
       if (latLngs.length === 1) {
         map.setView(latLngs[0], 15)
       } else {
         const bounds = L.latLngBounds(latLngs)
         map.fitBounds(bounds, { padding: [50, 50], maxZoom: 16 })
       }
+    } else if (liveCoord && !isTripCompleted && !isNewJourney) {
+      // During active journey live updates, smoothly pan to latest position without changing zoom!
+      map.panTo([liveCoord.latitude, liveCoord.longitude], { animate: true })
     }
-  }, [validRoute.length, trip?.id, trip?.status, trip?.total_distance_km, liveCoord?.latitude, liveCoord?.longitude])
+  }, [
+    validRoute.map((p) => `${p.latitude.toFixed(6)},${p.longitude.toFixed(6)},${p.timestamp}`).join('|'),
+    trip?.id,
+    trip?.status,
+    trip?.total_distance_km,
+    liveCoord?.latitude,
+    liveCoord?.longitude,
+    liveCoord?.heading,
+    liveCoord?.speed_kmh,
+    liveCoord?.timestamp,
+  ])
 
   // Center on Start
   const handleCenterStart = () => {
