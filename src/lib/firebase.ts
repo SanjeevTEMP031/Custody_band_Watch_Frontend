@@ -120,7 +120,11 @@ export function extractLatestBattery(data: Record<string, any>): number | null {
   return candidates[0].value
 }
 
-import { normalizeVerifiedGpsFix } from '../services/gpsNormalization'
+import {
+  collectFirestoreGpsCandidates,
+  logGpsValidationDiagnostics,
+  selectNewestVerifiedGpsCandidate,
+} from '../services/gpsNormalization'
 
 export interface ExtractedGps {
   latitude: number | null
@@ -132,9 +136,6 @@ export interface ExtractedGps {
   heading: number | null
 }
 
-/**
- * Extracts the latest valid GPS coordinates from Firestore device document.
- * If gps_fix is false, does NOT replace previous valid coordinates with 0,0 or null.
 /**
  * Parses raw hardware packet from Huateng C05 GPS wristband.
  * Format: [MNYD*ID*LEN*CMD, date, time, status, lat, lat_dir, lon, lon_dir, speed, ...]
@@ -175,157 +176,69 @@ export function parseRawGpsPacket(rawStr?: string | null): {
 }
 
 /**
- * Extracts the most recent valid GPS location from multiple potential fields.
- * Retains the last valid GPS coordinates.
+ * Selects the newest independently verified Firestore GPS candidate.
  */
 export function extractLatestGps(
   data: Record<string, any>,
-  prevLat?: number | null,
-  prevLon?: number | null,
-  prevTime?: string | null
+  prevDevice?: Device | null
 ): ExtractedGps {
-  let lat: number | null = null
-  let lon: number | null = null
-  let hasGpsFix = false
-  let timeStr: string | null = null
-  let gpsSource: string | null = null
-  let speed: number | null = null
-  let heading: number | null = null
-
-  // Helper to validate coordinate pair
-  const isValidCoord = (lt: unknown, ln: unknown): boolean => {
-    if (lt == null || ln == null) return false
-    const nLat = Number(lt)
-    const nLon = Number(ln)
-    if (!Number.isFinite(nLat) || !Number.isFinite(nLon)) return false
-    if (nLat === 0 && nLon === 0) return false
-    return nLat >= -90 && nLat <= 90 && nLon >= -180 && nLon <= 180
-  }
-  const isValidFix = (location: Record<string, unknown>): boolean => {
-    return normalizeVerifiedGpsFix(location) !== null
-  }
-
-  // 1. Highest Priority: Parse actual hardware GPS packet directly from watch
-  const rawLoc = data.latest?.location || data.latest?.location_on_demand || data.latest?.other
-  if (rawLoc?.raw) {
-    const parsed = parseRawGpsPacket(rawLoc.raw)
-    const fix = parsed && normalizeVerifiedGpsFix({
-      ...rawLoc,
-      ...parsed,
-      gps_status: parsed.gps_fix ? 'A' : 'V',
-    })
-    if (fix) {
-      lat = fix.latitude
-      lon = fix.longitude
-      hasGpsFix = true
-      speed = parsed?.speed_kmh ?? null
-      timeStr = fix.recordedAt
-      gpsSource = fix.source
-    }
-  }
-
-  // 2. Check nested latest.location (lat / lon from real packet)
-  if (lat == null && data.latest?.location) {
-    const loc = data.latest.location
-    // Prioritize lat/lon (real packet) over latitude/longitude (which might be demo/seed copy)
-    const cLat = loc.lat ?? loc.latitude
-    const cLon = loc.lon ?? loc.lng ?? loc.longitude
-    const fixFlag = isValidFix(loc)
-
-    if (fixFlag && isValidCoord(cLat, cLon)) {
-      lat = Number(cLat)
-      lon = Number(cLon)
-      hasGpsFix = fixFlag
-      timeStr = loc.received_at ?? loc.device_timestamp ?? loc.gps_time ?? null
-      speed = loc.speed_kmh ?? loc.speed ?? speed
-      heading = loc.heading ?? loc.bearing ?? loc.course ?? null
-      gpsSource = String(loc.gps_source ?? loc.source ?? loc.location_source ?? loc.provider)
-    }
-  }
-
-  // 3. Check location_on_demand
-  if (lat == null && data.latest?.location_on_demand) {
-    const loc = data.latest.location_on_demand
-    const cLat = loc.lat ?? loc.latitude
-    const cLon = loc.lon ?? loc.lng ?? loc.longitude
-    if (isValidFix(loc) && isValidCoord(cLat, cLon)) {
-      lat = Number(cLat)
-      lon = Number(cLon)
-      hasGpsFix = loc.gps_fix !== false
-      timeStr = loc.received_at ?? loc.gps_time ?? null
-      speed = loc.speed_kmh ?? speed
-      gpsSource = String(loc.gps_source ?? loc.source ?? loc.location_source ?? loc.provider)
-    }
-  }
-
-  // 4. Check last_location
-  if (lat == null && data.last_location) {
-    const loc = data.last_location
-    const cLat = loc.lat ?? loc.latitude
-    const cLon = loc.lon ?? loc.lng ?? loc.longitude
-    if (isValidFix(loc) && isValidCoord(cLat, cLon)) {
-      lat = Number(cLat)
-      lon = Number(cLon)
-      hasGpsFix = true
-      timeStr = loc.received_at ?? loc.device_timestamp ?? null
-      gpsSource = String(loc.gps_source ?? loc.source ?? loc.location_source ?? loc.provider)
-    }
-  }
-
-  // 5. Root level fields (fallback only)
-  if (lat == null) {
-    const cLat = data.lat ?? data.last_latitude ?? data.latitude
-    const cLon = data.lon ?? data.last_longitude ?? data.longitude
-    const rootFixValid = isValidFix(data)
-    if (isValidCoord(cLat, cLon)) {
-      lat = Number(cLat)
-      lon = Number(cLon)
-      hasGpsFix = rootFixValid
-      timeStr = rootFixValid
-        ? data.gps_update_time ?? data.gps_recorded_at ?? data.gps_time ?? data.device_timestamp ?? null
-        : data.gps_update_time ?? data.gps_recorded_at ?? data.gps_time ?? null
-      gpsSource = String(data.gps_source ?? data.source ?? data.location_source ?? data.provider)
-    }
-  }
-
-  const lastFix = typeof data.last_fix === 'object' && data.last_fix !== null
-    ? data.last_fix as Record<string, unknown>
+  const previous = prevDevice
+    ? {
+        latitude: prevDevice.last_latitude ?? null,
+        longitude: prevDevice.last_longitude ?? null,
+        timestamp: prevDevice.gps_update_time ?? null,
+        source: prevDevice.gps_fix_source ?? null,
+        hasGpsFix: prevDevice.has_gps_fix === true,
+      }
     : null
-  if (lastFix) {
-    const fix = normalizeVerifiedGpsFix(lastFix)
-    const currentTime = parseTimestamp(timeStr)
-    if (
-      fix &&
-      (lat == null || currentTime === null || fix.timestamp > currentTime)
-    ) {
-      lat = fix.latitude
-      lon = fix.longitude
-      hasGpsFix = true
-      timeStr = fix.recordedAt
-      const lastFixSpeed = lastFix.speed_kmh ?? lastFix.speed
-      const lastFixHeading = lastFix.heading ?? lastFix.bearing ?? lastFix.course
-      if (lastFixSpeed != null && Number.isFinite(Number(lastFixSpeed))) speed = Number(lastFixSpeed)
-      if (lastFixHeading != null && Number.isFinite(Number(lastFixHeading))) heading = Number(lastFixHeading)
-      gpsSource = fix.source
+  const candidates = collectFirestoreGpsCandidates(data, previous)
+  const latest = data.latest && typeof data.latest === 'object' ? data.latest : {}
+  const packetCandidates = ['location', 'location_on_demand', 'other'].flatMap((key) => {
+    const location = latest[key]
+    if (!location || typeof location !== 'object' || typeof location.raw !== 'string') return []
+    const parsed = parseRawGpsPacket(location.raw)
+    if (!parsed) return []
+    return [{
+      name: `latest.${key}.raw`,
+      record: {
+        ...location,
+        ...parsed,
+        gps_status: parsed.gps_fix ? 'A' : 'V',
+      },
+    }]
+  })
+  const selection = selectNewestVerifiedGpsCandidate([...packetCandidates, ...candidates])
+  logGpsValidationDiagnostics('Firestore device document', selection.rejected)
+  const selected = selection.selected
+  if (!selected) {
+    return {
+      latitude: null,
+      longitude: null,
+      hasGpsFix: false,
+      gpsUpdateTime: null,
+      gpsSource: null,
+      speed_kmh: null,
+      heading: null,
     }
   }
 
-  // Always keep the last known real coordinates regardless of fix status.
-  // The map will show stale markers differently (grey) so users know the fix is old.
-  if (lat == null && isValidCoord(prevLat, prevLon)) {
-    lat = prevLat!
-    lon = prevLon!
+  const record = selected.record as Record<string, unknown>
+  const finiteNumber = (...values: unknown[]): number | null => {
+    for (const value of values) {
+      if (value === undefined || value === null || value === '') continue
+      const number = Number(value)
+      if (Number.isFinite(number)) return number
+    }
+    return null
   }
-  if ((!hasGpsFix || !timeStr) && prevTime) timeStr = prevTime
-
   return {
-    latitude: lat,
-    longitude: lon,
-    hasGpsFix,
-    gpsUpdateTime: timeStr,
-    gpsSource,
-    speed_kmh: speed != null ? Number(speed) : null,
-    heading: heading != null ? Number(heading) : null,
+    latitude: selected.fix.latitude,
+    longitude: selected.fix.longitude,
+    hasGpsFix: true,
+    gpsUpdateTime: selected.fix.recordedAt,
+    gpsSource: selected.fix.source,
+    speed_kmh: finiteNumber(record.speed_kmh, record.speed),
+    heading: finiteNumber(record.heading, record.bearing, record.course),
   }
 }
 
@@ -364,12 +277,7 @@ export function mapFirestoreDocToDevice(
   prevDevice?: Device | null
 ): Device {
   const batteryPct = extractLatestBattery(data)
-  const gps = extractLatestGps(
-    data,
-    prevDevice?.last_latitude,
-    prevDevice?.last_longitude,
-    prevDevice?.gps_update_time
-  )
+  const gps = extractLatestGps(data, prevDevice)
   const online = isDeviceOnline(data)
 
   const rawLastSeen =

@@ -212,8 +212,11 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
         </Alert>
         {selectedKey && (gpsRouteStatus === 'unavailable' ||
           gpsRouteStatus === 'history-sync' ||
-          gpsRouteStatus === 'unavailable-history-sync') && (
+          gpsRouteStatus === 'unavailable-history-sync' ||
+          gpsRouteStatus === 'configuration-error') && (
           <Alert severity="warning" sx={{ position: 'absolute', left: 12, bottom: 90, maxWidth: 430 }}>
+            {gpsRouteStatus === 'configuration-error' &&
+              'GPS API configuration error: requests must return application/json. Check VITE_API_BASE_URL and the hosting proxy; an HTTPS page also requires an HTTPS backend or proxy. '}
             {(gpsRouteStatus === 'history-sync' || gpsRouteStatus === 'unavailable-history-sync') &&
               'A valid latest GPS fix is missing from backend history and is not added to the recorded trail. '}
             {(gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'unavailable-history-sync') &&

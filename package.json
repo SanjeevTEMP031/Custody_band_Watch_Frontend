@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "test:gps": "node --test tests/gps-normalization.test.mjs",
+    "test:api": "node --test tests/api-response.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -166,8 +166,12 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
     )}
     {(gpsRouteStatus === 'unavailable' ||
       gpsRouteStatus === 'history-sync' ||
-      gpsRouteStatus === 'unavailable-history-sync') && (
+      gpsRouteStatus === 'unavailable-history-sync' ||
+      gpsRouteStatus === 'configuration-error') && (
       <Box role="status" sx={{ position: 'absolute', left: 20, bottom: 20, zIndex: 1000, bgcolor: 'rgba(239, 246, 255, 0.96)', color: '#1e3a8a', px: 1.5, py: 1, borderRadius: 1, fontSize: 12, border: '1px solid #bfdbfe', maxWidth: 420 }}>
+        {gpsRouteStatus === 'configuration-error' && (
+          <div>GPS API configuration error: requests must return application/json. Check VITE_API_BASE_URL and the hosting proxy; an HTTPS page also requires an HTTPS backend or proxy.</div>
+        )}
         {(gpsRouteStatus === 'history-sync' || gpsRouteStatus === 'unavailable-history-sync') && (
           <div>A valid latest GPS fix is missing from backend history and is not added to the recorded trail.</div>
         )}

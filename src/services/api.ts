@@ -1,18 +1,20 @@
 // =============================================================================
 // Trackin360 / Custody Watch Platform — API Service
-// Backend: http://192.168.10.91:8000  (OpenAPI v3.1)
 // All paths are prefixed with /api/v1 (set via VITE_API_BASE_URL)
 // =============================================================================
 
-// =============================================================================
-// Trackin360 / Custody Watch Platform — API Service
-// Backend: http://192.168.10.91:8000  (OpenAPI v3.1)
-// All paths are prefixed with /api/v1 (set via VITE_API_BASE_URL)
-// =============================================================================
-
-import { mergeVerifiedGpsFixes, normalizeVerifiedGpsFix } from './gpsNormalization'
+import {
+  getGpsFixRejectionReasons,
+  logGpsValidationDiagnostics,
+  mergeVerifiedGpsFixes,
+  normalizeVerifiedGpsFix,
+  unwrapGpsHistoryResponse,
+  unwrapGpsLatestResponse,
+} from './gpsNormalization'
+import { getJsonContentTypeError } from './apiResponse'
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '/api/v1').replace(/\/+$/, '')
+const HAS_API_SERVER_PROXY = import.meta.env.VITE_API_SERVER_PROXY === 'true'
 const ACCESS_TOKEN_KEY = 'trackin360-access-token'
 
 // =============================================================================
@@ -314,11 +316,13 @@ export interface WebhookCreateRequest {
 
 export class ApiError extends Error {
   readonly status: number
+  readonly configurationError: boolean
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, configurationError = false) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.configurationError = configurationError
   }
 }
 
@@ -339,6 +343,29 @@ export const clearAccessToken = () => {
 // =============================================================================
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  if (
+    import.meta.env.PROD &&
+    !/^https?:\/\//i.test(API_BASE_URL) &&
+    !HAS_API_SERVER_PROXY
+  ) {
+    throw new ApiError(
+      'Production API configuration error: VITE_API_BASE_URL must be an absolute backend URL. Static Firebase Hosting cannot serve API requests from a relative /api/v1 path without a working server-side proxy.',
+      0,
+      true
+    )
+  }
+  if (
+    typeof window !== 'undefined' &&
+    window.location.protocol === 'https:' &&
+    API_BASE_URL.startsWith('http://')
+  ) {
+    throw new ApiError(
+      'The API is configured with HTTP, but this page is served over HTTPS. Browsers block this mixed-content request. Configure an HTTPS backend URL or a working HTTPS server-side proxy.',
+      0,
+      true
+    )
+  }
+
   const headers = new Headers(init.headers)
   const token = getAccessToken()
   if (token) headers.set('Authorization', `Bearer ${token}`)
@@ -358,10 +385,13 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (!response.ok) {
     let message = `API request failed (${response.status}).`
     try {
-      const body: unknown = await response.json()
-      if (typeof body === 'object' && body !== null && 'detail' in body) {
-        const detail = (body as any).detail
-        message = typeof detail === 'string' ? detail : JSON.stringify(detail)
+      const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase()
+      if (contentType === 'application/json') {
+        const body: unknown = await response.json()
+        if (typeof body === 'object' && body !== null && 'detail' in body) {
+          const detail = (body as any).detail
+          message = typeof detail === 'string' ? detail : JSON.stringify(detail)
+        }
       }
     } catch {
       // Keep the status-based message when the server response is not JSON.
@@ -370,7 +400,26 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
 
   if (response.status === 204) return undefined as T
-  return (await response.json()) as T
+  const contentTypeError = getJsonContentTypeError(
+    response.headers.get('content-type'),
+    API_BASE_URL
+  )
+  if (contentTypeError) {
+    throw new ApiError(
+      contentTypeError,
+      response.status,
+      true
+    )
+  }
+  try {
+    return (await response.json()) as T
+  } catch {
+    throw new ApiError(
+      `The API at ${API_BASE_URL} declared application/json but returned an invalid JSON body.`,
+      response.status,
+      true
+    )
+  }
 }
 
 // =============================================================================
@@ -528,14 +577,22 @@ export const getLatestGpsLocation = async (
 ): Promise<LatestGpsLocation | null> => {
   try {
     const response = await request<unknown>(`/gps/${deviceId}/latest`, { signal })
-    const wrapper = typeof response === 'object' && response !== null
-      ? response as Record<string, unknown>
-      : null
-    const rawValue = wrapper?.value ?? wrapper?.data ?? response
-    if (typeof rawValue !== 'object' || rawValue === null) return null
-    const raw = rawValue as Record<string, unknown>
+    const raw = unwrapGpsLatestResponse(response)
+    if (!raw) {
+      logGpsValidationDiagnostics('GPS latest response', [{
+        name: 'response',
+        reasons: ['unrecognized-response-shape'],
+      }])
+      return null
+    }
     const fix = normalizeVerifiedGpsFix(raw)
-    if (!fix) return null
+    if (!fix) {
+      logGpsValidationDiagnostics('GPS latest response', [{
+        name: 'latest',
+        reasons: getGpsFixRejectionReasons(raw),
+      }])
+      return null
+    }
 
     const finiteNumber = (...values: unknown[]): number | null => {
       const value = values.find((candidate) => candidate !== undefined && candidate !== null)
@@ -564,7 +621,8 @@ export const getLatestGpsLocation = async (
     }
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') return null
-    console.warn(`Unable to load latest GPS fix for device ${deviceId}.`, error)
+    if (error instanceof ApiError && error.configurationError) throw error
+    console.warn('Unable to load latest GPS fix.', error)
     return null
   }
 }
@@ -576,17 +634,16 @@ export const getGpsHistory = async (
   signal?: AbortSignal
 ): Promise<GpsLocation[]> => {
   const response = await request<unknown>(`/gps/${deviceId}/history?limit=${limit}`, { signal })
-  const wrapper = typeof response === 'object' && response !== null
-    ? response as Record<string, unknown>
-    : null
-  const history = Array.isArray(response)
-    ? response
-    : [wrapper?.value, wrapper?.data, wrapper?.history, wrapper?.items]
-      .find(Array.isArray)
-  if (!Array.isArray(history)) {
-    console.warn(`GPS history response for device ${deviceId} was not a list.`)
+  const history = unwrapGpsHistoryResponse(response)
+  if (!history) {
+    console.warn('GPS history response did not contain a recognized record list.')
     return []
   }
+  const rejected = history.flatMap((record, index) => {
+    const reasons = getGpsFixRejectionReasons(record)
+    return reasons.length > 0 ? [{ name: `record-${index + 1}`, reasons }] : []
+  })
+  logGpsValidationDiagnostics('GPS history response', rejected)
   return mergeVerifiedGpsFixes(history, null).history.map((fix) => ({
     latitude: fix.latitude,
     longitude: fix.longitude,

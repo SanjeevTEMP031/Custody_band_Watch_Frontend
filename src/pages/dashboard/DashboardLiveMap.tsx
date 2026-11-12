@@ -819,8 +819,12 @@ export default function DashboardLiveMap({
       <div className="map-canvas-container" ref={mapContainerRef}>
         {selectedDevice && (gpsRouteStatus === 'unavailable' ||
           gpsRouteStatus === 'history-sync' ||
-          gpsRouteStatus === 'unavailable-history-sync') && (
+          gpsRouteStatus === 'unavailable-history-sync' ||
+          gpsRouteStatus === 'configuration-error') && (
           <div className="gps-route-status" role="status">
+            {gpsRouteStatus === 'configuration-error' && (
+              <p>GPS API configuration error: requests must return application/json. Check VITE_API_BASE_URL and the hosting proxy; an HTTPS page also requires an HTTPS backend or proxy.</p>
+            )}
             {(gpsRouteStatus === 'history-sync' || gpsRouteStatus === 'unavailable-history-sync') && (
               <p>A valid latest GPS fix is missing from backend history and is not added to the recorded trail.</p>
             )}

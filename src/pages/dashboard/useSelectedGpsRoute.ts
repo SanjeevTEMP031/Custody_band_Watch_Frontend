@@ -1,10 +1,19 @@
 import { useEffect, useRef } from 'react'
 import L from 'leaflet'
-import { getGpsHistory, getLatestGpsLocation, type GpsLocation } from '../../services/api'
+import {
+  ApiError,
+  getGpsHistory,
+  getLatestGpsLocation,
+  type GpsLocation,
+} from '../../services/api'
 import {
   isFreshGpsTimestamp,
   normalizeVerifiedGpsFix,
 } from '../../services/gpsNormalization'
+import {
+  appendGpsTrailPoint,
+  DEFAULT_GPS_TRAIL_FILTERS,
+} from '../../services/gpsTrail'
 
 interface RoutePoint {
   latitude: number
@@ -47,14 +56,13 @@ export type SelectedGpsRouteStatus =
   | 'unavailable'
   | 'history-sync'
   | 'unavailable-history-sync'
+  | 'configuration-error'
 export type SelectedGpsRouteSegment = Array<{
   latitude: number
   longitude: number
   timestamp: number
 }>
 
-const MAX_FIX_GAP_MS = 5 * 60_000
-const MAX_PLAUSIBLE_SPEED_KMH = 180
 const HISTORY_REFRESH_INTERVAL_MS = 30_000
 function parsePoint(value: unknown): RoutePoint | null {
   const fix = normalizeVerifiedGpsFix(value)
@@ -69,56 +77,11 @@ function parsePoint(value: unknown): RoutePoint | null {
   }
 }
 
-function distanceMeters(first: RoutePoint, second: RoutePoint): number {
-  const radians = (degrees: number) => degrees * Math.PI / 180
-  const latDelta = radians(second.latitude - first.latitude)
-  const lonDelta = radians(second.longitude - first.longitude)
-  const firstLat = radians(first.latitude)
-  const secondLat = radians(second.latitude)
-  const haversine =
-    Math.sin(latDelta / 2) ** 2 +
-    Math.cos(firstLat) * Math.cos(secondLat) * Math.sin(lonDelta / 2) ** 2
-  return 6_371_000 * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine))
-}
-
 function addPoint(route: RouteState, point: RoutePoint): boolean {
-  const previous = route.latest
-  if (!previous) {
-    route.latest = point
-    route.segments.push([point])
-    route.keys.add(point.key)
-    route.lastMovementPoint = point
-    return true
-  }
-  if (point.timestamp <= previous.timestamp || route.keys.has(point.key)) return false
-
-  const movementAnchor = route.lastMovementPoint ?? previous
-  const elapsed = point.timestamp - previous.timestamp
-  if (elapsed > MAX_FIX_GAP_MS) {
-    route.segments.push([point])
-    route.latest = point
-    route.keys.add(point.key)
-    route.lastMovementPoint = point
-    return true
-  }
-  const distance = distanceMeters(previous, point)
-  if (distance / (elapsed / 3_600_000) > MAX_PLAUSIBLE_SPEED_KMH) return false
-
-  route.latest = point
-  const movementDistance = distanceMeters(movementAnchor, point)
-  const reportedAccuracy = Math.max(movementAnchor.accuracy ?? 0, point.accuracy ?? 0)
-  const jitterThreshold = Math.max(
-    GPS_TRAIL_CONFIG.minMovementMeters,
-    Math.min(30, reportedAccuracy || GPS_TRAIL_CONFIG.minMovementMeters)
-  )
-  if (movementDistance < jitterThreshold) return false
-
-  const currentSegment = route.segments[route.segments.length - 1]
-  if (!currentSegment || currentSegment.length < 1) route.segments.push([movementAnchor, point])
-  else currentSegment.push(point)
-  route.keys.add(point.key)
-  route.lastMovementPoint = point
-  return true
+  return appendGpsTrailPoint(route, point, {
+    ...DEFAULT_GPS_TRAIL_FILTERS,
+    minMovementMeters: GPS_TRAIL_CONFIG.minMovementMeters,
+  })
 }
 
 function routeSegments(route: RouteState): SelectedGpsRouteSegment[] {
@@ -273,7 +236,10 @@ export function useSelectedGpsRoute(
         }
       } catch (error) {
         if (!cancelled) {
-          onStatusChangeRef.current?.(getRouteStatus(route))
+          const configurationError = error instanceof ApiError && error.configurationError
+          onStatusChangeRef.current?.(
+            configurationError ? 'configuration-error' : getRouteStatus(route)
+          )
           console.warn(`Unable to refresh GPS route for device ${deviceId}.`, error)
         }
       } finally {
@@ -331,7 +297,12 @@ export function useSelectedGpsRoute(
       try {
         await refreshHistory()
       } catch (error) {
-        if (!cancelled) console.warn(`Unable to load GPS history for device ${deviceId}.`, error)
+        if (!cancelled) {
+          if (error instanceof ApiError && error.configurationError) {
+            onStatusChangeRef.current?.('configuration-error')
+          }
+          console.warn(`Unable to load GPS history for device ${deviceId}.`, error)
+        }
       }
       if (!cancelled) void pollLatest()
     }
