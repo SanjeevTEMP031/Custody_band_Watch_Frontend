@@ -518,6 +518,9 @@
   flex: 1;
   position: relative;
   background: #f8fafc;
+  /* Explicit height ensures Leaflet tiles always render inside a flex child */
+  min-height: 0;
+  height: 100%;
 }
 
 .map-empty-overlay {

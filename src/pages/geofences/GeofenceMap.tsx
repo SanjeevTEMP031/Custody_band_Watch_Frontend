@@ -50,7 +50,7 @@ export default function GeofenceMap({ device, geofences }: { device: Device | nu
         fillColor: '#1976d2',
         fillOpacity: 1,
       })
-        .bindTooltip(device.device_name ?? device.serial_number)
+        .bindTooltip(device.device_name ?? device.serial_number ?? device.device_id)
         .addTo(layer)
       instance.setView([device.last_latitude, device.last_longitude], 14)
     } else if (geofences.length > 0) {

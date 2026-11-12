@@ -81,7 +81,7 @@ export default function AddDevicePage() {
     setBusy(true)
     let saved = 0
     try {
-      for (const value of values) { await createDevice(value, value); saved++ }
+      for (const value of values) { await createDevice({ device_id: value }); saved++ }
       setSuccess(`${saved} devices registered. Model, offset and lock-card settings have not been saved.`)
       setImei('')
       setExcelImeis([])
@@ -118,4 +118,3 @@ export default function AddDevicePage() {
     </Stack>
   </Stack>
 }
-

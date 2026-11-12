@@ -71,11 +71,11 @@ const columns: { label: string; value: (device: Device) => string | number }[] =
 
 export interface DeviceTableProps {
   devices: Device[]
-  onAssign: (id: number) => void
-  onUnassign: (id: number) => void
+  onAssign: (id: string | number) => void
+  onUnassign: (id: string | number) => void
   onDeleteSingle?: (device: Device) => void
-  onSelectionChange?: (selectedIds: number[]) => void
-  selectedIds?: number[]
+  onSelectionChange?: (selectedIds: Array<string | number>) => void
+  selectedIds?: Array<string | number>
   health?: boolean
   onHealth?: (device: Device) => void
 }
@@ -90,7 +90,7 @@ export default function DeviceTable({
   health = false,
   onHealth,
 }: DeviceTableProps) {
-  const [selected, setSelected] = useState<number[]>(selectedIds)
+  const [selected, setSelected] = useState<Array<string | number>>(selectedIds)
   const [menu, setMenu] = useState<{ anchor: HTMLElement; device: Device } | null>(null)
   
   // Horizontal Slider & Panel Resizing State (default 135% so all text is 100% visible)
@@ -120,7 +120,7 @@ export default function DeviceTable({
 
   const [successNotice, setSuccessNotice] = useState('')
 
-  const handleSelectToggle = (id: number) => {
+  const handleSelectToggle = (id: string | number) => {
     const next = selected.includes(id) ? selected.filter(i => i !== id) : [...selected, id]
     setSelected(next)
     onSelectionChange?.(next)

@@ -15,9 +15,9 @@ function DeviceManagementPage() {
   const [pageSize, setPageSize] = useState(20)
   const [actionError, setActionError] = useState('')
   const [actionNotice, setActionNotice] = useState('')
-  const [selectedDeviceId, setSelectedDeviceId] = useState<number | null>(null)
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string | number | null>(null)
   const [selectedPersonId, setSelectedPersonId] = useState('')
-  const [selectedIds, setSelectedIds] = useState<number[]>([])
+  const [selectedIds, setSelectedIds] = useState<Array<string | number>>([])
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
   const [deleteConfirmText, setDeleteConfirmText] = useState('')
   const [singleDeleteDevice, setSingleDeleteDevice] = useState<any>(null)
@@ -46,7 +46,7 @@ function DeviceManagementPage() {
     }
   }
 
-  const handleUnassign = async (deviceId: number) => {
+  const handleUnassign = async (deviceId: string | number) => {
     setActionError('')
     try {
       await unassignDevice(deviceId)
@@ -78,7 +78,7 @@ function DeviceManagementPage() {
         <TextField size="small" label="IMEI / Device Name" value={search} onChange={event => setSearch(event.target.value)} />
         <TextField select size="small" label="Status" value={status} onChange={event => { setStatus(event.target.value); setPage(0) }} sx={{ minWidth: 180 }}>
           <MenuItem value="All">All</MenuItem>
-          {[...new Set(data?.devices.map(device => device.status))].map(value => <MenuItem key={value} value={value}>{value}</MenuItem>)}
+          {[...new Set(data?.devices.map(device => device.status).filter((value): value is string => Boolean(value)))].map(value => <MenuItem key={value} value={value}>{value}</MenuItem>)}
         </TextField>
         <Button type="submit" variant="contained" sx={{ bgcolor: '#00998c', borderRadius: 0.5 }}>Lookup</Button>
                 <Button
@@ -207,5 +207,3 @@ function DeviceManagementPage() {
 }
 
 export default DeviceManagementPage
-
-

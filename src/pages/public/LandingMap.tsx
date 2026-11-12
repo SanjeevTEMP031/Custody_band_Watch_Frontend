@@ -50,13 +50,17 @@ export default function LandingMap() {
         setDevices(updatedList)
         setLastRefreshed(new Date().toLocaleTimeString())
         if (updatedList.length > 0) {
-          const located = updatedList.filter(d => d.last_latitude != null && d.last_longitude != null)
+          // Only consider devices with a confirmed real GPS fix
+          const located = updatedList.filter(d =>
+            (d as any).has_gps_fix === true &&
+            d.last_latitude != null && d.last_longitude != null
+          )
           setSelectedDevice(prev => {
             if (prev) {
               const matched = updatedList.find(d => d.id === prev.id)
               if (matched) return matched
             }
-            return located[0] ?? updatedList[0]
+            return located[0] ?? null
           })
         } else {
           setSelectedDevice(null)
@@ -74,12 +78,14 @@ export default function LandingMap() {
 
   const createLayer = (style: MapTileStyle) => {
     const config = tileLayers[style]
-    const layer = L.tileLayer(config.url, {
+    const options: L.TileLayerOptions = {
       maxZoom: 19,
-      subdomains: config.subdomains,
       attribution: config.attribution,
-    })
-    return layer
+    }
+    if (config.subdomains) {
+      options.subdomains = config.subdomains
+    }
+    return L.tileLayer(config.url, options)
   }
 
   // Initialize Leaflet map
@@ -107,6 +113,11 @@ export default function LandingMap() {
 
     return () => {
       map.remove()
+      // Clear Leaflet's internal ID so the container can be re-used
+      // (needed in React Strict Mode which mounts/unmounts twice)
+      if (mapContainer.current) {
+        delete (mapContainer.current as any)._leaflet_id
+      }
       mapInstance.current = null
       markerGroup.current = null
       activeTileLayer.current = null
@@ -130,8 +141,11 @@ export default function LandingMap() {
 
     markerGroup.current.clearLayers()
 
-    const located = devices.filter(
-      d => d.last_latitude != null && d.last_longitude != null && Number.isFinite(d.last_latitude) && Number.isFinite(d.last_longitude)
+    // Only plot devices with a confirmed real GPS fix — no stale / cell-tower positions
+    const located = devices.filter(d =>
+      (d as any).has_gps_fix === true &&
+      d.last_latitude != null && d.last_longitude != null &&
+      Number.isFinite(d.last_latitude) && Number.isFinite(d.last_longitude)
     )
 
     located.forEach((dev) => {

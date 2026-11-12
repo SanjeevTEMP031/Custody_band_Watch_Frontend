@@ -97,8 +97,8 @@ function LoginPage() {
         login({
           id: user.id,
           email: user.email,
-          name: user.full_name,
-          role: user.role,
+          name: user.full_name || user.email,
+          role: user.role || 'user',
         }),
       )
       navigate('/admin/dashboard', { replace: true })

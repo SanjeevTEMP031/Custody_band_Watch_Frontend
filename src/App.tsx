@@ -23,7 +23,7 @@ function App() {
     getCurrentUser()
       .then((user) => {
         setSessionError('')
-        dispatch(setUser({ id: user.id, email: user.email, name: user.full_name, role: user.role }))
+        dispatch(setUser({ id: user.id, email: user.email, name: user.full_name || user.email, role: user.role || 'user' }))
       })
       .catch((error: unknown) => {
         // Do NOT aggressively logout if session check fails; keep the user on dashboard

@@ -63,6 +63,7 @@ function AppRoutes() {
         <Route path="/admin/location-history" element={<LocationHistoryPage />} />
         <Route path="/admin/journeys" element={<LocationHistoryPage />} />
         <Route path="/admin/journey" element={<LocationHistoryPage />} />
+        <Route path="/admin/route-map" element={<LocationHistoryPage defaultTab="planner" />} />
         <Route path="/admin/geofences" element={<GeofencesPage />} />
         <Route path="/admin/alerts" element={<AlertsPage />} />
         <Route path="/admin/alarm-statistics" element={<AlarmStatisticsPage />} />

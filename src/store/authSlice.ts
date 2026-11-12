@@ -1,7 +1,7 @@
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
 
 interface UserProfile {
-  id?: number
+  id?: number | string
   email: string
   name: string
   role: string

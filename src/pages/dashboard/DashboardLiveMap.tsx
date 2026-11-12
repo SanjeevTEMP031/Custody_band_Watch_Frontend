@@ -1,15 +1,42 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+/**
+ * DashboardLiveMap.tsx
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Live GPS tracking map for the Trackin360 / Custody Watch platform.
+ *
+ * Features:
+ *  • Blue circular marker at current device position (with pulse ring)
+ *  • Blue route loaded from valid GPS history for the selected device
+ *  • Selected device GPS is polled every 3 s without overlapping requests
+ *  • Movement threshold, timestamp ordering, and gap checks suppress jitter
+ *  • Route is retained when stationary and can be hidden without stopping tracking
+ *  • Stale GPS shown with grey marker + yellow warning badge — never hidden
+ *  • Marker updates only to actual reported coordinates
+ *  • No hardcoded coordinates or auto-pan after first fit
+ *
+ * C05 GPS fix validity rules (MNYD protocol):
+ * Accept: status is not 'V', valid coordinates, gps_fix = true
+ *  Reject : status = 'V', lat = 0 / lon = 0, gps_fix = false
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+import { Maximize2, Minimize2, Radio, Compass, Eye, EyeOff } from 'lucide-react'
 import {
-  Maximize2,
-  Minimize2,
-  Radio,
-  Compass,
-} from 'lucide-react'
-import { getLatestGpsLocation, type Device } from '../../services/api'
+  getLatestGpsLocation,
+  type Device,
+  type GpsLocation,
+} from '../../services/api'
 import { isValidGpsCoord } from '../../lib/firebase'
 import { Link } from 'react-router-dom'
+import {
+  SELECTED_GPS_POLL_INTERVAL_MS,
+  useSelectedGpsRoute,
+  type SelectedGpsRouteStatus,
+} from './useSelectedGpsRoute'
+
+// ─── Types ───────────────────────────────────────────────────────────────────
 
 interface DashboardLiveMapProps {
   devices: Device[]
@@ -17,63 +44,127 @@ interface DashboardLiveMapProps {
   selectedDeviceId?: number | string | null
 }
 
+/**
+ * Per-device state kept in a ref (not React state) to avoid re-renders
+ * on every GPS poll while still mutating Leaflet objects in-place.
+ */
 interface MarkerEntry {
   device: Device
+  /** The blue location marker */
   marker: L.Marker
+  /** Current confirmed position */
   currentLat: number
   currentLng: number
-  targetLat: number
-  targetLng: number
-  animFrameId?: number
+  latestFixAt: number | null
 }
 
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const GPS_FRESHNESS_MS = 300_000
+
+/** Poll the backend for the latest GPS fix this often (milliseconds). */
+const POLL_INTERVAL_MS = 10_000
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
 /**
- * Creates custom high-precision GPS marker icon with animated pulse ring,
- * optional heading direction arrow, and wearer name label.
+ * Returns true when the GPS coordinates represent a real, valid fix.
+ * Rejects: (0,0), NaN, Infinity, and coordinates identical to the
+ * device-not-found sentinel (0.000000 N / 0.000000 E).
+ */
+function isAcceptableFix(lat: number, lng: number): boolean {
+  return isValidGpsCoord(lat, lng) && !(lat === 0 && lng === 0)
+}
+
+function timestampMillis(timestamp: unknown): number | null {
+  if (timestamp == null || timestamp === '') return null
+  if (typeof timestamp === 'object') {
+    const timestampValue = timestamp as { seconds?: unknown; toDate?: () => Date }
+    if (typeof timestampValue.toDate === 'function') {
+      const value = timestampValue.toDate().getTime()
+      return Number.isFinite(value) ? value : null
+    }
+    if (typeof timestampValue.seconds === 'number') return timestampValue.seconds * 1000
+  }
+  const numericTimestamp = Number(timestamp)
+  if (Number.isFinite(numericTimestamp) && numericTimestamp > 0) {
+    return numericTimestamp < 1_000_000_000_000 ? numericTimestamp * 1000 : numericTimestamp
+  }
+  const text = String(timestamp).trim()
+  const withTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text) ? text : `${text}Z`
+  const parsed = Date.parse(withTimezone)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function isStaleGps(timestamp: number | null, now = Date.now()): boolean {
+  return timestamp !== null && now - timestamp > GPS_FRESHNESS_MS
+}
+
+// ─── Icon factory ─────────────────────────────────────────────────────────────
+
+/**
+ * Creates a custom GPS marker icon.
+ *
+ * Live / selected  → blue circle with pulse ring
+ * Online (not sel) → green circle
+ * Stale GPS        → grey circle + ⚠ badge in name pill
  */
 function createDeviceIcon(options: {
   isOnline: boolean
   isSelected: boolean
+  isStale: boolean
   heading?: number | null
   deviceName?: string | null
 }): L.DivIcon {
-  const { isOnline, isSelected, heading, deviceName } = options
+  const { isOnline, isSelected, isStale, heading, deviceName } = options
 
-  const coreColor = isSelected ? '#2563eb' : isOnline ? '#10b981' : '#64748b'
-  const ringColor = isSelected ? '#1d4ed8' : isOnline ? '#059669' : '#475569'
-  const haloColor = isSelected
-    ? 'rgba(37, 99, 235, 0.35)'
-    : isOnline
-    ? 'rgba(16, 185, 129, 0.35)'
-    : 'transparent'
+  const coreColor = isStale
+    ? '#94a3b8'
+    : isSelected
+      ? '#2563eb'
+      : isOnline
+        ? '#10b981'
+        : '#64748b'
+  const ringColor = isStale
+    ? '#64748b'
+    : isSelected
+      ? '#1d4ed8'
+      : isOnline
+        ? '#059669'
+        : '#475569'
   const scale = isSelected ? 'scale(1.18)' : 'scale(1)'
 
   const hasHeading = heading != null && Number.isFinite(heading) && heading >= 0
   const rotation = hasHeading ? heading : 0
 
   const innerGraphic = hasHeading
-    ? `<div style="transform: rotate(${rotation}deg); font-size: 11px; line-height: 1; font-weight: 900; color: #ffffff;">▲</div>`
-    : `<div style="width: 8px; height: 8px; border-radius: 50%; background: #ffffff; box-shadow: 0 0 3px rgba(0,0,0,0.4);"></div>`
+    ? `<div style="transform:rotate(${rotation}deg);font-size:11px;line-height:1;font-weight:900;color:#ffffff;">▲</div>`
+    : `<div style="width:8px;height:8px;border-radius:50%;background:#ffffff;box-shadow:0 0 3px rgba(0,0,0,0.4);"></div>`
 
-  const namePillHtml = deviceName
-    ? `<div class="marker-name-pill" style="
-        position: absolute;
-        top: -24px;
-        left: 50%;
-        transform: translateX(-50%);
-        background: rgba(15, 23, 42, 0.90);
-        color: #ffffff;
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-        font-size: 10px;
-        font-weight: 700;
-        padding: 2px 7px;
-        border-radius: 10px;
-        white-space: nowrap;
-        pointer-events: none;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.3);
-        border: 1px solid rgba(255,255,255,0.22);
-      ">${deviceName}</div>`
+  const staleBadge = isStale
+    ? ` <span style="color:#fbbf24;">⚠ Stale</span>`
     : ''
+
+  const namePill = deviceName
+    ? `<div class="marker-name-pill" style="
+        position:absolute;top:-24px;left:50%;transform:translateX(-50%);
+        background:rgba(15,23,42,0.90);color:#ffffff;
+        font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+        font-size:10px;font-weight:700;padding:2px 7px;border-radius:10px;
+        white-space:nowrap;pointer-events:none;
+        box-shadow:0 2px 6px rgba(0,0,0,0.3);border:1px solid rgba(255,255,255,0.22);
+      ">${deviceName}${staleBadge}</div>`
+    : ''
+
+  // Pulse ring — only shown for live, selected device
+  const pulseRing =
+    isSelected && !isStale
+      ? `<div style="
+          position:absolute;inset:-8px;border-radius:50%;
+          border:2px solid ${ringColor};opacity:0.4;
+          animation:gpsPulse 2s ease-out infinite;
+        "></div>`
+      : ''
 
   return L.divIcon({
     className: 'custom-gps-pin',
@@ -82,146 +173,93 @@ function createDeviceIcon(options: {
     popupAnchor: [0, -22],
     html: `
       <div class="pin-wrapper" style="
-        position: relative;
-        width: 36px;
-        height: 36px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        transform: ${scale};
-        transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
+        position:relative;width:36px;height:36px;
+        display:flex;align-items:center;justify-content:center;
+        transform:${scale};
       ">
-        ${namePillHtml}
-        ${isOnline ? `<div class="pin-pulse" style="background: ${haloColor};"></div>` : ''}
+        ${namePill}
+        ${pulseRing}
         <div style="
-          width: 24px;
-          height: 24px;
-          border-radius: 50%;
-          background: ${coreColor};
-          border: 2.5px solid #ffffff;
-          box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35), 0 0 0 2px ${ringColor};
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          position: relative;
-          z-index: 2;
-        ">
-          ${innerGraphic}
-        </div>
+          width:24px;height:24px;border-radius:50%;
+          background:${coreColor};border:2.5px solid #ffffff;
+          box-shadow:0 4px 14px rgba(0,0,0,0.35),0 0 0 2px ${ringColor};
+          display:flex;align-items:center;justify-content:center;
+          position:relative;z-index:2;
+        ">${innerGraphic}</div>
       </div>
     `,
   })
 }
 
+// ─── Popup factory ────────────────────────────────────────────────────────────
+
 /**
- * Creates rich telemetry popup content for a device on the live map.
+ * Builds the HTML string for the Leaflet popup.
+ * Accepts an optional override for speed/battery/heading from the latest GPS poll.
  */
-function createPopupHtml(device: Device, lat: number, lng: number): string {
+function createPopupHtml(
+  device: Device,
+  lat: number,
+  lng: number,
+  overrides?: Partial<GpsLocation>
+): string {
+  const d = device as any
   const isOnline =
-    (device as any).online === true ||
-    (device as any).is_online === true ||
-    (device as any).is_active === true ||
-    String(device.status || (device as any).connection_status || '').toLowerCase() === 'online' ||
+    d.online === true ||
+    d.is_online === true ||
+    d.is_active === true ||
+    String(device.status || d.connection_status || '').toLowerCase() === 'online' ||
     String(device.status || '').toLowerCase() === 'active'
 
-  const hasFix = (device as any).has_gps_fix !== false && (device as any).gps_fix !== false
-  const lastSeenFormatted = device.last_seen ? new Date(device.last_seen).toLocaleString() : 'Live'
-  const speed = (device as any).speed_kmh ?? (device as any).speed ?? null
-  const heading = (device as any).heading ?? null
-  const battery = device.battery_pct ?? (device as any).battery_percent ?? (device as any).battery ?? null
-  const rawWearer = device.device_name || (device as any).wearer_name || device.serial_number || `Watch #${device.id}`
-  const wearer = String(rawWearer).toLowerCase().includes('demo') ? `Watch #${device.id}` : rawWearer
+  const recordedAt =
+    overrides?.recorded_at ??
+    device.gps_update_time ??
+    null
+  const fixTimestamp = timestampMillis(recordedAt)
+  const isStale = isStaleGps(fixTimestamp)
+
+  const speed = overrides?.speed_kmh ?? d.speed_kmh ?? d.speed ?? null
+  const heading = overrides?.heading ?? d.heading ?? null
+  const battery =
+    overrides?.battery_pct ??
+    device.battery_pct ??
+    d.battery_percent ??
+    d.battery ??
+    null
+  const lastSeenStr = fixTimestamp !== null ? new Date(fixTimestamp).toLocaleString() : '—'
+
+  const rawName = device.device_name || d.wearer_name || device.serial_number || `Watch #${device.id}`
+  const wearer = String(rawName).toLowerCase().includes('demo') ? `Watch #${device.id}` : rawName
 
   return `
-    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 13px; line-height: 1.4; min-width: 220px; padding: 4px;">
-      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; border-bottom: 1px solid #e2e8f0; padding-bottom: 5px;">
-        <strong style="color: #0f172a; font-size: 14px;">${wearer}</strong>
-        <span style="font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 9999px; background: ${isOnline ? '#dcfce7' : '#f1f5f9'}; color: ${isOnline ? '#15803d' : '#64748b'};">
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:13px;line-height:1.4;min-width:230px;padding:4px;">
+      ${isStale ? `<div style="background:#fef9c3;border:1px solid #fbbf24;border-radius:6px;padding:5px 8px;margin-bottom:7px;font-size:10px;color:#92400e;font-weight:600;">
+        ⚠ Stale GPS — the last valid fix is older than five minutes.
+      </div>` : ''}
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;border-bottom:1px solid #e2e8f0;padding-bottom:5px;">
+        <strong style="color:#0f172a;font-size:14px;">${wearer}</strong>
+        <span style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:9999px;background:${isOnline ? '#dcfce7' : '#f1f5f9'};color:${isOnline ? '#15803d' : '#64748b'};">
           ${isOnline ? 'ONLINE' : 'OFFLINE'}
         </span>
       </div>
-      <div style="color: #475569; font-size: 11px; margin-bottom: 3px;">
-        <strong>IMEI:</strong> ${device.imei || device.serial_number || 'N/A'}
-      </div>
-      <div style="color: #475569; font-size: 11px; margin-bottom: 3px;">
-        <strong>Battery:</strong> <span style="font-weight: 600; color: ${battery != null && battery <= 20 ? '#dc2626' : '#16a34a'};">${battery != null ? `${battery}%` : 'N/A'}</span>
-      </div>
-      ${speed != null && speed > 0 ? `<div style="color: #475569; font-size: 11px; margin-bottom: 3px;"><strong>Speed:</strong> ${speed} km/h</div>` : ''}
-      ${heading != null && heading >= 0 ? `<div style="color: #475569; font-size: 11px; margin-bottom: 3px;"><strong>Heading:</strong> ${Math.round(heading)}°</div>` : ''}
-      <div style="color: #475569; font-size: 11px; margin-bottom: 3px;">
-        <strong>GPS Status:</strong> <span style="font-weight: 600; color: ${hasFix ? '#16a34a' : '#d97706'};">${hasFix ? 'GPS Active' : 'No GPS Fix'}</span>
-      </div>
-      <div style="color: #64748b; font-size: 10px; margin-bottom: 3px;">
-        <strong>Coordinates:</strong> ${lat.toFixed(5)}, ${lng.toFixed(5)}
-      </div>
-      <div style="color: #64748b; font-size: 10px; margin-bottom: 8px;">
-        <strong>Last Update:</strong> ${lastSeenFormatted}
-      </div>
-      <a href="/admin/journeys?device=${device.id}" style="display: block; text-align: center; background: #2563eb; color: #ffffff; text-decoration: none; padding: 6px 12px; border-radius: 6px; font-size: 11px; font-weight: 700; margin-bottom: 4px;">
-        View Live Route & Journey &rarr;
+      <div style="color:#475569;font-size:11px;margin-bottom:3px;"><strong>IMEI:</strong> ${device.imei || device.serial_number || 'N/A'}</div>
+      <div style="color:#475569;font-size:11px;margin-bottom:3px;"><strong>Battery:</strong> <span style="font-weight:600;color:${battery != null && battery <= 20 ? '#dc2626' : '#16a34a'};">${battery != null ? `${battery}%` : 'N/A'}</span></div>
+      ${speed != null && speed > 0 ? `<div style="color:#475569;font-size:11px;margin-bottom:3px;"><strong>Speed:</strong> ${Number(speed).toFixed(1)} km/h</div>` : ''}
+      ${heading != null && heading >= 0 ? `<div style="color:#475569;font-size:11px;margin-bottom:3px;"><strong>Heading:</strong> ${Math.round(Number(heading))}°</div>` : ''}
+      <div style="color:#475569;font-size:11px;margin-bottom:3px;"><strong>GPS Status:</strong> <span style="font-weight:600;color:${isStale ? '#d97706' : '#16a34a'};">${isStale ? '🟡 Stale' : fixTimestamp !== null ? '🟢 Recent Fix' : '⚪ Time Unknown'}</span></div>
+      <div style="color:#64748b;font-size:10px;margin-bottom:3px;"><strong>Coordinates:</strong> ${lat.toFixed(5)}, ${lng.toFixed(5)}</div>
+      <div style="color:#64748b;font-size:10px;margin-bottom:8px;"><strong>GPS Time:</strong> ${lastSeenStr}</div>
+      <a href="/admin/journeys?device=${device.id}" style="display:block;text-align:center;background:#2563eb;color:#ffffff;text-decoration:none;padding:6px 12px;border-radius:6px;font-size:11px;font-weight:700;margin-bottom:4px;">
+        View Live Route &amp; Journey →
       </a>
-      <a href="/admin/monitoring-center?device=${device.id}" style="display: block; text-align: center; background: #f1f5f9; color: #334155; text-decoration: none; padding: 4px 10px; border-radius: 6px; font-size: 10px; font-weight: 600;">
-        Open Monitoring Center &rarr;
+      <a href="/admin/monitoring-center?device=${device.id}" style="display:block;text-align:center;background:#f1f5f9;color:#334155;text-decoration:none;padding:4px 10px;border-radius:6px;font-size:10px;font-weight:600;">
+        Open Monitoring Center →
       </a>
     </div>
   `
 }
 
-/**
- * Smoothly animates a Leaflet marker between coordinates via requestAnimationFrame
- * using an ease-out cubic curve. This ensures the dot glides fluidly across the
- * map without any jumping, blinking, or screen refreshes.
- */
-function animateMarker(
-  entry: MarkerEntry,
-  toLat: number,
-  toLng: number,
-  durationMs = 950
-) {
-  if (entry.animFrameId) {
-    cancelAnimationFrame(entry.animFrameId)
-    entry.animFrameId = undefined
-  }
-
-  const fromLat = entry.currentLat
-  const fromLng = entry.currentLng
-
-  // Micro-jitter filter (< 0.3 meter movement)
-  if (Math.abs(toLat - fromLat) < 0.000003 && Math.abs(toLng - fromLng) < 0.000003) {
-    entry.marker.setLatLng([toLat, toLng])
-    entry.currentLat = toLat
-    entry.currentLng = toLng
-    return
-  }
-
-  const startTime = performance.now()
-  // Ease Out Cubic: natural glide with smooth deceleration
-  const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3)
-
-  const step = (now: number) => {
-    const elapsed = now - startTime
-    const progress = Math.min(elapsed / durationMs, 1)
-    const eased = easeOutCubic(progress)
-
-    const lat = fromLat + (toLat - fromLat) * eased
-    const lng = fromLng + (toLng - fromLng) * eased
-
-    entry.marker.setLatLng([lat, lng])
-    entry.currentLat = lat
-    entry.currentLng = lng
-
-    if (progress < 1) {
-      entry.animFrameId = requestAnimationFrame(step)
-    } else {
-      entry.marker.setLatLng([toLat, toLng])
-      entry.currentLat = toLat
-      entry.currentLng = toLng
-      entry.animFrameId = undefined
-    }
-  }
-
-  entry.animFrameId = requestAnimationFrame(step)
-}
+// ─── Component ────────────────────────────────────────────────────────────────
 
 export default function DashboardLiveMap({
   devices,
@@ -238,7 +276,11 @@ export default function DashboardLiveMap({
 
   const [mapStyle, setMapStyle] = useState<'standard' | 'humanitarian' | 'voyager'>('standard')
   const [isFullscreen, setIsFullscreen] = useState(false)
+  const [isTrailVisible, setIsTrailVisible] = useState(true)
+  const [mapForTracking, setMapForTracking] = useState<L.Map | null>(null)
+  const [gpsRouteStatus, setGpsRouteStatus] = useState<SelectedGpsRouteStatus>('loading')
 
+  // Map tile providers
   const mapTileProviders = {
     standard: {
       url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
@@ -254,14 +296,124 @@ export default function DashboardLiveMap({
     },
   }
 
-  // Filter devices that have valid GPS coordinates
+  // Only devices that have a known, valid coordinate to show on the map
   const locatedDevices = devices.filter((d) => {
     const lat = d.last_latitude ?? (d as any).latitude
     const lng = d.last_longitude ?? (d as any).longitude
-    return isValidGpsCoord(lat, lng)
+    return isAcceptableFix(Number(lat), Number(lng))
   })
 
-  // 1. Initialize Leaflet Map
+  const selectedDevice = devices.find(
+    (device) =>
+      String(device.id) === String(selectedDeviceId) ||
+      String(device.device_id) === String(selectedDeviceId)
+  )
+  const trackingDeviceId = selectedDevice
+    ? String(selectedDevice.device_id || selectedDevice.imei || selectedDevice.serial_number || selectedDevice.id)
+    : null
+  const firestoreLatest = useMemo<GpsLocation | null>(() => {
+    if (
+      selectedDevice?.gps_fix_source !== 'firestore_last_fix' ||
+      selectedDevice.has_gps_fix !== true ||
+      selectedDevice.last_latitude == null ||
+      selectedDevice.last_longitude == null ||
+      !selectedDevice.gps_update_time
+    ) return null
+    return {
+      device_id: trackingDeviceId ?? undefined,
+      latitude: selectedDevice.last_latitude,
+      longitude: selectedDevice.last_longitude,
+      recorded_at: selectedDevice.gps_update_time,
+      gps_fix: true,
+      gps_status: 'GPS Locked',
+      status: 'GPS Locked',
+    }
+  }, [selectedDevice, trackingDeviceId])
+
+  const handleFreshGpsPoint = useCallback((point: GpsLocation) => {
+    if (selectedDeviceId == null) return
+    const markerKey = String(selectedDevice?.id ?? selectedDeviceId)
+    const latitude = Number(point.latitude)
+    const longitude = Number(point.longitude)
+    const timestamp = timestampMillis(point.recorded_at)
+    if (timestamp === null || !isAcceptableFix(latitude, longitude)) return
+    let entry = markersMapRef.current.get(markerKey)
+    if (!entry) {
+      const map = mapInstanceRef.current
+      const markerGroup = markerGroupRef.current
+      if (!map || !markerGroup || !selectedDevice) return
+      const device = {
+        ...selectedDevice,
+        last_latitude: latitude,
+        last_longitude: longitude,
+        gps_update_time: new Date(timestamp).toISOString(),
+      }
+      const marker = L.marker([latitude, longitude], {
+        icon: createDeviceIcon({
+          isOnline: device.online === true || device.is_online === true,
+          isSelected: true,
+          isStale: false,
+          heading: point.heading ?? device.heading,
+          deviceName: device.device_name || `Watch #${device.id}`,
+        }),
+        zIndexOffset: 1200,
+      })
+      marker.bindPopup(createPopupHtml(device, latitude, longitude, point), { maxWidth: 280 })
+      marker.on('click', () => onSelectDevice?.(selectedDevice))
+      marker.addTo(markerGroup)
+      entry = {
+        device,
+        marker,
+        currentLat: latitude,
+        currentLng: longitude,
+        latestFixAt: null,
+      }
+      markersMapRef.current.set(markerKey, entry)
+    }
+    if (entry.latestFixAt !== null && timestamp <= entry.latestFixAt) return
+
+    entry.currentLat = latitude
+    entry.currentLng = longitude
+    entry.latestFixAt = timestamp
+    entry.device = {
+      ...entry.device,
+      last_latitude: latitude,
+      last_longitude: longitude,
+      gps_update_time: new Date(timestamp).toISOString(),
+      ...(point.speed_kmh != null ? { speed_kmh: Number(point.speed_kmh) } : {}),
+      ...(point.heading != null ? { heading: Number(point.heading) } : {}),
+      ...(point.battery_pct != null ? { battery_pct: Number(point.battery_pct) } : {}),
+    }
+    const markerElement = entry.marker.getElement()
+    markerElement?.classList.add('gps-marker-moving')
+    entry.marker.setLatLng([latitude, longitude])
+    if (markerElement) {
+      window.setTimeout(() => markerElement.classList.remove('gps-marker-moving'), 750)
+    }
+    entry.marker.setIcon(createDeviceIcon({
+      isOnline: entry.device.online === true || entry.device.is_online === true,
+      isSelected: true,
+      isStale: false,
+      heading: point.heading ?? entry.device.heading,
+      deviceName: entry.device.device_name || `Watch #${entry.device.id}`,
+    }))
+    entry.marker.setPopupContent(
+      createPopupHtml(entry.device, latitude, longitude, point)
+    )
+  }, [onSelectDevice, selectedDevice, selectedDeviceId])
+
+  useSelectedGpsRoute(
+    mapForTracking,
+    trackingDeviceId,
+    isTrailVisible,
+    handleFreshGpsPoint,
+    undefined,
+    setGpsRouteStatus,
+    mapForTracking !== null,
+    firestoreLatest
+  )
+
+  // ── Effect 1: Initialise Leaflet map (runs ONCE) ──────────────────────────
   useEffect(() => {
     if (!mapContainerRef.current) return
 
@@ -271,8 +423,8 @@ export default function DashboardLiveMap({
           Number(firstLocated.last_latitude ?? (firstLocated as any).latitude),
           Number(firstLocated.last_longitude ?? (firstLocated as any).longitude),
         ]
-      : [20.5937, 78.9629]
-    const initialZoom = firstLocated ? 14 : 4
+      : [20.5937, 78.9629] // India centre as fallback
+    const initialZoom = firstLocated ? 15 : 4
 
     const map = L.map(mapContainerRef.current, {
       center: initialCenter,
@@ -285,6 +437,7 @@ export default function DashboardLiveMap({
     const initialTiles = L.tileLayer(mapTileProviders[mapStyle].url, {
       maxZoom: 19,
       attribution: mapTileProviders[mapStyle].attribution,
+      crossOrigin: '',
     }).addTo(map)
 
     const markers = L.layerGroup().addTo(map)
@@ -292,43 +445,43 @@ export default function DashboardLiveMap({
     mapInstanceRef.current = map
     markerGroupRef.current = markers
     tileLayerRef.current = initialTiles
+    setMapForTracking(map)
 
-    // Handle container resize smoothly
+    // Force size recalculation after first paint (flex container height resolves late)
+    const sizeTimer = setTimeout(() => map.invalidateSize({ pan: false }), 150)
+
+    // Handle container resize
     const resizeObserver = new ResizeObserver(() => {
       map.invalidateSize({ pan: false })
     })
     resizeObserver.observe(mapContainerRef.current)
 
     return () => {
+      clearTimeout(sizeTimer)
       resizeObserver.disconnect()
-
-      // Clean up any running marker animations
-      for (const entry of markersMapRef.current.values()) {
-        if (entry.animFrameId) cancelAnimationFrame(entry.animFrameId)
-      }
       markersMapRef.current.clear()
-
       map.remove()
       mapInstanceRef.current = null
       markerGroupRef.current = null
       tileLayerRef.current = null
     }
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // 2. Switch Tile Style
+  // ── Effect 2: Switch tile layer style ────────────────────────────────────
   useEffect(() => {
     if (!mapInstanceRef.current) return
-    if (tileLayerRef.current) {
-      tileLayerRef.current.remove()
-    }
+    tileLayerRef.current?.remove()
     const provider = mapTileProviders[mapStyle]
     tileLayerRef.current = L.tileLayer(provider.url, {
       maxZoom: 19,
       attribution: provider.attribution,
+      crossOrigin: '',
     }).addTo(mapInstanceRef.current)
-  }, [mapStyle])
+  }, [mapStyle]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // 3. Update Markers smoothly without recreating or resetting map viewport
+  // ── Effect 3: Sync markers from device list ───────────────────────────────
+  // Runs whenever the devices prop changes (Firestore real-time push).
+  // Creates new markers; updates icons/popups; never moves marker from jitter.
   useEffect(() => {
     const map = mapInstanceRef.current
     const markersGroup = markerGroupRef.current
@@ -345,82 +498,87 @@ export default function DashboardLiveMap({
       const lng = Number(device.last_longitude ?? (device as any).longitude)
       bounds.push([lat, lng])
 
-      const isSelected = String(selectedDeviceId) === key
+      const isSelected =
+        String(selectedDeviceId) === key || String(selectedDeviceId) === String(device.device_id)
       const isOnline =
         (device as any).online === true ||
         (device as any).is_online === true ||
         (device as any).is_active === true ||
         String(device.status || (device as any).connection_status || '').toLowerCase() === 'online' ||
         String(device.status || '').toLowerCase() === 'active'
-
       const rawName = device.device_name || (device as any).wearer_name || `Watch #${device.id}`
       const deviceName = String(rawName).toLowerCase().includes('demo') ? `Watch #${device.id}` : rawName
       const heading = (device as any).heading ?? null
-
+      let entry = markersMapRef.current.get(key)
+      const gpsTimestamp = timestampMillis(device.gps_update_time)
+      const preserveTrackedFix =
+        isSelected &&
+        entry?.latestFixAt !== null &&
+        entry?.latestFixAt !== undefined &&
+        (gpsTimestamp === null || gpsTimestamp < entry.latestFixAt)
+      const fixTimestamp = entry && preserveTrackedFix ? entry.latestFixAt : gpsTimestamp
+      const markerDevice = preserveTrackedFix && entry
+        ? {
+            ...device,
+            last_latitude: entry.currentLat,
+            last_longitude: entry.currentLng,
+            gps_update_time: fixTimestamp !== null
+              ? new Date(fixTimestamp).toISOString()
+              : device.gps_update_time,
+          }
+        : device
       const icon = createDeviceIcon({
         isOnline,
         isSelected,
+        isStale: isStaleGps(fixTimestamp),
         heading,
         deviceName,
       })
-
-      const popupHtml = createPopupHtml(device, lat, lng)
-
-      let entry = markersMapRef.current.get(key)
+      const popupHtml = createPopupHtml(markerDevice, entry?.currentLat ?? lat, entry?.currentLng ?? lng)
 
       if (!entry) {
-        // --- A. NEW MARKER: Create once and add to persistent registry ---
+        // ── A. First time seeing this device — create marker ─────────────
         const marker = L.marker([lat, lng], {
           icon,
           zIndexOffset: isSelected ? 1200 : 1000,
         })
-
-        marker.bindPopup(popupHtml)
-        marker.on('click', () => {
-          onSelectDevice?.(device)
-        })
-
+        marker.bindPopup(popupHtml, { maxWidth: 280 })
+        marker.on('click', () => onSelectDevice?.(device))
         marker.addTo(markersGroup)
 
         entry = {
-          device,
+          device: markerDevice,
           marker,
           currentLat: lat,
           currentLng: lng,
-          targetLat: lat,
-          targetLng: lng,
+          latestFixAt: fixTimestamp,
         }
         markersMapRef.current.set(key, entry)
       } else {
-        // --- B. EXISTING MARKER: Update in-place & animate position smoothly ---
-        entry.device = device
+        // ── B. Device already on map — Firestore pushed updated last_lat/last_lng ──
+        entry.device = markerDevice
+        if (!preserveTrackedFix && gpsTimestamp !== null) {
+          entry.latestFixAt = gpsTimestamp
+        }
         entry.marker.setIcon(icon)
         entry.marker.setZIndexOffset(isSelected ? 1200 : 1000)
         entry.marker.setPopupContent(popupHtml)
 
-        // If coordinates changed, glide smoothly to new position!
-        if (
-          Math.abs(entry.currentLat - lat) > 0.000003 ||
-          Math.abs(entry.currentLng - lng) > 0.000003
-        ) {
-          entry.targetLat = lat
-          entry.targetLng = lng
-          animateMarker(entry, lat, lng)
-        }
+          // ── Extend the purple trail with the new Firestore-confirmed position
+          // Trail path: [previous last_lat, last_lng] → [new last_lat, last_lng]
       }
     })
 
-    // Clean up markers for removed devices
+    // Remove markers/trails for devices no longer in the list
     for (const [key, entry] of markersMapRef.current.entries()) {
       if (!currentDeviceKeys.has(key)) {
-        if (entry.animFrameId) cancelAnimationFrame(entry.animFrameId)
+        if (key === String(selectedDevice?.id) && entry.latestFixAt !== null) continue
         entry.marker.remove()
         markersMapRef.current.delete(key)
       }
     }
 
-    // Initial viewport: fit bounds ONCE only on first load!
-    // NEVER call fitBounds on subsequent coordinates updates to avoid jarring resets!
+    // Fit map to all device positions ONCE on first load only
     if (!hasInitialFittedRef.current && bounds.length > 0) {
       hasInitialFittedRef.current = true
       if (bounds.length === 1) {
@@ -429,30 +587,69 @@ export default function DashboardLiveMap({
         map.fitBounds(bounds, { padding: [40, 40], maxZoom: 15 })
       }
     }
-  }, [devices, selectedDeviceId])
+  }, [devices, selectedDeviceId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // 4. Smooth Pan when selected device changes
-  useEffect(() => {
-    if (!selectedDeviceId || !mapInstanceRef.current) return
-    const entry = markersMapRef.current.get(String(selectedDeviceId))
-    if (entry) {
-      mapInstanceRef.current.panTo([entry.currentLat, entry.currentLng], {
-        animate: true,
-        duration: 0.8,
-      })
-    }
-  }, [selectedDeviceId])
-
-  // 5. Shortest-time telemetry polling: 3-second background polling for active watches
+  // ── Effect 4: Live GPS polling every 10 s ────────────────────────────────
+  // Keep non-selected markers current; the selected device is polled by the route hook.
   useEffect(() => {
     if (locatedDevices.length === 0) return
 
     let isCancelled = false
+    const applyGpsFix = (entry: MarkerEntry, fix: GpsLocation) => {
+      const latitude = Number(fix.latitude)
+      const longitude = Number(fix.longitude)
+      const timestamp = timestampMillis(fix.recorded_at)
+      const status = String(fix.status ?? fix.gps_status ?? '').toUpperCase()
+      if (
+        fix.gps_fix === false ||
+        status === 'V' ||
+        timestamp === null ||
+        !isAcceptableFix(latitude, longitude) ||
+        (entry.latestFixAt !== null && timestamp <= entry.latestFixAt)
+      ) return
+
+      const speed = fix.speed_kmh == null ? null : Number(fix.speed_kmh)
+
+      entry.latestFixAt = timestamp
+      entry.currentLat = latitude
+      entry.currentLng = longitude
+      entry.marker.setLatLng([latitude, longitude])
+      entry.device = {
+        ...entry.device,
+        last_latitude: latitude,
+        last_longitude: longitude,
+        gps_update_time: new Date(timestamp).toISOString(),
+        has_gps_fix: true,
+        gps_fix: true,
+        ...(fix.speed_kmh != null ? { speed_kmh: speed } : {}),
+        ...(fix.heading != null ? { heading: Number(fix.heading) } : {}),
+        ...(fix.battery_pct != null ? { battery_pct: Number(fix.battery_pct) } : {}),
+      }
+
+      const rawName = entry.device.device_name || entry.device.wearer_name || `Watch #${entry.device.id}`
+      const deviceName = String(rawName).toLowerCase().includes('demo')
+        ? `Watch #${entry.device.id}`
+        : rawName
+      entry.marker.setIcon(
+        createDeviceIcon({
+          isOnline: entry.device.online === true || entry.device.is_online === true,
+          isSelected: String(selectedDeviceId) === String(entry.device.id),
+          isStale: isStaleGps(entry.latestFixAt),
+          heading: fix.heading ?? entry.device.heading,
+          deviceName,
+        })
+      )
+      entry.marker.setPopupContent(createPopupHtml(entry.device, latitude, longitude, fix))
+    }
 
     const pollActiveWatches = async () => {
-      // Poll selected watch first, or all located watches
+      // Poll selected device first; otherwise poll up to 5 devices
       const targets = selectedDeviceId
-        ? locatedDevices.filter((d) => String(d.id) === String(selectedDeviceId))
+        ? locatedDevices.filter(
+            (device) =>
+              String(device.id) !== String(selectedDeviceId) &&
+              String(device.device_id) !== String(selectedDeviceId)
+          ).slice(0, 5)
         : locatedDevices.slice(0, 5)
 
       for (const dev of targets) {
@@ -460,65 +657,25 @@ export default function DashboardLiveMap({
         try {
           const latestGps = await getLatestGpsLocation(dev.id)
           if (isCancelled || !latestGps) continue
-          if (!isValidGpsCoord(latestGps.latitude, latestGps.longitude)) continue
+
+          // ── C05 GPS fix validation ──────────────────────────────────────
+          // Reject: V-status (gps_fix = false) or zero/null coordinates
+          if (!latestGps.gps_fix) continue
+          if (!isAcceptableFix(latestGps.latitude, latestGps.longitude)) continue
 
           const entry = markersMapRef.current.get(String(dev.id))
-          if (entry) {
-            // Check if coordinates moved
-            const hasMoved =
-              Math.abs(entry.targetLat - latestGps.latitude) > 0.000003 ||
-              Math.abs(entry.targetLng - latestGps.longitude) > 0.000003
+          if (!entry) continue
 
-            if (hasMoved) {
-              entry.targetLat = latestGps.latitude
-              entry.targetLng = latestGps.longitude
-
-              const updatedDev: Device = {
-                ...entry.device,
-                last_latitude: latestGps.latitude,
-                last_longitude: latestGps.longitude,
-                battery_pct: latestGps.battery_pct ?? entry.device.battery_pct,
-                last_seen: latestGps.recorded_at,
-                ...(latestGps.speed_kmh != null ? { speed_kmh: latestGps.speed_kmh } : {}),
-                ...(latestGps.heading != null ? { heading: latestGps.heading } : {}),
-              } as Device
-              entry.device = updatedDev
-
-              entry.marker.setPopupContent(
-                createPopupHtml(updatedDev, latestGps.latitude, latestGps.longitude)
-              )
-
-              entry.marker.setIcon(
-                createDeviceIcon({
-                  isOnline: true,
-                  isSelected: String(selectedDeviceId) === String(dev.id),
-                  heading: latestGps.heading,
-                  deviceName: (() => {
-                    const n = updatedDev.device_name || (updatedDev as any).wearer_name || `Watch #${updatedDev.id}`
-                    return String(n).toLowerCase().includes('demo') ? `Watch #${updatedDev.id}` : n
-                  })(),
-                })
-              )
-
-              // Glide the dot smoothly to the new position!
-              animateMarker(entry, latestGps.latitude, latestGps.longitude, 1000)
-
-              // If currently selected, gently pan along with movement
-              if (String(selectedDeviceId) === String(dev.id) && mapInstanceRef.current) {
-                mapInstanceRef.current.panTo([latestGps.latitude, latestGps.longitude], {
-                  animate: true,
-                  duration: 0.8,
-                })
-              }
-            }
-          }
-        } catch {
-          // Continue gracefully
+          applyGpsFix(entry, latestGps)
+        } catch (error) {
+          console.warn(`Unable to refresh GPS for device ${dev.id}; keeping the current route.`, error)
         }
       }
     }
 
-    const intervalId = window.setInterval(pollActiveWatches, 3000)
+    // Poll every 10 s; run once immediately
+    pollActiveWatches()
+    const intervalId = window.setInterval(pollActiveWatches, POLL_INTERVAL_MS)
 
     return () => {
       isCancelled = true
@@ -526,70 +683,109 @@ export default function DashboardLiveMap({
     }
   }, [locatedDevices.map((d) => d.id).join(','), selectedDeviceId])
 
-  // Recenter / fit bounds manually
+  useEffect(() => {
+    const refreshGpsStatus = () => {
+      const now = Date.now()
+      for (const entry of markersMapRef.current.values()) {
+        const rawName =
+          entry.device.device_name || (entry.device as any).wearer_name || `Watch #${entry.device.id}`
+        const deviceName = String(rawName).toLowerCase().includes('demo')
+          ? `Watch #${entry.device.id}`
+          : rawName
+        const isOnline = entry.device.online === true || entry.device.is_online === true
+        entry.marker.setIcon(
+          createDeviceIcon({
+            isOnline,
+            isSelected: String(selectedDeviceId) === String(entry.device.id),
+            isStale: isStaleGps(entry.latestFixAt, now),
+            heading: entry.device.heading,
+            deviceName,
+          })
+        )
+        const markerPosition = entry.marker.getLatLng()
+        entry.marker.setPopupContent(
+          createPopupHtml(entry.device, markerPosition.lat, markerPosition.lng)
+        )
+      }
+    }
+
+    refreshGpsStatus()
+    const timerId = window.setInterval(refreshGpsStatus, 5_000)
+    return () => window.clearInterval(timerId)
+  }, [selectedDeviceId])
+
+  // ── Recenter / fit bounds handler ─────────────────────────────────────────
   const handleRecenter = useCallback(() => {
     if (!mapInstanceRef.current) return
-    if (locatedDevices.length > 0) {
-      const bounds: [number, number][] = locatedDevices.map((d) => [
-        Number(d.last_latitude ?? (d as any).latitude),
-        Number(d.last_longitude ?? (d as any).longitude),
-      ])
-      if (bounds.length === 1) {
-        mapInstanceRef.current.setView(bounds[0], 15)
-      } else {
-        mapInstanceRef.current.fitBounds(bounds, { padding: [40, 40] })
-      }
+    if (locatedDevices.length === 0) return
+    const bounds: [number, number][] = locatedDevices.map((d) => [
+      Number(d.last_latitude ?? (d as any).latitude),
+      Number(d.last_longitude ?? (d as any).longitude),
+    ])
+    if (bounds.length === 1) {
+      mapInstanceRef.current.setView(bounds[0], 16)
+    } else {
+      mapInstanceRef.current.fitBounds(bounds, { padding: [40, 40] })
     }
   }, [locatedDevices])
 
-  // Toggle Fullscreen
-  const toggleFullscreen = () => {
-    if (!wrapperRef.current) return
-    if (!isFullscreen) {
-      if (wrapperRef.current.requestFullscreen) {
-        wrapperRef.current.requestFullscreen()
-      }
-      setIsFullscreen(true)
-    } else {
-      if (document.exitFullscreen) {
-        document.exitFullscreen()
-      }
-      setIsFullscreen(false)
-    }
-  }
+  // ── Fullscreen toggle ─────────────────────────────────────────────────────
+  const toggleFullscreen = useCallback(() => {
+    setIsFullscreen((f) => {
+      wrapperRef.current?.classList.toggle('is-fullscreen', !f)
+      setTimeout(() => mapInstanceRef.current?.invalidateSize({ pan: false }), 100)
+      return !f
+    })
+  }, [])
 
+  // ─── Render ───────────────────────────────────────────────────────────────
   return (
     <div
       ref={wrapperRef}
-      className={'dashboard-live-map-wrapper ' + (isFullscreen ? 'is-fullscreen' : '')}
+      className={`dashboard-live-map-wrapper${isFullscreen ? ' is-fullscreen' : ''}`}
     >
-      {/* Map Header Bar */}
+      {/* ── Map card header ── */}
       <div className="map-card-header">
         <div className="map-title-group">
           <div className="map-badge-icon">
-            <Radio size={16} className="text-emerald-500 animate-pulse" />
+            <Radio size={16} />
           </div>
           <div>
             <h3 className="map-heading">Live Telemetry Map</h3>
             <p className="map-subheading">
-              OpenStreetMap real-time GPS positioning &bull; {locatedDevices.length} active markers
-              &bull; 3s live polling
+              OpenStreetMap real-time GPS positioning
+              {' • '}
+              {locatedDevices.length} active marker{locatedDevices.length !== 1 ? 's' : ''}
+              {' • '}
+              Selected route refreshes every {SELECTED_GPS_POLL_INTERVAL_MS / 1000}s
             </p>
           </div>
         </div>
 
-        {/* Map View & Control Actions */}
         <div className="map-controls-group">
-          {/* Layer switcher */}
+          {selectedDevice && (
+            <button
+              type="button"
+              className="map-action-btn"
+              onClick={() => setIsTrailVisible((visible) => !visible)}
+              title={isTrailVisible ? 'Hide selected device route' : 'Show selected device route'}
+              aria-label={isTrailVisible ? 'Hide selected device route' : 'Show selected device route'}
+              aria-pressed={isTrailVisible}
+            >
+              {isTrailVisible ? <Eye size={16} /> : <EyeOff size={16} />}
+            </button>
+          )}
+
+          {/* Tile style selector */}
           <select
             className="map-layer-select"
             value={mapStyle}
-            onChange={(e) => setMapStyle(e.target.value as any)}
-            aria-label="Map Tile Style"
+            onChange={(e) => setMapStyle(e.target.value as typeof mapStyle)}
+            aria-label="Map style"
           >
             <option value="standard">Standard Street</option>
-            <option value="voyager">Carto Light</option>
             <option value="humanitarian">Humanitarian</option>
+            <option value="voyager">Voyager</option>
           </select>
 
           {/* Recenter */}
@@ -597,8 +793,8 @@ export default function DashboardLiveMap({
             type="button"
             className="map-action-btn"
             onClick={handleRecenter}
-            title="Recenter Map View"
-            aria-label="Recenter Map"
+            title="Recenter on all devices"
+            aria-label="Recenter map"
           >
             <Compass size={16} />
           </button>
@@ -616,14 +812,21 @@ export default function DashboardLiveMap({
         </div>
       </div>
 
-      {/* Map Canvas */}
+      {/* ── Map canvas ── */}
       <div className="map-canvas-container" ref={mapContainerRef}>
+        {selectedDevice && (gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'history-mismatch') && (
+          <div className="gps-route-status" role="status">
+            {gpsRouteStatus === 'history-mismatch'
+              ? 'A newer source-verified Firestore GPS fix is not in backend history. The marker may show that fix, but it is not added to the recorded trail until the backend history confirms it.'
+              : 'No fresh valid GPS fix received from the backend. Any visible trail contains recorded GPS points only; no movement is simulated.'}
+          </div>
+        )}
         {locatedDevices.length === 0 && (
           <div className="map-empty-overlay">
             <div className="map-empty-badge">
               <Compass size={24} className="text-cyan-600 mb-2" />
               <h4>Awaiting GPS Coordinates</h4>
-              <p>Registered bands will appear live on this OpenStreetMap grid as soon as telemetry packets arrive.</p>
+              <p>Registered bands will appear live on this OpenStreetMap grid as soon as telemetry packets are received from the C05 GPS watch.</p>
               <Link to="/admin/device-management" className="map-empty-link">
                 Manage Devices &rarr;
               </Link>
@@ -632,24 +835,58 @@ export default function DashboardLiveMap({
         )}
       </div>
 
-      {/* Pulse Pin Animation Styles */}
+      {/* ── Inline styles ── */}
       <style>{`
-        .pin-pulse {
-          position: absolute;
-          width: 36px;
-          height: 36px;
-          border-radius: 50%;
-          animation: mapPulse 2s infinite ease-out;
-          pointer-events: none;
-        }
-        @keyframes mapPulse {
-          0% { transform: scale(0.6); opacity: 0.9; }
-          100% { transform: scale(1.6); opacity: 0; }
-        }
+        /* ── GPS marker icon ─────────────────────────────────────────────── */
         .custom-gps-pin {
           background: transparent !important;
           border: none !important;
         }
+
+        .custom-gps-pin.gps-marker-moving {
+          transition: transform 700ms ease-out;
+        }
+
+        /* Pulse ring animation on selected/live marker */
+        @keyframes gpsPulse {
+          0%   { transform: scale(0.9); opacity: 0.6; }
+          70%  { transform: scale(1.6); opacity: 0; }
+          100% { transform: scale(1.6); opacity: 0; }
+        }
+
+        /* ── Selected device GPS route ────────────────────────────────────── */
+        .leaflet-overlay-pane svg path.gps-trail-line {
+          stroke: #2563eb !important;
+          stroke-width: 3px !important;
+          stroke-opacity: 0.9 !important;
+          stroke-linecap: round !important;
+          stroke-linejoin: round !important;
+          fill: none !important;
+        }
+
+        .leaflet-overlay-pane .gps-trail-dot {
+          fill: #2563eb !important;
+          fill-opacity: 1 !important;
+          stroke: #ffffff !important;
+          stroke-width: 1px !important;
+        }
+
+        .gps-route-status {
+          position: absolute;
+          z-index: 500;
+          left: 12px;
+          bottom: 12px;
+          max-width: 420px;
+          padding: 8px 12px;
+          border: 1px solid #bfdbfe;
+          border-radius: 6px;
+          background: rgba(239, 246, 255, 0.96);
+          color: #1e3a8a;
+          font-size: 12px;
+          line-height: 1.4;
+          box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12);
+        }
+
       `}</style>
     </div>
   )

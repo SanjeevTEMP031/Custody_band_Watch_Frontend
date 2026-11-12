@@ -9,10 +9,25 @@ import {
   MapPin,
   Flag,
   Crosshair,
+  Search,
+  Sparkles,
 } from 'lucide-react'
 import { isValidGpsCoord, type TripPoint, type TripRecord } from '../../lib/firebase'
+import { getRoute, getMultiPointRoute, geocode, type Coords, type RouteData } from './RouteMap'
+
+import markerIcon from 'leaflet/dist/images/marker-icon.png'
+import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png'
+import markerShadow from 'leaflet/dist/images/marker-shadow.png'
+
+// Fix Leaflet's default marker icons under Vite
+L.Icon.Default.mergeOptions({
+  iconUrl: markerIcon,
+  iconRetinaUrl: markerIcon2x,
+  shadowUrl: markerShadow,
+})
 
 export type MapTileProvider = 'standard' | 'humanitarian' | 'voyager'
+export type PathStyleOption = 'purple-dotted' | 'blue-solid' | 'both'
 
 const TILE_PROVIDERS: Record<MapTileProvider, { name: string; url: string; attribution: string }> = {
   standard: {
@@ -173,11 +188,26 @@ export default function RouteTrackingMap({
   const tileLayerRef = useRef<L.TileLayer | null>(null)
   const polylineHaloRef = useRef<L.Polyline | null>(null)
   const polylineMainRef = useRef<L.Polyline | null>(null)
+  const polylineOsrmRef = useRef<L.Polyline | null>(null)
   const markerGroupRef = useRef<L.LayerGroup | null>(null)
   const lastFittedTripIdRef = useRef<string | null>(null)
 
   const [mapStyle, setMapStyle] = useState<MapTileProvider>('standard')
+  const [pathStyle, setPathStyle] = useState<PathStyleOption>('purple-dotted')
   const [isFullscreen, setIsFullscreen] = useState(false)
+
+  // OSRM Driving Route State
+  const [osrmRoute, setOsrmRoute] = useState<RouteData | null>(null)
+  const [osrmLoading, setOsrmLoading] = useState<boolean>(false)
+
+  // Interactive Route Search / Planning State
+  const [showSearch, setShowSearch] = useState<boolean>(false)
+  const [searchFrom, setSearchFrom] = useState<string>('Hitech City, Hyderabad')
+  const [searchTo, setSearchTo] = useState<string>('Charminar, Hyderabad')
+  const [searchPoints, setSearchPoints] = useState<{ a: Coords; b: Coords } | null>(null)
+  const [searchRoute, setSearchRoute] = useState<RouteData | null>(null)
+  const [searchLoading, setSearchLoading] = useState<boolean>(false)
+  const [searchError, setSearchError] = useState<string>('')
 
   // Consolidate route points from prop or trip
   const routePoints = points ?? trip?.route_points ?? []
@@ -197,7 +227,7 @@ export default function RouteTrackingMap({
       ? validRoute[validRoute.length - 1]
       : null
 
-  // 1. Initialize Map
+  // 1. Initialize Map with both OSRM Dotted Purple and Blue polyline layers
   useEffect(() => {
     if (!mapContainerRef.current) return
 
@@ -223,8 +253,7 @@ export default function RouteTrackingMap({
 
     const markers = L.layerGroup().addTo(map)
 
-    // Polyline layers: thick, clearly visible Leaflet polyline
-    // Halo underneath for high contrast on all map styles
+    // Halo polyline for high contrast
     const halo = L.polyline([], {
       color: '#1e40af',
       weight: 10,
@@ -242,11 +271,20 @@ export default function RouteTrackingMap({
       lineJoin: 'round',
     }).addTo(map)
 
+    // Dotted purple OSRM road path: tiny dash + round caps + thick weight = row of dots
+    const osrmLine = L.polyline([], {
+      color: '#4f1fd1',
+      weight: 9,
+      dashArray: '1 14',
+      lineCap: 'round',
+    }).addTo(map)
+
     mapInstanceRef.current = map
     tileLayerRef.current = initialTiles
     markerGroupRef.current = markers
     polylineHaloRef.current = halo
     polylineMainRef.current = mainLine
+    polylineOsrmRef.current = osrmLine
 
     const observer = new ResizeObserver(() => map.invalidateSize({ pan: false }))
     observer.observe(mapContainerRef.current)
@@ -259,6 +297,7 @@ export default function RouteTrackingMap({
       markerGroupRef.current = null
       polylineHaloRef.current = null
       polylineMainRef.current = null
+      polylineOsrmRef.current = null
     }
   }, [])
 
@@ -273,13 +312,85 @@ export default function RouteTrackingMap({
     }).addTo(mapInstanceRef.current)
   }, [mapStyle])
 
-  // 3. Render route polyline, start marker, end marker, and current location marker
+  // 2b. Automatically compute OSRM Road-snapped Driving Route for Selected Journey
+  useEffect(() => {
+    if (!startCoord) {
+      setOsrmRoute(null)
+      return
+    }
+
+    const destCoord = isTripCompleted && endCoord ? endCoord : liveCoord
+    if (!destCoord) {
+      setOsrmRoute(null)
+      return
+    }
+
+    let isCurrent = true
+    setOsrmLoading(true)
+
+    const fetchOsrmPath = async () => {
+      try {
+        // If there are intermediate route points, sample up to 10 points
+        if (validRoute.length > 2) {
+          const step = Math.max(1, Math.floor(validRoute.length / 8))
+          const sampled: Coords[] = []
+          for (let i = 0; i < validRoute.length; i += step) {
+            sampled.push({ lat: validRoute[i].latitude, lng: validRoute[i].longitude })
+          }
+          const lastValid = validRoute[validRoute.length - 1]
+          if (
+            sampled[sampled.length - 1].lat !== lastValid.latitude ||
+            sampled[sampled.length - 1].lng !== lastValid.longitude
+          ) {
+            sampled.push({ lat: lastValid.latitude, lng: lastValid.longitude })
+          }
+
+          if (sampled.length >= 2) {
+            const data = await getMultiPointRoute(sampled)
+            if (isCurrent) setOsrmRoute(data)
+            return
+          }
+        }
+
+        const data = await getRoute(
+          { lat: startCoord.latitude, lng: startCoord.longitude },
+          { lat: destCoord.latitude, lng: destCoord.longitude }
+        )
+        if (isCurrent) {
+          setOsrmRoute(data)
+        }
+      } catch (err) {
+        console.warn('OSRM road route calculation fallback to direct GPS points:', err)
+        if (isCurrent) setOsrmRoute(null)
+      } finally {
+        if (isCurrent) setOsrmLoading(false)
+      }
+    }
+
+    fetchOsrmPath()
+
+    return () => {
+      isCurrent = false
+    }
+  }, [
+    startCoord?.latitude,
+    startCoord?.longitude,
+    endCoord?.latitude,
+    endCoord?.longitude,
+    liveCoord?.latitude,
+    liveCoord?.longitude,
+    validRoute.length,
+    isTripCompleted,
+  ])
+
+  // 3. Render route polylines, start marker, end marker, search markers and live position marker
   useEffect(() => {
     const map = mapInstanceRef.current
     const markers = markerGroupRef.current
     const halo = polylineHaloRef.current
     const mainLine = polylineMainRef.current
-    if (!map || !markers || !halo || !mainLine) return
+    const osrmLine = polylineOsrmRef.current
+    if (!map || !markers || !halo || !mainLine || !osrmLine) return
 
     markers.clearLayers()
 
@@ -293,8 +404,25 @@ export default function RouteTrackingMap({
       }
     }
 
-    halo.setLatLngs(latLngs)
-    mainLine.setLatLngs(latLngs)
+    // Determine path to render for OSRM Dotted Purple line
+    const activeRoadPath: L.LatLngTuple[] =
+      searchRoute?.path ??
+      (osrmRoute?.path && osrmRoute.path.length > 0 ? osrmRoute.path : latLngs)
+
+    if (pathStyle === 'purple-dotted') {
+      osrmLine.setLatLngs(activeRoadPath)
+      halo.setLatLngs([])
+      mainLine.setLatLngs([])
+    } else if (pathStyle === 'blue-solid') {
+      osrmLine.setLatLngs([])
+      halo.setLatLngs(latLngs)
+      mainLine.setLatLngs(latLngs)
+    } else {
+      // Both
+      osrmLine.setLatLngs(activeRoadPath)
+      halo.setLatLngs(latLngs)
+      mainLine.setLatLngs(latLngs)
+    }
 
     // --- A. START MARKER (GREEN) ---
     if (startCoord) {
@@ -312,6 +440,7 @@ export default function RouteTrackingMap({
           <div><strong>Coordinates:</strong> ${startCoord.latitude.toFixed(5)}, ${startCoord.longitude.toFixed(5)}</div>
           <div><strong>Start Time:</strong> ${startCoord.timestamp ? new Date(startCoord.timestamp).toLocaleString() : 'N/A'}</div>
           ${trip?.wearer_name ? `<div><strong>Wearer:</strong> ${trip.wearer_name}</div>` : ''}
+          ${osrmRoute ? `<div style="color: #4f1fd1; font-weight: 600; margin-top: 4px;">OSRM Driving: ${osrmRoute.distanceKm.toFixed(1)} km · ${Math.round(osrmRoute.durationMin)} min</div>` : ''}
         </div>
       `
       startMarker.bindPopup(popupContent)
@@ -334,6 +463,7 @@ export default function RouteTrackingMap({
           <div><strong>Coordinates:</strong> ${endCoord.latitude.toFixed(5)}, ${endCoord.longitude.toFixed(5)}</div>
           <div><strong>End Time:</strong> ${endCoord.timestamp ? new Date(endCoord.timestamp).toLocaleString() : 'N/A'}</div>
           <div><strong>Total Travelled:</strong> ${trip?.total_distance_km?.toFixed(2) ?? '—'} km</div>
+          ${osrmRoute ? `<div style="color: #4f1fd1; font-weight: 600; margin-top: 4px;">Road Route: ${osrmRoute.distanceKm.toFixed(1)} km · ${Math.round(osrmRoute.durationMin)} min</div>` : ''}
         </div>
       `
       endMarker.bindPopup(popupContent)
@@ -357,27 +487,41 @@ export default function RouteTrackingMap({
           ${liveCoord.speed_kmh != null ? `<div><strong>Speed:</strong> ${liveCoord.speed_kmh} km/h</div>` : ''}
           ${liveCoord.heading != null ? `<div><strong>Direction:</strong> ${liveCoord.heading}°</div>` : ''}
           <div><strong>Last Updated:</strong> ${liveCoord.timestamp ? new Date(liveCoord.timestamp).toLocaleTimeString() : 'Live'}</div>
+          ${osrmRoute ? `<div style="color: #4f1fd1; font-weight: 600; margin-top: 4px;">Route from Start: ${osrmRoute.distanceKm.toFixed(1)} km · ${Math.round(osrmRoute.durationMin)} min</div>` : ''}
         </div>
       `
       currentMarker.bindPopup(popupContent)
       markers.addLayer(currentMarker)
     }
 
-    // --- D. AUTO FIT BOUNDS (Only on journey selection or initial load) ---
-    // Avoids jarring zoom resets on every 5-second GPS packet update!
+    // --- D. SEARCH ROUTE MARKERS (IF ACTIVE SEARCH) ---
+    if (searchPoints) {
+      const sMarker = L.marker([searchPoints.a.lat, searchPoints.a.lng]).bindPopup(
+        `<div style="padding: 2px;"><strong>Start Point A:</strong> ${searchFrom}</div>`
+      )
+      const eMarker = L.marker([searchPoints.b.lat, searchPoints.b.lng]).bindPopup(
+        `<div style="padding: 2px;"><strong>Destination Point B:</strong> ${searchTo}</div>`
+      )
+      markers.addLayer(sMarker)
+      markers.addLayer(eMarker)
+    }
+
+    // --- E. AUTO FIT BOUNDS ---
     const tripId = trip?.id ?? 'default'
     const isNewJourney = lastFittedTripIdRef.current !== tripId
 
-    if (autoFitOnUpdate && latLngs.length > 0 && isNewJourney) {
+    if (searchRoute && searchRoute.path.length > 0) {
+      map.fitBounds(searchRoute.path, { padding: [40, 40] })
+    } else if (autoFitOnUpdate && (osrmRoute?.path?.length || latLngs.length > 0) && isNewJourney) {
       lastFittedTripIdRef.current = tripId
-      if (latLngs.length === 1) {
-        map.setView(latLngs[0], 15)
+      const boundsTarget = osrmRoute?.path && osrmRoute.path.length > 0 ? osrmRoute.path : latLngs
+      if (boundsTarget.length === 1) {
+        map.setView(boundsTarget[0], 15)
       } else {
-        const bounds = L.latLngBounds(latLngs)
+        const bounds = L.latLngBounds(boundsTarget)
         map.fitBounds(bounds, { padding: [50, 50], maxZoom: 16 })
       }
     } else if (liveCoord && !isTripCompleted && !isNewJourney) {
-      // During active journey live updates, smoothly pan to latest position without changing zoom!
       map.panTo([liveCoord.latitude, liveCoord.longitude], { animate: true })
     }
   }, [
@@ -390,6 +534,11 @@ export default function RouteTrackingMap({
     liveCoord?.heading,
     liveCoord?.speed_kmh,
     liveCoord?.timestamp,
+    osrmRoute?.distanceKm,
+    osrmRoute?.path?.length,
+    pathStyle,
+    searchRoute,
+    searchPoints,
   ])
 
   // Center on Start
@@ -409,11 +558,12 @@ export default function RouteTrackingMap({
 
   // Fit Entire Route Bounds
   const handleFitEntireRoute = () => {
-    if (mapInstanceRef.current && validRoute.length > 0) {
-      if (validRoute.length === 1) {
-        mapInstanceRef.current.setView([validRoute[0].latitude, validRoute[0].longitude], 15)
-      } else {
-        const bounds = L.latLngBounds(validRoute.map((p) => [p.latitude, p.longitude]))
+    if (mapInstanceRef.current) {
+      const targetPath = searchRoute?.path ?? (osrmRoute?.path && osrmRoute.path.length > 0 ? osrmRoute.path : validRoute.map((p) => [p.latitude, p.longitude] as L.LatLngTuple))
+      if (targetPath.length === 1) {
+        mapInstanceRef.current.setView(targetPath[0], 15)
+      } else if (targetPath.length > 1) {
+        const bounds = L.latLngBounds(targetPath)
         mapInstanceRef.current.fitBounds(bounds, { padding: [50, 50], maxZoom: 16 })
       }
     }
@@ -427,6 +577,48 @@ export default function RouteTrackingMap({
     } else {
       document.exitFullscreen().then(() => setIsFullscreen(false)).catch(() => {})
     }
+  }
+
+  // Handle Search Submission
+  const handleSearchSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!searchFrom.trim() || !searchTo.trim()) {
+      setSearchError('Please provide both Start and Destination addresses')
+      return
+    }
+    setSearchLoading(true)
+    setSearchError('')
+    try {
+      const a = await geocode(searchFrom)
+      const b = await geocode(searchTo)
+      const r = await getRoute(a, b)
+      setSearchPoints({ a, b })
+      setSearchRoute(r)
+      setPathStyle('purple-dotted')
+    } catch (err) {
+      setSearchError(err instanceof Error ? err.message : 'Could not calculate road route')
+    } finally {
+      setSearchLoading(false)
+    }
+  }
+
+  // Auto-fill Search from device coords
+  const handleUseJourneyPoints = () => {
+    if (startCoord) {
+      setSearchFrom(`${startCoord.latitude.toFixed(5)}, ${startCoord.longitude.toFixed(5)}`)
+    }
+    const dest = endCoord || liveCoord
+    if (dest) {
+      setSearchTo(`${dest.latitude.toFixed(5)}, ${dest.longitude.toFixed(5)}`)
+    }
+  }
+
+  // Clear search and restore device route
+  const handleClearSearch = () => {
+    setSearchRoute(null)
+    setSearchPoints(null)
+    setSearchError('')
+    handleFitEntireRoute()
   }
 
   return (
@@ -461,7 +653,7 @@ export default function RouteTrackingMap({
       />
 
       {/* Empty State Overlay */}
-      {validRoute.length === 0 && (
+      {validRoute.length === 0 && !searchRoute && (
         <Box
           sx={{
             position: 'absolute',
@@ -480,7 +672,7 @@ export default function RouteTrackingMap({
             boxShadow: '0 4px 14px rgba(0,0,0,0.2)',
           }}
         >
-          No GPS Route Available for this Device / Trip
+          No GPS Route Available for this Device / Trip. You can use "Plan / Search Route" to calculate paths.
         </Box>
       )}
 
@@ -494,6 +686,7 @@ export default function RouteTrackingMap({
           display: 'flex',
           flexWrap: 'wrap',
           gap: 1,
+          alignItems: 'center',
         }}
       >
         <ButtonGroup
@@ -569,7 +762,7 @@ export default function RouteTrackingMap({
             </Tooltip>
           )}
 
-          {validRoute.length > 1 && (
+          {(validRoute.length > 1 || searchRoute) && (
             <Tooltip title="Fit complete journey route in view">
               <button
                 type="button"
@@ -585,14 +778,302 @@ export default function RouteTrackingMap({
                   fontSize: 12,
                   fontWeight: 600,
                   color: '#0284c7',
+                  borderRight: '1px solid #e2e8f0',
                 }}
               >
                 <Navigation size={14} /> Fit Route
               </button>
             </Tooltip>
           )}
+
+          {/* Toggle Plan / Search Route Panel */}
+          <Tooltip title="Plan custom road route between addresses with OSRM">
+            <button
+              type="button"
+              onClick={() => setShowSearch(!showSearch)}
+              style={{
+                background: showSearch ? '#f3e8ff' : 'transparent',
+                border: 'none',
+                cursor: 'pointer',
+                padding: '6px 12px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 5,
+                fontSize: 12,
+                fontWeight: 700,
+                color: '#4f1fd1',
+              }}
+            >
+              <Search size={14} /> Plan / Search Route
+            </button>
+          </Tooltip>
         </ButtonGroup>
+
+        {/* Path Style Selector */}
+        <Box
+          sx={{
+            display: 'flex',
+            bgcolor: '#ffffff',
+            borderRadius: 1.5,
+            p: 0.5,
+            boxShadow: '0 2px 8px rgba(0,0,0,0.12)',
+            border: '1px solid #e2e8f0',
+            alignItems: 'center',
+            gap: 0.5,
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => setPathStyle('purple-dotted')}
+            style={{
+              border: 'none',
+              background: pathStyle === 'purple-dotted' ? '#f3e8ff' : 'transparent',
+              color: pathStyle === 'purple-dotted' ? '#4f1fd1' : '#64748b',
+              fontWeight: pathStyle === 'purple-dotted' ? 700 : 500,
+              fontSize: 11,
+              padding: '4px 8px',
+              borderRadius: 4,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 4,
+            }}
+          >
+            <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: '#4f1fd1' }} />
+            Dotted Purple
+          </button>
+          <button
+            type="button"
+            onClick={() => setPathStyle('blue-solid')}
+            style={{
+              border: 'none',
+              background: pathStyle === 'blue-solid' ? '#eff6ff' : 'transparent',
+              color: pathStyle === 'blue-solid' ? '#2563eb' : '#64748b',
+              fontWeight: pathStyle === 'blue-solid' ? 700 : 500,
+              fontSize: 11,
+              padding: '4px 8px',
+              borderRadius: 4,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 4,
+            }}
+          >
+            <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: '#2563eb' }} />
+            Solid Blue
+          </button>
+          <button
+            type="button"
+            onClick={() => setPathStyle('both')}
+            style={{
+              border: 'none',
+              background: pathStyle === 'both' ? '#f8fafc' : 'transparent',
+              color: pathStyle === 'both' ? '#0f172a' : '#64748b',
+              fontWeight: pathStyle === 'both' ? 700 : 500,
+              fontSize: 11,
+              padding: '4px 8px',
+              borderRadius: 4,
+              cursor: 'pointer',
+            }}
+          >
+            Both
+          </button>
+        </Box>
+
+        {/* Live OSRM Road Distance & Driving Time Pill */}
+        {osrmLoading && !searchRoute && (
+          <Box
+            sx={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 1,
+              bgcolor: 'rgba(255, 255, 255, 0.95)',
+              backdropFilter: 'blur(6px)',
+              px: 1.5,
+              py: 0.6,
+              borderRadius: 1.5,
+              border: '1px solid #d8b4fe',
+              fontSize: 12,
+              fontWeight: 600,
+              color: '#4f1fd1',
+            }}
+          >
+            <Sparkles size={14} color="#4f1fd1" className="animate-spin" />
+            <span>Calculating Road Path…</span>
+          </Box>
+        )}
+
+        {osrmRoute && !searchRoute && !osrmLoading && (
+          <Box
+            sx={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 1,
+              bgcolor: 'rgba(255, 255, 255, 0.95)',
+              backdropFilter: 'blur(6px)',
+              px: 1.5,
+              py: 0.6,
+              borderRadius: 1.5,
+              border: '1px solid #d8b4fe',
+              boxShadow: '0 2px 8px rgba(79, 31, 209, 0.12)',
+              fontSize: 12,
+              fontWeight: 700,
+              color: '#4f1fd1',
+            }}
+          >
+            <Sparkles size={14} color="#4f1fd1" />
+            <span>Road: {osrmRoute.distanceKm.toFixed(1)} km</span>
+            <span style={{ color: '#9333ea' }}>·</span>
+            <span>{Math.round(osrmRoute.durationMin)} min</span>
+          </Box>
+        )}
       </Box>
+
+      {/* Floating Route Search & Directions Panel */}
+      {showSearch && (
+        <Box
+          component="form"
+          onSubmit={handleSearchSubmit}
+          sx={{
+            position: 'absolute',
+            top: 60,
+            left: 14,
+            right: 14,
+            maxWidth: 860,
+            zIndex: 1000,
+            bgcolor: 'rgba(255, 255, 255, 0.98)',
+            backdropFilter: 'blur(10px)',
+            p: 1.5,
+            borderRadius: 2,
+            border: '1px solid #cbd5e1',
+            boxShadow: '0 8px 24px rgba(0,0,0,0.15)',
+            display: 'flex',
+            flexWrap: 'wrap',
+            alignItems: 'center',
+            gap: 1.25,
+          }}
+        >
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flex: 1, minWidth: 200 }}>
+            <Typography variant="caption" sx={{ fontWeight: 800, color: '#16a34a' }}>FROM:</Typography>
+            <input
+              value={searchFrom}
+              onChange={(e) => setSearchFrom(e.target.value)}
+              placeholder="From (point A)"
+              style={{
+                width: '100%',
+                padding: '7px 10px',
+                fontSize: 12,
+                borderRadius: 6,
+                border: '1px solid #cbd5e1',
+                outline: 'none',
+              }}
+            />
+          </Box>
+
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flex: 1, minWidth: 200 }}>
+            <Typography variant="caption" sx={{ fontWeight: 800, color: '#dc2626' }}>TO:</Typography>
+            <input
+              value={searchTo}
+              onChange={(e) => setSearchTo(e.target.value)}
+              placeholder="To (point B)"
+              style={{
+                width: '100%',
+                padding: '7px 10px',
+                fontSize: 12,
+                borderRadius: 6,
+                border: '1px solid #cbd5e1',
+                outline: 'none',
+              }}
+            />
+          </Box>
+
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            <button
+              type="submit"
+              disabled={searchLoading}
+              style={{
+                background: searchLoading ? '#94a3b8' : '#4f1fd1',
+                color: '#ffffff',
+                border: 'none',
+                padding: '7px 15px',
+                borderRadius: 6,
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: searchLoading ? 'not-allowed' : 'pointer',
+                boxShadow: '0 2px 6px rgba(79, 31, 209, 0.3)',
+              }}
+            >
+              {searchLoading ? 'Routing…' : 'Show Route'}
+            </button>
+
+            {(startCoord || liveCoord) && (
+              <button
+                type="button"
+                onClick={handleUseJourneyPoints}
+                style={{
+                  background: '#f1f5f9',
+                  color: '#334155',
+                  border: '1px solid #cbd5e1',
+                  padding: '7px 10px',
+                  borderRadius: 6,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                }}
+              >
+                Use Device Coords
+              </button>
+            )}
+
+            {searchRoute && (
+              <button
+                type="button"
+                onClick={handleClearSearch}
+                style={{
+                  background: 'transparent',
+                  color: '#64748b',
+                  border: 'none',
+                  padding: '7px 6px',
+                  fontSize: 11,
+                  cursor: 'pointer',
+                  textDecoration: 'underline',
+                }}
+              >
+                Clear
+              </button>
+            )}
+          </Box>
+
+          {searchRoute && (
+            <Box
+              sx={{
+                width: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 2,
+                bgcolor: '#f5f3ff',
+                color: '#4f1fd1',
+                px: 1.5,
+                py: 0.75,
+                borderRadius: 1,
+                fontSize: 12,
+                fontWeight: 700,
+                border: '1px solid #d8b4fe',
+              }}
+            >
+              <span>🛣️ OSRM Road Distance: {searchRoute.distanceKm.toFixed(1)} km</span>
+              <span>⏱️ Driving Time: {Math.round(searchRoute.durationMin)} min</span>
+              <span style={{ fontSize: 11, fontWeight: 500, color: '#6d28d9' }}>(Dotted Purple Path)</span>
+            </Box>
+          )}
+
+          {searchError && (
+            <Typography variant="caption" sx={{ color: '#dc2626', fontWeight: 600, width: '100%' }}>
+              {searchError}
+            </Typography>
+          )}
+        </Box>
+      )}
 
       {/* Top Right Controls: Tile Switcher & Fullscreen */}
       <Box
@@ -657,7 +1138,7 @@ export default function RouteTrackingMap({
       </Box>
 
       {/* Bottom Route Legend Bar */}
-      {validRoute.length > 0 && (
+      {(validRoute.length > 0 || searchRoute) && (
         <Box
           sx={{
             position: 'absolute',
@@ -684,9 +1165,26 @@ export default function RouteTrackingMap({
           </Box>
 
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-            <Box sx={{ width: 20, height: 4, borderRadius: 1, bgcolor: '#2563eb' }} />
-            <Typography variant="caption" sx={{ fontWeight: 600 }}>Travelled Route</Typography>
+            <Box
+              sx={{
+                width: 24,
+                height: 5,
+                borderRadius: 2,
+                bgcolor: '#4f1fd1',
+                border: '1px dashed #ffffff',
+              }}
+            />
+            <Typography variant="caption" sx={{ fontWeight: 700, color: '#4f1fd1' }}>
+              Dotted Purple Path (OSRM)
+            </Typography>
           </Box>
+
+          {pathStyle !== 'purple-dotted' && (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <Box sx={{ width: 20, height: 4, borderRadius: 1, bgcolor: '#2563eb' }} />
+              <Typography variant="caption" sx={{ fontWeight: 600 }}>GPS Telemetry Line</Typography>
+            </Box>
+          )}
 
           {isTripCompleted ? (
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -704,4 +1202,3 @@ export default function RouteTrackingMap({
     </Box>
   )
 }
-

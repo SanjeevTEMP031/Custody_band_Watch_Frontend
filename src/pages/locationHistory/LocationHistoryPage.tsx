@@ -27,6 +27,7 @@ import {
   Table as TableIcon,
   RotateCw,
   Radio,
+  Navigation,
 } from 'lucide-react'
 import ApiFeedback from '../../components/common/ApiFeedback'
 import { useApiData } from '../../hooks/useApiData'
@@ -56,6 +57,7 @@ import {
   type TripRecord,
 } from '../../lib/firebase'
 import RouteTrackingMap from './RouteTrackingMap'
+import RouteMap from './RouteMap'
 import TripSummaryCard from './TripSummaryCard'
 
 /**
@@ -173,9 +175,14 @@ function normalizeToTripRecord(raw: any, deviceId: string, fallbackWearer?: stri
   }
 }
 
-function LocationHistoryPage() {
+interface LocationHistoryPageProps {
+  defaultTab?: 'map' | 'planner' | 'table'
+}
+
+export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHistoryPageProps = {}) {
   const [params, setParams] = useSearchParams()
   const initialDeviceParam = params.get('device') ?? ''
+  const tabParam = params.get('tab') as 'map' | 'planner' | 'table' | null
 
   // Devices: real-time Firestore + REST API fallback
   const { devices: realtimeDevices } = useRealtimeDevices()
@@ -218,7 +225,7 @@ function LocationHistoryPage() {
   const [loadingJourneys, setLoadingJourneys] = useState<boolean>(false)
   const [isSubmittingJourney, setIsSubmittingJourney] = useState<boolean>(false)
   const [journeyNotice, setJourneyNotice] = useState<{ message: string; severity: 'success' | 'error' | 'info' } | null>(null)
-  const [viewTab, setViewTab] = useState<'map' | 'table'>('map')
+  const [viewTab, setViewTab] = useState<'map' | 'planner' | 'table'>(() => tabParam || defaultTab)
 
   // 1. Fetch from backend journeys APIs (GET /api/v1/journeys/active/{id} & GET /api/v1/journeys/device/{id})
   const refreshBackendJourneys = useCallback(async () => {
@@ -295,11 +302,11 @@ function LocationHistoryPage() {
         .map((l) => ({
           latitude: Number(l.latitude),
           longitude: Number(l.longitude),
-          timestamp: l.recorded_at,
-          speed_kmh: l.speed_kmh,
-          heading: l.heading,
-          accuracy_m: l.accuracy_m,
-          battery_pct: l.battery_pct,
+          timestamp: l.recorded_at ?? l.received_at ?? l.timestamp ?? new Date().toISOString(),
+          speed_kmh: l.speed_kmh ?? null,
+          heading: l.heading ?? null,
+          accuracy_m: l.accuracy_m ?? null,
+          battery_pct: l.battery_pct ?? null,
         }))
         .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
 
@@ -484,17 +491,17 @@ function LocationHistoryPage() {
             latitude: gps.latitude,
             longitude: gps.longitude,
             timestamp: recordedIso,
-            speed_kmh: gps.speed_kmh,
-            heading: gps.heading,
-            battery_pct: gps.battery_pct,
+            speed_kmh: gps.speed_kmh ?? null,
+            heading: gps.heading ?? null,
+            battery_pct: gps.battery_pct ?? null,
           }
 
           setLiveLocation({
             latitude: gps.latitude,
             longitude: gps.longitude,
-            speed_kmh: gps.speed_kmh,
-            heading: gps.heading,
-            battery_pct: gps.battery_pct,
+            speed_kmh: gps.speed_kmh ?? null,
+            heading: gps.heading ?? null,
+            battery_pct: gps.battery_pct ?? null,
             timestamp: recordedIso,
             satellites: gps.satellites,
             gps_fix: gps.gps_fix,
@@ -891,6 +898,12 @@ function LocationHistoryPage() {
             iconPosition="start"
           />
           <Tab
+            value="planner"
+            label="Route Finder & OSRM Path Planner"
+            icon={<Navigation size={18} />}
+            iconPosition="start"
+          />
+          <Tab
             value="table"
             label={`GPS Points Log (${tableDataWithDistance.length})`}
             icon={<TableIcon size={18} />}
@@ -909,7 +922,7 @@ function LocationHistoryPage() {
         )}
       </Box>
 
-      {/* TAB 1: INTERACTIVE MAP (Requirements 2, 3, 4, 5 & 10: Green START, Red END, Thick Polyline, Auto Fit Bounds) */}
+      {/* TAB 1: INTERACTIVE MAP (Requirements 2, 3, 4, 5 & 10: Green START, Red END, Dotted Purple OSRM Road Path, Auto Fit Bounds) */}
       {viewTab === 'map' && (
         <Card elevation={0} sx={{ borderRadius: 2.5, border: '1px solid #cbd5e1', overflow: 'hidden' }}>
           <RouteTrackingMap
@@ -918,6 +931,28 @@ function LocationHistoryPage() {
             currentLocation={liveLocation}
             height={580}
             autoFitOnUpdate={true}
+          />
+        </Card>
+      )}
+
+      {/* TAB 2: OSRM ROUTE FINDER & ROAD PATH PLANNER */}
+      {viewTab === 'planner' && (
+        <Card elevation={0} sx={{ borderRadius: 2.5, border: '1px solid #cbd5e1', overflow: 'hidden' }}>
+          <RouteMap
+            initialFrom={
+              currentDisplayJourney?.start_location && currentDisplayJourney.start_location.latitude
+                ? `${currentDisplayJourney.start_location.latitude.toFixed(5)}, ${currentDisplayJourney.start_location.longitude.toFixed(5)}`
+                : 'Hitech City, Hyderabad'
+            }
+            initialTo={
+              liveLocation
+                ? `${liveLocation.latitude.toFixed(5)}, ${liveLocation.longitude.toFixed(5)}`
+                : currentDisplayJourney?.end_location && currentDisplayJourney.end_location.latitude
+                ? `${currentDisplayJourney.end_location.latitude.toFixed(5)}, ${currentDisplayJourney.end_location.longitude.toFixed(5)}`
+                : 'Charminar, Hyderabad'
+            }
+            height={580}
+            autoLoadOnMount={true}
           />
         </Card>
       )}
@@ -996,4 +1031,3 @@ function LocationHistoryPage() {
   )
 }
 
-export default LocationHistoryPage

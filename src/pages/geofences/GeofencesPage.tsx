@@ -53,7 +53,7 @@ function GeofencesPage() {
   )
   const { data: geofences, loading, error, reload } = useApiData(loadGeofences)
   const { data: devices, loading: devicesLoading, error: devicesError } = useApiData(loadDevices)
-  const device = validDeviceId ? devices?.find(item => item.id === requestedDeviceId) ?? null : null
+  const device = validDeviceId ? devices?.find(item => String(item.id) === String(requestedDeviceId)) ?? null : null
 
   const openCreateDialog = () => {
     setName('')
@@ -69,13 +69,13 @@ function GeofencesPage() {
     event.preventDefault()
     setActionError('')
     try {
-      const fence_type: FenceType = alarmType === 'only_enter' ? 'inclusion' : 'exclusion'
+      const fence_type: FenceType = alarmType === 'only_enter' ? 'INCLUSION' : 'EXCLUSION'
       await createGeofence({
         name: name.trim() + (remark ? ` (${remark.trim()})` : ''),
         fence_type,
-        latitude: Number(latitude),
-        longitude: Number(longitude),
-        radius_m: Number(radius),
+        center_latitude: Number(latitude),
+        center_longitude: Number(longitude),
+        radius_meters: Number(radius),
       })
       setDialogOpen(false)
       setName('')

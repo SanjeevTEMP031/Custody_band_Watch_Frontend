@@ -65,6 +65,7 @@ export default function AppShell() {
     const p = location.pathname
     if (p.includes('/admin/dashboard')) return 'Enterprise Dashboard'
     if (p.includes('/admin/device-management')) return 'Device Management'
+    if (p.includes('/admin/location-history') || p.includes('/admin/journeys') || p.includes('/admin/route-map')) return 'Location History & Route Tracking'
     if (p.includes('/admin/monitoring-center') || p.includes('/admin/live-people')) return 'Monitoring Center'
     if (p.includes('/admin/geofence') || p.includes('/admin/geofences')) return 'Geofence Security'
     if (p.includes('/admin/alerts') || p.includes('/admin/notifications')) return 'Security Alerts'

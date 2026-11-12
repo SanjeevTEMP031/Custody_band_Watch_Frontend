@@ -1,18 +1,46 @@
+// =============================================================================
+// Trackin360 / Custody Watch Platform — API Service
+// Backend: http://192.168.10.91:8000  (OpenAPI v3.1)
+// All paths are prefixed with /api/v1 (set via VITE_API_BASE_URL)
+// =============================================================================
+
+// =============================================================================
+// Trackin360 / Custody Watch Platform — API Service
+// Backend: http://192.168.10.91:8000  (OpenAPI v3.1)
+// All paths are prefixed with /api/v1 (set via VITE_API_BASE_URL)
+// =============================================================================
+
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '/api/v1').replace(/\/+$/, '')
 const ACCESS_TOKEN_KEY = 'trackin360-access-token'
 
+// =============================================================================
+// TYPES — aligned to backend OpenAPI schemas
+// =============================================================================
+
+export interface Token {
+  access_token: string
+  token_type: string
+  expires_in_minutes: number
+}
+
 export interface ApiUser {
-  company?: string | null
-  login_name?: string | null
-  contact?: string | null
-  phone?: string | null
-  is_subcompany?: boolean
   id: number
   email: string
   full_name: string
   role: string
   is_active: boolean
   created_at: string
+  company?: string | null
+  login_name?: string | null
+  contact?: string | null
+  phone?: string | number | null
+  is_subcompany?: boolean
+  reference_no?: string
+  date_of_birth?: string | null
+  status?: string
+  badge_number?: string | null
+  phone_number?: string | null
+  department?: string | null
 }
 
 export interface CustodyPerson {
@@ -21,13 +49,35 @@ export interface CustodyPerson {
   full_name: string
   date_of_birth: string | null
   status: string
-  notes: string | null
-  created_at: string
+  notes?: string | null
+  created_at?: string
 }
 
+/** Backend DeviceCreate schema */
+export interface DeviceCreate {
+  device_id: string          // Watch IMEI / Serial Number
+  maker?: string             // default: "MNYD"
+  wearer_name?: string | null
+  case_number?: string | null
+  is_active?: boolean
+}
+
+/** Backend DeviceUpdate schema */
+export interface DeviceUpdate {
+  wearer_name?: string | null
+  case_number?: string | null
+  is_active?: boolean | null
+}
+
+/** Flat device object returned by GET /api/v1/devices */
 export interface Device {
-  id: number
+  // identifiers
+  id: string | number         // internal DB id
+  device_id: string           // IMEI — primary key used in all sub-routes
+  imei?: string | null
+  serial_number: string
   device_name?: string | null
+  maker?: string | null
   company?: string | null
   parent_customer?: string | null
   is_subcompany?: boolean
@@ -35,22 +85,74 @@ export interface Device {
   device_model?: string | null
   activation_time?: string | null
   expire_time?: string | null
+  created_at?: string | null
+  // assignment
+  wearer_name?: string | null
+  case_number?: string | null
+  custody_person_id?: number | null
+  custody_person_name?: string | null
+  // status
+  status?: string | null
+  is_active?: boolean
+  online?: boolean
+  is_online?: boolean
+  // last seen
+  last_seen?: string | null
+  device_timestamp?: string | null
+  gps_update_time?: string | null
+  // location snapshot
+  last_latitude?: number | null
+  last_longitude?: number | null
+  latitude?: number | null
+  longitude?: number | null
+  speed_kmh?: number | null
+  // telemetry
+  battery?: number | null
+  battery_pct?: number | null
+  battery_percent?: number | null
   heart_rate?: number | null
+  heart_rate_bpm?: number | null
+  step_counter?: number | null
+  steps?: number | null
   blood_pressure?: string | null
   temperature?: number | null
-  step_counter?: number | null
-  sleep?: string | null
   blood_oxygen?: number | null
-  created_at?: string | null
-  serial_number: string
-  imei: string | null
-  status: string
-  battery_pct: number | null
-  last_seen: string | null
-  last_latitude: number | null
-  last_longitude: number | null
-  custody_person_id: number | null
+  sleep?: string | null
+  // misc
+  connection_status?: string | null
+  has_gps_fix?: boolean
+  gps_fix?: boolean
+  gps_status?: string | null
+  gps_fix_source?: string | null
+  heading?: number | null
 }
+
+/** GPS live/history location point */
+export interface GpsLocation {
+  device_id?: string
+  latitude: number
+  longitude: number
+  speed_kmh?: number | null
+  heading?: number | null
+  accuracy_m?: number | null
+  battery_pct?: number | null
+  satellites?: number | null
+  gps_fix?: boolean
+  status?: string | null
+  gps_status?: string | null
+  validity?: string | null
+  recorded_at?: string | null
+  received_at?: string | null
+  timestamp?: string | null
+  raw?: unknown
+}
+
+export interface LatestGpsLocation extends GpsLocation {
+  recorded_at: string
+}
+
+/** Alias kept for backwards compatibility with existing map components */
+export type LocationRecord = GpsLocation & { id?: number; device_id?: any }
 
 export interface JourneyLocation {
   latitude: number
@@ -107,62 +209,102 @@ export interface EndJourneyRequest {
   timestamp?: string
 }
 
-export interface LatestGpsLocation {
-  latitude: number
-  longitude: number
-  speed_kmh: number | null
-  heading: number | null
-  battery_pct: number | null
-  recorded_at: string
-  satellites?: number | null
-  gps_fix?: boolean
-  raw?: unknown
-}
-
-export interface LocationRecord {
-  id: number
-  device_id: number
-  latitude: number
-  longitude: number
-  accuracy_m: number | null
-  speed_kmh: number | null
-  heading: number | null
-  battery_pct: number | null
-  recorded_at: string
+/** Backend GeofenceCreate schema (note: center_latitude/longitude + radius_meters) */
+export interface GeofenceCreate {
+  name: string
+  fence_type?: 'INCLUSION' | 'EXCLUSION'  // default: INCLUSION
+  center_latitude: number
+  center_longitude: number
+  radius_meters?: number                   // default: 500, min: 10
+  assigned_device_id?: string | null       // watch IMEI
+  is_active?: boolean
 }
 
 export interface Geofence {
   id: number
   name: string
   fence_type: string
+  center_latitude: number
+  center_longitude: number
+  // legacy aliases (some backends still return these)
   latitude: number
   longitude: number
-  radius_m: number
-  trip_id: number | null
+  radius_meters?: number
+  radius_m?: number
+  assigned_device_id?: string | null
   is_active: boolean
+  created_at?: string | null
 }
 
-export type FenceType = 'inclusion' | 'exclusion'
+export type FenceType = 'INCLUSION' | 'EXCLUSION'
+
+export interface GeofenceCheckRequest {
+  latitude: number
+  longitude: number
+  center_latitude: number
+  center_longitude: number
+  radius_meters: number
+}
+
+export interface GeofenceValidateRequest {
+  device_id: string
+  latitude: number
+  longitude: number
+}
 
 export interface ApiAlert {
+  id: number
+  type: string
+  alert_type?: string
+  severity?: string
+  status: string
+  message: string
+  device_id?: string | number | null
   device_name?: string | null
   device_model?: string | null
   imei?: string | null
-  location_time?: string | null
   is_subcompany?: boolean
-  id: number
-  type: string
-  severity: string
-  status: string
-  message: string
-  device_id: number | null
-  trip_id: number | null
-  latitude: number | null
-  longitude: number | null
+  latitude?: number | null
+  longitude?: number | null
+  location_time?: string | null
   created_at: string
-  acknowledged_by: number | null
-  acknowledged_at: string | null
+  acknowledged_by?: number | string | null
+  acknowledged_at?: string | null
+  resolution_notes?: string | null
 }
+
+export interface DashboardStats {
+  total_devices: number
+  online_devices: number
+  offline_devices: number
+  low_battery_devices: number
+  active_alerts_count: number
+  live_tcp_sockets?: number
+}
+
+export interface AccountUpdate {
+  full_name?: string | null
+  badge_number?: string | null
+  phone_number?: string | null
+  department?: string | null
+  is_active?: boolean | null
+}
+
+export interface SendCommandRequest {
+  device_id: string           // Target watch IMEI
+  command_type?: string       // CR | RESET | UPLOAD | SETIP | POWEROFF | FACTORY
+  parameters?: string | null  // e.g. "60" for UPLOAD interval
+}
+
+export interface WebhookCreateRequest {
+  name: string
+  target_url: string
+  events?: string             // ALL | SOS | STRAP_CUT | GEOFENCE_BREACH
+}
+
+// =============================================================================
+// ERROR
+// =============================================================================
 
 export class ApiError extends Error {
   readonly status: number
@@ -174,6 +316,10 @@ export class ApiError extends Error {
   }
 }
 
+// =============================================================================
+// TOKEN HELPERS
+// =============================================================================
+
 export const getAccessToken = () =>
   window.localStorage.getItem(ACCESS_TOKEN_KEY) ?? window.sessionStorage.getItem(ACCESS_TOKEN_KEY)
 
@@ -181,6 +327,10 @@ export const clearAccessToken = () => {
   window.localStorage.removeItem(ACCESS_TOKEN_KEY)
   window.sessionStorage.removeItem(ACCESS_TOKEN_KEY)
 }
+
+// =============================================================================
+// CORE REQUEST
+// =============================================================================
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
@@ -194,6 +344,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   try {
     response = await fetch(`${API_BASE_URL}${path}`, { ...init, headers })
   } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
     const message = error instanceof Error ? error.message : 'Network request failed.'
     throw new ApiError(`Cannot reach the API at ${API_BASE_URL}: ${message}`, 0)
   }
@@ -203,7 +354,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     try {
       const body: unknown = await response.json()
       if (typeof body === 'object' && body !== null && 'detail' in body) {
-        const detail = body.detail
+        const detail = (body as any).detail
         message = typeof detail === 'string' ? detail : JSON.stringify(detail)
       }
     } catch {
@@ -216,12 +367,14 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (await response.json()) as T
 }
 
-export async function loginApi(username: string, password: string, remember = true): Promise<ApiUser> {
-  const body = new URLSearchParams({ username, password })
-  const token = await request<{ access_token: string; token_type: string }>('/auth/login', {
+// =============================================================================
+// AUTH  —  POST /api/v1/auth/login  (JSON body, NOT form-encoded)
+// =============================================================================
+
+export async function loginApi(email: string, password: string, remember = true): Promise<ApiUser> {
+  const token = await request<Token>('/auth/login', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
+    body: JSON.stringify({ email, password }),
   })
   const storage = remember ? window.localStorage : window.sessionStorage
   storage.setItem(ACCESS_TOKEN_KEY, token.access_token)
@@ -234,104 +387,452 @@ export async function loginApi(username: string, password: string, remember = tr
 }
 
 export const getCurrentUser = () => request<ApiUser>('/auth/me')
-export const listPeople = (skip = 0, limit = 100) =>
-  request<CustodyPerson[]>(`/custody?skip=${skip}&limit=${limit}`)
-export const listUsers = (skip = 0, limit = 100) =>
-  request<ApiUser[]>(`/users?skip=${skip}&limit=${limit}`)
+
+export const registerUser = (payload: { email: string; password: string; full_name?: string; role?: string }) =>
+  request<ApiUser>('/auth/register', { method: 'POST', body: JSON.stringify(payload) })
+
+// =============================================================================
+// DASHBOARD  —  /api/v1/dashboard/...
+// =============================================================================
+
+export const getDashboardStats = () => request<DashboardStats>('/dashboard/stats')
+export const getDashboardOverview = () => request<unknown>('/dashboard/overview')
+// Legacy alias
+export const getDashboardSummary = getDashboardOverview
+
+// =============================================================================
+// DEVICES  —  /api/v1/devices
+// =============================================================================
+
+/** Normalises a raw device object from the backend into a consistent Device shape */
+function normaliseDevice(d: any, idx: number): Device {
+  const isOnline =
+    d.online === true ||
+    d.is_online === true ||
+    d.is_active === true ||
+    String(d.status ?? '').toLowerCase() === 'online' ||
+    String(d.status ?? '').toLowerCase() === 'active' ||
+    String(d.connection_status ?? '').toLowerCase() === 'online'
+
+  const rawStatus = isOnline ? 'online' : (d.status ? String(d.status).toLowerCase() : 'offline')
+  const lat = d.last_latitude ?? d.latitude ?? null
+  const lng = d.last_longitude ?? d.longitude ?? null
+  const rawSpeed = d.speed_kmh ?? d.speed
+  const gpsStatus = String(
+    d.gps_status ?? d.validity ?? (typeof d.gps_fix === 'string' ? d.gps_fix : d.status) ?? ''
+  ).trim().toUpperCase()
+  const gpsFlagsValid = [d.gps_fix, d.gps_valid].every(
+    (flag) =>
+      flag !== false &&
+      flag !== 0 &&
+      String(flag).trim().toLowerCase() !== 'false' &&
+      String(flag).trim() !== '0' &&
+      String(flag).trim().toUpperCase() !== 'V'
+  )
+  const hasGpsFix = gpsFlagsValid && gpsStatus !== 'V'
+
+  let batteryVal: number | null = null
+  for (const c of [d.battery, d.battery_pct, d.battery_percent, d.battery_level, d.bat]) {
+    if (c !== null && c !== undefined && c !== '' && !Number.isNaN(Number(c))) {
+      batteryVal = Math.min(100, Math.max(0, Math.round(Number(c))))
+      break
+    }
+  }
+
+  const deviceId = d.device_id ?? d.imei ?? d.serial_number ?? String(d.id ?? idx + 1)
+
+  return {
+    ...d,
+    device_id: deviceId,
+    id: d.id ?? d.device_id ?? String(idx + 1),
+    serial_number: d.serial_number ?? deviceId,
+    imei: d.imei ?? deviceId,
+    device_name: d.device_name ?? d.wearer_name ?? d.name ?? `Watch #${deviceId}`,
+    wearer_name: d.wearer_name ?? d.custody_person_name ?? null,
+    status: rawStatus,
+    connection_status: rawStatus,
+    online: isOnline,
+    is_online: isOnline,
+    is_active: isOnline,
+    battery: batteryVal,
+    battery_pct: batteryVal,
+    battery_percent: batteryVal,
+    last_seen: d.last_seen ?? d.device_timestamp ?? null,
+    gps_update_time:
+      d.gps_update_time ??
+      d.gps_recorded_at ??
+      d.gps_time ??
+      d.last_gps_update ??
+      (hasGpsFix ? d.recorded_at ?? null : null),
+    last_latitude: lat != null ? Number(lat) : null,
+    last_longitude: lng != null ? Number(lng) : null,
+    latitude: lat != null ? Number(lat) : null,
+    longitude: lng != null ? Number(lng) : null,
+    speed_kmh: rawSpeed != null && Number.isFinite(Number(rawSpeed)) ? Number(rawSpeed) : null,
+    heading: d.heading != null && Number.isFinite(Number(d.heading)) ? Number(d.heading) : null,
+    has_gps_fix: hasGpsFix,
+    gps_fix: hasGpsFix,
+    gps_status: d.gps_status ?? d.validity ?? null,
+    custody_person_id: d.custody_person_id ?? null,
+    custody_person_name: d.custody_person_name ?? d.wearer_name ?? null,
+  }
+}
+
 export const listDevices = async (skip = 0, limit = 100): Promise<Device[]> => {
   const raw = await request<any[]>(`/devices?skip=${skip}&limit=${limit}`)
-  return (Array.isArray(raw) ? raw : []).map((d: any, idx: number) => {
-    // Online status detection
-    const isOnline =
-      d.online === true ||
-      d.is_online === true ||
-      d.is_active === true ||
-      String(d.status ?? '').toLowerCase() === 'online' ||
-      String(d.status ?? '').toLowerCase() === 'active' ||
-      String(d.connection_status ?? '').toLowerCase() === 'online'
+  return (Array.isArray(raw) ? raw : []).map(normaliseDevice)
+}
 
-    const rawStatus = isOnline ? 'online' : (d.status ? String(d.status).toLowerCase() : 'offline')
-    const lat = d.last_latitude ?? d.latitude ?? null
-    const lng = d.last_longitude ?? d.longitude ?? null
+export const getDevice = async (deviceId: string | number): Promise<Device> => {
+  const raw = await request<any>(`/devices/${deviceId}`)
+  return normaliseDevice(raw, 0)
+}
 
-    // Exact battery percentage extraction from backend
-    let batteryVal: number | null = null
-    const batteryCandidates = [d.battery, d.battery_pct, d.battery_percent, d.battery_level, d.bat]
-    for (const c of batteryCandidates) {
-      if (c !== null && c !== undefined && c !== '' && !Number.isNaN(Number(c))) {
-        batteryVal = Math.min(100, Math.max(0, Math.round(Number(c))))
-        break
-      }
-    }
+export const createDevice = (payload: DeviceCreate) =>
+  request<Device>('/devices', { method: 'POST', body: JSON.stringify(payload) })
 
-    const rawDevName = d.device_name ?? d.wearer_name ?? d.name ?? `Watch #${d.device_id ?? idx + 1}`
-    const cleanDevName = String(rawDevName).toLowerCase().includes('demo') ? `Watch #${d.device_id ?? idx + 1}` : rawDevName
-    const rawPerson = d.custody_person_name ?? d.wearer_name ?? null
-    const cleanPerson = rawPerson && !String(rawPerson).toLowerCase().includes('demo') ? rawPerson : null
+export const updateDevice = (deviceId: string, payload: DeviceUpdate) =>
+  request<Device>(`/devices/${deviceId}`, { method: 'PUT', body: JSON.stringify(payload) })
+
+/** Send a protocol command directly to a watch (e.g. CR for GPS poll, RESET) */
+export const sendDeviceCommand = (deviceId: string, command = 'CR') =>
+  request<unknown>(`/devices/${deviceId}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ command }),
+  })
+
+// Legacy helpers kept for backwards compat
+export const unassignDevice = (deviceId: number | string) =>
+  updateDevice(String(deviceId), { wearer_name: null, case_number: null })
+
+export const assignDevice = (deviceId: number | string, _custodyPersonId: number, wearerName?: string) =>
+  updateDevice(String(deviceId), { wearer_name: wearerName ?? null })
+
+// =============================================================================
+// GPS & LOCATIONS  —  /api/v1/gps/...
+// =============================================================================
+
+/** All active wearers' latest coordinates — ideal for live map dashboard */
+export const getLiveLocations = () => request<GpsLocation[]>('/gps/live')
+
+/** Latest GPS fix for a specific device */
+export const getLatestGpsLocation = async (
+  deviceId: string | number,
+  signal?: AbortSignal
+): Promise<LatestGpsLocation | null> => {
+  try {
+    const response = await request<any>(`/gps/${deviceId}/latest`, { signal })
+    const raw = response?.value ?? response?.data ?? response
+    if (!raw) return null
+    const gpsStatus = String(
+      raw.gps_status ?? raw.status ?? raw.validity ?? (typeof raw.gps_fix === 'string' ? raw.gps_fix : '')
+    ).trim().toUpperCase()
+    const gpsFlagsValid = [raw.gps_fix, raw.gps_valid].every(
+      (flag) =>
+        flag !== false &&
+        flag !== 0 &&
+        String(flag).trim().toLowerCase() !== 'false' &&
+        String(flag).trim() !== '0' &&
+        String(flag).trim().toUpperCase() !== 'V'
+    )
+    if (!gpsFlagsValid || gpsStatus === 'V') return null
+
+    const lat = raw.latitude ?? raw.lat ?? raw.last_latitude
+    const lng = raw.longitude ?? raw.lon ?? raw.lng ?? raw.last_longitude
+    if (lat == null || lng == null) return null
+
+    const latitude = Number(lat)
+    const longitude = Number(lng)
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null
+    if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null
+    if (latitude === 0 && longitude === 0) return null
+    const rawTimestamp =
+      raw.recorded_at ??
+      raw.received_at ??
+      raw.device_timestamp ??
+      raw.timestamp ??
+      raw.gps_time ??
+      raw.last_valid_gps_time ??
+      raw.gps_update_time
+    if (rawTimestamp == null) return null
+    const timestampObject =
+      typeof rawTimestamp === 'object' && rawTimestamp !== null
+        ? rawTimestamp as { seconds?: unknown; toDate?: () => Date }
+        : null
+    const timestampDate =
+      rawTimestamp instanceof Date
+        ? rawTimestamp
+        : typeof timestampObject?.toDate === 'function'
+          ? timestampObject.toDate()
+          : typeof timestampObject?.seconds === 'number'
+            ? new Date(timestampObject.seconds * 1000)
+            : null
+    const numericTimestamp = timestampDate ? NaN : Number(rawTimestamp)
+    const recordedAt = timestampDate
+      ? timestampDate.toISOString()
+      : Number.isFinite(numericTimestamp) && numericTimestamp > 0
+        ? new Date(numericTimestamp < 1_000_000_000_000 ? numericTimestamp * 1000 : numericTimestamp).toISOString()
+        : String(rawTimestamp)
+    if (Number.isNaN(Date.parse(recordedAt))) return null
 
     return {
-      ...d,
-      id: typeof d.id === 'number' ? d.id : (Number(d.device_id) || (idx + 1)),
-      serial_number: d.serial_number ?? d.device_id ?? String(d.id ?? idx + 1),
-      imei: d.imei ?? d.device_id ?? null,
-      device_name: cleanDevName,
-      status: rawStatus,
-      connection_status: rawStatus,
-      online: isOnline,
-      is_online: isOnline,
-      is_active: isOnline,
-      battery: batteryVal,
-      battery_pct: batteryVal,
-      battery_percent: batteryVal,
-      last_seen: d.last_seen || d.device_timestamp || new Date().toISOString(),
-      last_latitude: lat != null ? Number(lat) : null,
-      last_longitude: lng != null ? Number(lng) : null,
-      latitude: lat != null ? Number(lat) : null,
-      longitude: lng != null ? Number(lng) : null,
-      custody_person_id: d.custody_person_id ?? null,
-      custody_person_name: cleanPerson,
+      latitude,
+      longitude,
+      speed_kmh: raw.speed_kmh ?? raw.speed ?? null,
+      heading: raw.heading ?? raw.bearing ?? raw.course ?? null,
+      battery_pct: raw.battery_pct ?? raw.battery_percent ?? raw.battery ?? null,
+      recorded_at: recordedAt,
+      satellites: raw.satellites ?? raw.sat_count ?? null,
+      gps_fix: true,
+      status: gpsStatus || null,
+      gps_status: gpsStatus || null,
+      validity: gpsStatus || null,
+      raw,
     }
-  })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return null
+    console.warn(`Unable to load latest GPS fix for device ${deviceId}.`, error)
+    return null
+  }
 }
-export const createDevice = (serial_number: string, imei: string | null) =>
-  request<Device>('/devices', {
-    method: 'POST',
-    body: JSON.stringify({ serial_number, imei }),
-  })
-export const unassignDevice = (deviceId: number) =>
-  request<Device>(`/devices/${deviceId}/unassign`, { method: 'POST' })
-export const assignDevice = (deviceId: number, custodyPersonId: number) =>
-  request<Device>(`/devices/${deviceId}/assign`, {
-    method: 'POST',
-    body: JSON.stringify({ custody_person_id: custodyPersonId }),
-  })
+
+/** Location history / breadcrumbs for route replay */
+export const getGpsHistory = async (
+  deviceId: string | number,
+  limit = 100,
+  signal?: AbortSignal
+): Promise<GpsLocation[]> => {
+  const response = await request<unknown>(`/gps/${deviceId}/history?limit=${limit}`, { signal })
+  if (Array.isArray(response)) return response as GpsLocation[]
+  if (typeof response === 'object' && response !== null) {
+    const wrapped = response as { value?: unknown; data?: unknown }
+    if (Array.isArray(wrapped.value)) return wrapped.value as GpsLocation[]
+    if (Array.isArray(wrapped.data)) return wrapped.data as GpsLocation[]
+  }
+  console.warn(`GPS history response for device ${deviceId} was not a list.`)
+  return []
+}
+
+/** Force GPS poll (sends CR command to wake watch GPS chip) */
+export const pollDeviceGps = (deviceId: string | number) =>
+  request<unknown>(`/gps/${deviceId}/poll`, { method: 'POST' })
+
+/** Check if a point is inside a geofence circle */
+export const checkGeofence = (payload: GeofenceCheckRequest) =>
+  request<unknown>('/gps/geofence/check', { method: 'POST', body: JSON.stringify(payload) })
+
+// Legacy aliases
+export const getLatestLocation = (deviceId: number | string) => getLatestGpsLocation(deviceId)
+export const listLocationHistory = (deviceId: number | string, limit = 500) => getGpsHistory(deviceId, limit)
+
+// =============================================================================
+// GEOFENCES  —  /api/v1/geofences
+// =============================================================================
+
 export const listGeofences = (skip = 0, limit = 100) =>
   request<Geofence[]>(`/geofences?skip=${skip}&limit=${limit}`)
-export const createGeofence = (payload: {
-  name: string
-  fence_type: FenceType
-  latitude: number
-  longitude: number
-  radius_m: number
-}) => request<Geofence>('/geofences', { method: 'POST', body: JSON.stringify(payload) })
-export const updateGeofence = (id: number, payload: Partial<Pick<Geofence, 'name' | 'radius_m' | 'is_active'>>) =>
-  request<Geofence>(`/geofences/${id}`, { method: 'PATCH', body: JSON.stringify(payload) })
-export const deleteGeofence = (id: number) =>
-  request<void>(`/geofences/${id}`, { method: 'DELETE' })
-export const listAlerts = (skip = 0, limit = 100) =>
-  request<ApiAlert[]>(`/alerts?skip=${skip}&limit=${limit}`)
+
+export const getGeofence = (id: number) => request<Geofence>(`/geofences/${id}`)
+
+export const createGeofence = (payload: GeofenceCreate) =>
+  request<Geofence>('/geofences', { method: 'POST', body: JSON.stringify(payload) })
+
+export const deleteGeofence = (id: number) => request<unknown>(`/geofences/${id}`, { method: 'DELETE' })
+
+export const validateGeofencePosition = (payload: GeofenceValidateRequest) =>
+  request<unknown>('/geofences/validate-position', { method: 'POST', body: JSON.stringify(payload) })
+
+// Legacy alias — the backend no longer has PATCH, use createGeofence or deleteGeofence
+export const updateGeofence = (_id: number, _payload: unknown) => {
+  console.warn('updateGeofence: backend does not support PATCH; delete and re-create the geofence instead.')
+  return Promise.reject(new Error('Geofence PATCH not supported — please delete and re-create.'))
+}
+
+// =============================================================================
+// ALERTS  —  /api/v1/alerts
+// =============================================================================
+
+export interface ListAlertsParams {
+  status?: string | null       // NEW | ACKNOWLEDGED | RESOLVED
+  alert_type?: string | null   // SOS | STRAP_CUT | LOW_BATTERY | GEOFENCE_BREACH
+  device_id?: string | null    // filter by IMEI
+  limit?: number
+}
+
+export const listAlerts = (skipOrParams: number | ListAlertsParams = 0, limit = 100) => {
+  const q = new URLSearchParams()
+  if (typeof skipOrParams === 'number') {
+    q.set('skip', String(skipOrParams))
+    q.set('limit', String(limit))
+  } else {
+    if (skipOrParams.status) q.set('status', skipOrParams.status)
+    if (skipOrParams.alert_type) q.set('alert_type', skipOrParams.alert_type)
+    if (skipOrParams.device_id) q.set('device_id', skipOrParams.device_id)
+    if (skipOrParams.limit != null) q.set('limit', String(skipOrParams.limit))
+  }
+  const qs = q.toString()
+  return request<ApiAlert[]>(`/alerts${qs ? `?${qs}` : ''}`)
+}
+
+export const getAlert = (id: number) => request<ApiAlert>(`/alerts/${id}`)
+
 export const acknowledgeAlert = (id: number, notes = 'Officer acknowledged alert') =>
   request<ApiAlert>(`/alerts/${id}/acknowledge`, {
     method: 'POST',
     body: JSON.stringify({ notes }),
   })
-export const resolveAlert = (id: number, resolutionNotes = 'Incident cleared and verified by officer') =>
+
+export const resolveAlert = (id: number, resolution_notes = 'Incident cleared and verified by officer') =>
   request<ApiAlert>(`/alerts/${id}/resolve`, {
     method: 'POST',
-    body: JSON.stringify({ resolution_notes: resolutionNotes }),
+    body: JSON.stringify({ resolution_notes }),
   })
-export const listLocationHistory = (deviceId: number | string, limit = 500) =>
-  request<LocationRecord[]>(`/locations/device/${deviceId}?limit=${limit}`)
+
+// Dashboard alerts (lighter endpoint, no auth required)
+export const getDashboardAlerts = (limit = 20) =>
+  request<ApiAlert[]>(`/dashboard/alerts?limit=${limit}`)
+
+// =============================================================================
+// MONITORING  —  /api/v1/monitoring/...
+// =============================================================================
+
+/** Full live grid for all wearers (coordinates, battery, heart rate, security flags) */
+export const getLiveGrid = () => request<unknown[]>('/monitoring/live-grid')
+
+/** Real-time summary KPIs for dispatcher screens */
+export const getMonitoringSummary = () => request<unknown>('/monitoring/summary')
+
+// =============================================================================
+// PLAYBACK  —  /api/v1/playback/{device_id}
+// =============================================================================
+
+export interface PlaybackParams {
+  limit?: number       // max 1000, default 200
+  start_date?: string  // YYYY-MM-DD
+  end_date?: string    // YYYY-MM-DD
+}
+
+export const getPlaybackRoute = (deviceId: string | number, params: PlaybackParams = {}) => {
+  const q = new URLSearchParams()
+  if (params.limit != null) q.set('limit', String(params.limit))
+  if (params.start_date) q.set('start_date', params.start_date)
+  if (params.end_date) q.set('end_date', params.end_date)
+  const qs = q.toString()
+  return request<unknown>(`/playback/${deviceId}${qs ? `?${qs}` : ''}`)
+}
+
+// =============================================================================
+// HEALTH & BIOMETRICS  —  /api/v1/health-data/...
+// =============================================================================
+
+export const getDeviceHealthSummary = (deviceId: string | number) =>
+  request<unknown>(`/health-data/device/${deviceId}/summary`)
+
+export const getHeartRateHistory = (deviceId: string | number, limit = 50) =>
+  request<unknown[]>(`/health-data/device/${deviceId}/heart-rate?limit=${limit}`)
+
+// =============================================================================
+// STATISTICS  —  /api/v1/statistics/...
+// =============================================================================
+
+export const getFleetStatistics = () => request<unknown>('/statistics/overview')
+
+// =============================================================================
+// ACCOUNTS  —  /api/v1/accounts  (requires Bearer token)
+// =============================================================================
+
+export const listAccounts = (skip = 0, limit = 100) =>
+  request<ApiUser[]>(`/accounts?skip=${skip}&limit=${limit}`)
+export const getAccount = (email: string) => request<ApiUser>(`/accounts/${email}`)
+export const updateAccount = (email: string, payload: AccountUpdate) =>
+  request<ApiUser>(`/accounts/${email}`, { method: 'PUT', body: JSON.stringify(payload) })
+export const deactivateAccount = (email: string) =>
+  request<unknown>(`/accounts/${email}`, { method: 'DELETE' })
+export const changePassword = (email: string, current_password: string, new_password: string) =>
+  request<unknown>(`/accounts/${email}/change-password`, {
+    method: 'POST',
+    body: JSON.stringify({ current_password, new_password }),
+  })
+
+export const listUsers = (skip = 0, limit = 100) =>
+  request<ApiUser[]>(`/users?skip=${skip}&limit=${limit}`)
+
+export const listPeople = (skip = 0, limit = 100) =>
+  request<CustodyPerson[]>(`/custody?skip=${skip}&limit=${limit}`)
+
+// =============================================================================
+// COMMANDS  —  /api/v1/commands/...
+// =============================================================================
+
+export const sendCommand = (payload: SendCommandRequest) =>
+  request<unknown>('/commands/send', { method: 'POST', body: JSON.stringify(payload) })
+
+export const getCommandHistory = (device_id?: string, limit = 50) => {
+  const q = new URLSearchParams({ limit: String(limit) })
+  if (device_id) q.set('device_id', device_id)
+  return request<unknown[]>(`/commands/history?${q}`)
+}
+
+export const getSupportedCommands = () => request<Record<string, string>>('/commands/supported')
+
+// =============================================================================
+// ROLES & RBAC  —  /api/v1/roles/...
+// =============================================================================
+
+export const listRoles = () => request<unknown[]>('/roles')
+export const getRole = (role_name: string) => request<unknown>(`/roles/${role_name}`)
+export const assignRole = (user_email: string, role_name: string) =>
+  request<unknown>('/roles/assign', { method: 'POST', body: JSON.stringify({ user_email, role_name }) })
+
+// =============================================================================
+// EXPORTS & LEGAL EVIDENCE  —  /api/v1/exports/...
+// =============================================================================
+
+export const getTelemetryCsvUrl = (deviceId: string | number, limit = 500) =>
+  `${API_BASE_URL}/exports/telemetry/${deviceId}/csv?limit=${limit}`
+
+export const getAlertsCsvUrl = (limit = 500) =>
+  `${API_BASE_URL}/exports/alerts/csv?limit=${limit}`
+
+export const getCourtEvidencePacket = (deviceId: string | number) =>
+  request<unknown>(`/exports/court-evidence/${deviceId}`)
+
+// =============================================================================
+// INTEGRATIONS & WEBHOOKS  —  /api/v1/integrations/...
+// =============================================================================
+
+export const getIntegrationsStatus = () => request<unknown>('/integrations/status')
+export const listWebhooks = () => request<unknown[]>('/integrations/webhooks')
+export const createWebhook = (payload: WebhookCreateRequest) =>
+  request<unknown>('/integrations/webhooks', { method: 'POST', body: JSON.stringify(payload) })
+export const testWebhook = () =>
+  request<unknown>('/integrations/webhooks/test', { method: 'POST' })
+
+// =============================================================================
+// JOURNEYS  — kept for backwards compat (may need backend route if added later)
+// =============================================================================
+
+export const startJourney = async (body: StartJourneyRequest): Promise<Journey> =>
+  request<Journey>('/journeys/start', { method: 'POST', body: JSON.stringify(body) })
+
+export const endJourney = async (body: EndJourneyRequest): Promise<Journey> =>
+  request<Journey>('/journeys/end', { method: 'POST', body: JSON.stringify(body) })
+
+export const getActiveJourney = async (deviceId: string | number): Promise<Journey | null> =>
+  request<Journey | null>(`/journeys/active/${deviceId}`).catch(() => null)
+
+export const getDeviceJourneys = async (deviceId: string | number): Promise<Journey[]> => {
+  const res = await request<Journey[] | { items: Journey[] }>(`/journeys/device/${deviceId}`).catch(() => [])
+  return Array.isArray(res) ? res : (res as any).items ?? []
+}
+
+export const getJourney = async (journeyId: string | number): Promise<Journey> =>
+  request<Journey>(`/journeys/${journeyId}`)
+
+// =============================================================================
+// RAW GPS PACKET PARSER  (Huateng C05 hardware protocol)
+// =============================================================================
+
 /**
  * Parses raw hardware packet from Huateng C05 GPS wristband.
  * Format: [MNYD*ID*LEN*CMD, date, time, status, lat, lat_dir, lon, lon_dir, speed, ...]
@@ -369,115 +870,4 @@ export function parseRawGpsPacket(rawStr?: string | null): {
     }
   }
   return null
-}
-
-export const getLatestGpsLocation = async (deviceId: string | number): Promise<LatestGpsLocation | null> => {
-  try {
-    const response = await request<any>(`/gps/${deviceId}/latest`)
-    if (!response) return null
-
-    // Support flat object or enveloped response ({ data: ... }, { location: ... }, { gps: ... })
-    const raw = response.data ?? response.location ?? response.gps ?? response
-
-    // Check for actual hardware packet or nested live location
-    const rawLoc = raw.latest?.location ?? response.latest?.location ?? raw
-    const rawStr = rawLoc.raw ?? raw.raw ?? ''
-    const parsedPacket = parseRawGpsPacket(rawStr)
-
-    // Prioritize actual hardware packet coordinates over demo values
-    const latVal =
-      parsedPacket?.latitude ??
-      rawLoc.lat ??
-      (rawLoc.gps_fix ? rawLoc.latitude : null) ??
-      raw.lat ??
-      raw.latitude ??
-      raw.last_latitude
-
-    const lonVal =
-      parsedPacket?.longitude ??
-      rawLoc.lon ??
-      (rawLoc.gps_fix ? rawLoc.longitude : null) ??
-      raw.lon ??
-      raw.lng ??
-      raw.longitude ??
-      raw.last_longitude
-
-    if (latVal == null || lonVal == null) return null
-    const latitude = Number(latVal)
-    const longitude = Number(lonVal)
-
-    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null
-    if (latitude === 0 && longitude === 0) return null
-    if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null
-
-    const speed = parsedPacket?.speed_kmh ?? rawLoc.speed_kmh ?? raw.speed_kmh ?? raw.speed ?? null
-    const heading = rawLoc.heading ?? rawLoc.bearing ?? raw.heading ?? raw.bearing ?? raw.course ?? raw.direction_deg ?? null
-    const battery =
-      parsedPacket?.battery_pct ??
-      rawLoc.battery_percent ??
-      raw.battery_pct ??
-      raw.battery_percent ??
-      raw.battery_level ??
-      raw.battery ??
-      null
-    const recordedAt =
-      rawLoc.received_at ??
-      raw.recorded_at ??
-      raw.device_timestamp ??
-      raw.timestamp ??
-      raw.received_at ??
-      raw.last_seen ??
-      new Date().toISOString()
-    const sats = rawLoc.satellites ?? raw.satellites ?? raw.sat_count ?? null
-    const fix = parsedPacket?.gps_fix ?? (rawLoc.gps_fix !== false && rawLoc.gps_valid !== false)
-
-    return {
-      latitude,
-      longitude,
-      speed_kmh: speed != null && Number.isFinite(Number(speed)) ? Number(speed) : null,
-      heading: heading != null && Number.isFinite(Number(heading)) ? Number(heading) : null,
-      battery_pct: battery != null && Number.isFinite(Number(battery)) ? Number(battery) : null,
-      recorded_at: typeof recordedAt === 'string' ? recordedAt : new Date(recordedAt).toISOString(),
-      satellites: sats != null ? Number(sats) : null,
-      gps_fix: fix,
-      raw,
-    }
-  } catch {
-    return null
-  }
-}
-
-export const getLatestLocation = (deviceId: number | string) =>
-  request<LocationRecord>(`/locations/device/${deviceId}/latest`)
-export const getDashboardSummary = () => request<unknown>('/dashboard')
-
-// ============================================================================
-// JOURNEYS API (POST /journeys/start, POST /journeys/end, GET /journeys/...)
-// ============================================================================
-
-export const startJourney = async (body: StartJourneyRequest): Promise<Journey> => {
-  return request<Journey>('/journeys/start', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  })
-}
-
-export const endJourney = async (body: EndJourneyRequest): Promise<Journey> => {
-  return request<Journey>('/journeys/end', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  })
-}
-
-export const getActiveJourney = async (deviceId: string | number): Promise<Journey | null> => {
-  return request<Journey | null>(`/journeys/active/${deviceId}`).catch(() => null)
-}
-
-export const getDeviceJourneys = async (deviceId: string | number): Promise<Journey[]> => {
-  const res = await request<Journey[] | { items: Journey[] }>(`/journeys/device/${deviceId}`).catch(() => [])
-  return Array.isArray(res) ? res : res.items || []
-}
-
-export const getJourney = async (journeyId: string | number): Promise<Journey> => {
-  return request<Journey>(`/journeys/${journeyId}`)
 }

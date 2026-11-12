@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Box, IconButton } from '@mui/material'
 import { FullscreenOutlined, Navigation } from '@mui/icons-material'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import type { Device } from '../../services/api'
-import { subscribeToDeviceTrips, type TripRecord, isValidGpsCoord } from '../../lib/firebase'
+import { subscribeToDeviceTrips, type TripRecord } from '../../lib/firebase'
+import type { SelectedGpsRouteStatus } from '../dashboard/useSelectedGpsRoute'
 
 export type OpenStreetMapStyle = 'standard' | 'humanitarian' | 'cycle'
 
@@ -23,29 +24,35 @@ const mapStyles: Record<OpenStreetMapStyle, { url: string; attribution: string }
   },
 }
 
-export default function OpenStreetMapView({ devices, selectedId, showNames, aggregate, mapStyle }: {
+export default function OpenStreetMapView({ devices, selectedId, showNames, aggregate, mapStyle, movementSegments, gpsRouteStatus }: {
   devices: Device[]; selectedId: number | string | null; showNames: boolean; aggregate: boolean; mapStyle: OpenStreetMapStyle
+  movementSegments: Array<Array<{ lat: number; lng: number }>>
+  gpsRouteStatus: SelectedGpsRouteStatus | null
 }) {
   const root = useRef<HTMLDivElement>(null)
   const canvas = useRef<HTMLDivElement>(null)
   const map = useRef<L.Map | null>(null)
   const markers = useRef<L.LayerGroup | null>(null)
-  const routeLine = useRef<L.Polyline | null>(null)
+  const routeLayers = useRef<L.LayerGroup | null>(null)
   const tileLayer = useRef<L.TileLayer | null>(null)
-  const [activeTrip, setActiveTrip] = useState<TripRecord | null>(null)
+  const [tripSelection, setTripSelection] = useState<{ deviceId: string; trip: TripRecord | null }>({ deviceId: '', trip: null })
+  const activeTrip = selectedId != null && tripSelection.deviceId === String(selectedId)
+    ? tripSelection.trip
+    : null
 
-  const located = devices.filter(device => device.last_latitude != null && device.last_longitude != null && Number.isFinite(device.last_latitude) && Number.isFinite(device.last_longitude))
+  const located = useMemo(
+    () => devices.filter(device => device.last_latitude != null && device.last_longitude != null && Number.isFinite(device.last_latitude) && Number.isFinite(device.last_longitude)),
+    [devices],
+  )
 
   // Subscribe to trips for selected device to show route polyline
   useEffect(() => {
-    if (!selectedId) {
-      setActiveTrip(null)
-      return
-    }
+    if (selectedId == null) return
 
-    const unsubscribe = subscribeToDeviceTrips(String(selectedId), (trips) => {
+    const deviceId = String(selectedId)
+    const unsubscribe = subscribeToDeviceTrips(deviceId, (trips) => {
       const active = trips.find(t => t.status === 'in_progress') ?? trips[0] ?? null
-      setActiveTrip(active)
+      setTripSelection({ deviceId, trip: active })
     })
 
     return () => unsubscribe()
@@ -53,23 +60,11 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
 
   useEffect(() => {
     if (!canvas.current) return
-    const first = located[0]
-    const initialCenter: [number, number] = first
-      ? [first.last_latitude!, first.last_longitude!]
-      : [20.5937, 78.9629]
-    const initialZoom = first ? 15 : 4
-
-    const instance = L.map(canvas.current, { zoomControl: false }).setView(initialCenter, initialZoom)
+    const instance = L.map(canvas.current, { zoomControl: false }).setView([20.5937, 78.9629], 4)
     L.control.zoom({ position: 'topright' }).addTo(instance)
     map.current = instance
     markers.current = L.layerGroup().addTo(instance)
-    routeLine.current = L.polyline([], {
-      color: '#2563eb',
-      weight: 5,
-      opacity: 0.9,
-      lineCap: 'round',
-      lineJoin: 'round',
-    }).addTo(instance)
+    routeLayers.current = L.layerGroup().addTo(instance)
 
     const observer = new ResizeObserver(() => instance.invalidateSize({ pan: false }))
     observer.observe(canvas.current)
@@ -80,7 +75,7 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
       instance.remove()
       map.current = null
       markers.current = null
-      routeLine.current = null
+      routeLayers.current = null
       tileLayer.current = null
     }
   }, [])
@@ -93,38 +88,39 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
   }, [mapStyle])
 
   useEffect(() => {
+    if (!map.current || !routeLayers.current) return
+    routeLayers.current.clearLayers()
+    movementSegments.forEach(segment => {
+      if (segment.length > 1) {
+        L.polyline(segment.map(point => [point.lat, point.lng] as L.LatLngTuple), {
+          color: '#2563eb',
+          weight: 3,
+          opacity: 0.9,
+          lineJoin: 'round',
+          lineCap: 'round',
+        }).addTo(routeLayers.current!)
+      }
+      segment.forEach(point => {
+        L.circleMarker([point.lat, point.lng], {
+          radius: 3,
+          color: '#ffffff',
+          weight: 0.5,
+          fillColor: '#2563eb',
+          fillOpacity: 1,
+        }).addTo(routeLayers.current!)
+      })
+    })
+  }, [movementSegments])
+
+  useEffect(() => {
     if (!map.current || !markers.current) return
     markers.current.clearLayers()
-
-    // 1. Draw route polyline if selected device has an active or recent journey
-    const validPoints = (activeTrip?.route_points || []).filter(p => isValidGpsCoord(p.latitude, p.longitude))
-    if (routeLine.current) {
-      if (validPoints.length > 1) {
-        const latLngs: L.LatLngTuple[] = validPoints.map(p => [p.latitude, p.longitude])
-        routeLine.current.setLatLngs(latLngs)
-      } else {
-        routeLine.current.setLatLngs([])
-      }
-    }
-
-    // 2. Draw Start Marker (Green) if active journey exists
-    if (validPoints.length > 0 && activeTrip?.start_location) {
-      const start = validPoints[0]
-      const startMarker = L.circleMarker([start.latitude, start.longitude], {
-        radius: 8,
-        color: '#ffffff',
-        weight: 2,
-        fillColor: '#16a34a',
-        fillOpacity: 1,
-      })
-      startMarker.bindTooltip('START', { permanent: true, direction: 'bottom', className: 'start-tooltip' })
-      markers.current.addLayer(startMarker)
-    }
-
-    // 3. Draw device markers
-    const located = devices.filter(device => device.last_latitude != null && device.last_longitude != null && Number.isFinite(device.last_latitude) && Number.isFinite(device.last_longitude))
+    const routePoints = movementSegments.flatMap(segment =>
+      segment.map(point => [point.lat, point.lng] as L.LatLngTuple),
+    )
+    // Draw device markers
     located.forEach(device => {
-      const isSelected = device.id === selectedId
+      const isSelected = String(device.id) === String(selectedId) || String(device.device_id) === String(selectedId)
       const marker = L.circleMarker([device.last_latitude!, device.last_longitude!], {
         radius: isSelected ? 10 : 7,
         color: '#fff',
@@ -133,20 +129,26 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
         fillOpacity: 1
       })
       const name = document.createElement('span')
-      name.textContent = device.device_name ?? device.serial_number
+      name.textContent = device.device_name ?? device.serial_number ?? ''
       marker.bindTooltip(name, { permanent: showNames, direction: 'top' })
       marker.addTo(markers.current!)
     })
 
-    const selected = located.find(device => device.id === selectedId) ?? located[0]
+    const selected = located.find(device =>
+      String(device.id) === String(selectedId) || String(device.device_id) === String(selectedId),
+    ) ?? located[0]
     if (aggregate && located.length > 1) {
-      map.current.fitBounds(L.latLngBounds(located.map(device => [device.last_latitude!, device.last_longitude!] as L.LatLngTuple)), { padding: [40, 40], maxZoom: 16 })
-    } else if (validPoints.length > 1 && !aggregate) {
-      map.current.fitBounds(L.latLngBounds(validPoints.map(p => [p.latitude, p.longitude] as L.LatLngTuple)), { padding: [40, 40], maxZoom: 16 })
+      const boundsPoints = [
+        ...located.map(device => [device.last_latitude!, device.last_longitude!] as L.LatLngTuple),
+        ...routePoints,
+      ]
+      map.current.fitBounds(L.latLngBounds(boundsPoints), { padding: [40, 40], maxZoom: 16 })
+    } else if (routePoints.length > 1) {
+      map.current.fitBounds(L.latLngBounds(routePoints), { padding: [40, 40], maxZoom: 16 })
     } else if (selected) {
       map.current.setView([selected.last_latitude!, selected.last_longitude!], 15)
     }
-  }, [devices, selectedId, showNames, aggregate, activeTrip])
+  }, [devices, selectedId, showNames, aggregate, located, movementSegments])
 
   return <Box ref={root} sx={{ position: 'relative', width: '100%', height: '100%', minHeight: 520, zIndex: 0, '&:fullscreen': { height: '100vh', width: '100vw' } }}>
     <Box ref={canvas} aria-label="Device location map" sx={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }} />
@@ -156,6 +158,19 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
       <Box sx={{ position: 'absolute', top: 20, left: 20, zIndex: 1000, bgcolor: 'rgba(37, 99, 235, 0.92)', color: '#ffffff', px: 2, py: 1, borderRadius: 1.5, fontSize: 13, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 1, boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
         <Navigation sx={{ fontSize: 16 }} />
         {activeTrip.status === 'in_progress' ? 'Active Journey' : 'Last Trip'}: {activeTrip.total_distance_km.toFixed(2)} km
+      </Box>
+    )}
+    {(gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'history-mismatch') && (
+      <Box role="status" sx={{ position: 'absolute', left: 20, bottom: 20, zIndex: 1000, bgcolor: 'rgba(239, 246, 255, 0.96)', color: '#1e3a8a', px: 1.5, py: 1, borderRadius: 1, fontSize: 12, border: '1px solid #bfdbfe', maxWidth: 420 }}>
+        {gpsRouteStatus === 'history-mismatch'
+          ? 'A newer source-verified Firestore GPS fix is missing from backend history; it is not added to the recorded trail.'
+          : 'No fresh valid GPS fix received. Any visible trail contains recorded GPS points only; no movement is simulated.'}
+      </Box>
+    )}
+    {movementSegments.some(segment => segment.length > 1) && activeTrip?.status !== 'in_progress' && (
+      <Box sx={{ position: 'absolute', top: 20, left: 20, zIndex: 1000, bgcolor: 'rgba(37, 99, 235, 0.92)', color: '#ffffff', px: 2, py: 1, borderRadius: 1.5, fontSize: 13, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 1, boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
+        <Navigation sx={{ fontSize: 16 }} />
+        Live tracking
       </Box>
     )}
 
