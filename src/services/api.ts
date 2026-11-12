@@ -10,6 +10,8 @@
 // All paths are prefixed with /api/v1 (set via VITE_API_BASE_URL)
 // =============================================================================
 
+import { mergeVerifiedGpsFixes, normalizeVerifiedGpsFix } from './gpsNormalization'
+
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '/api/v1').replace(/\/+$/, '')
 const ACCESS_TOKEN_KEY = 'trackin360-access-token'
 
@@ -138,6 +140,9 @@ export interface GpsLocation {
   battery_pct?: number | null
   satellites?: number | null
   gps_fix?: boolean
+  gps_valid?: boolean | number | string
+  gps_source?: string | null
+  source?: string | null
   status?: string | null
   gps_status?: string | null
   validity?: string | null
@@ -149,6 +154,7 @@ export interface GpsLocation {
 
 export interface LatestGpsLocation extends GpsLocation {
   recorded_at: string
+  gps_source: string
 }
 
 /** Alias kept for backwards compatibility with existing map components */
@@ -521,72 +527,39 @@ export const getLatestGpsLocation = async (
   signal?: AbortSignal
 ): Promise<LatestGpsLocation | null> => {
   try {
-    const response = await request<any>(`/gps/${deviceId}/latest`, { signal })
-    const raw = response?.value ?? response?.data ?? response
-    if (!raw) return null
-    const gpsStatus = String(
-      raw.gps_status ?? raw.status ?? raw.validity ?? (typeof raw.gps_fix === 'string' ? raw.gps_fix : '')
-    ).trim().toUpperCase()
-    const gpsFlagsValid = [raw.gps_fix, raw.gps_valid].every(
-      (flag) =>
-        flag !== false &&
-        flag !== 0 &&
-        String(flag).trim().toLowerCase() !== 'false' &&
-        String(flag).trim() !== '0' &&
-        String(flag).trim().toUpperCase() !== 'V'
-    )
-    if (!gpsFlagsValid || gpsStatus === 'V') return null
+    const response = await request<unknown>(`/gps/${deviceId}/latest`, { signal })
+    const wrapper = typeof response === 'object' && response !== null
+      ? response as Record<string, unknown>
+      : null
+    const rawValue = wrapper?.value ?? wrapper?.data ?? response
+    if (typeof rawValue !== 'object' || rawValue === null) return null
+    const raw = rawValue as Record<string, unknown>
+    const fix = normalizeVerifiedGpsFix(raw)
+    if (!fix) return null
 
-    const lat = raw.latitude ?? raw.lat ?? raw.last_latitude
-    const lng = raw.longitude ?? raw.lon ?? raw.lng ?? raw.last_longitude
-    if (lat == null || lng == null) return null
-
-    const latitude = Number(lat)
-    const longitude = Number(lng)
-    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null
-    if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null
-    if (latitude === 0 && longitude === 0) return null
-    const rawTimestamp =
-      raw.recorded_at ??
-      raw.received_at ??
-      raw.device_timestamp ??
-      raw.timestamp ??
-      raw.gps_time ??
-      raw.last_valid_gps_time ??
-      raw.gps_update_time
-    if (rawTimestamp == null) return null
-    const timestampObject =
-      typeof rawTimestamp === 'object' && rawTimestamp !== null
-        ? rawTimestamp as { seconds?: unknown; toDate?: () => Date }
-        : null
-    const timestampDate =
-      rawTimestamp instanceof Date
-        ? rawTimestamp
-        : typeof timestampObject?.toDate === 'function'
-          ? timestampObject.toDate()
-          : typeof timestampObject?.seconds === 'number'
-            ? new Date(timestampObject.seconds * 1000)
-            : null
-    const numericTimestamp = timestampDate ? NaN : Number(rawTimestamp)
-    const recordedAt = timestampDate
-      ? timestampDate.toISOString()
-      : Number.isFinite(numericTimestamp) && numericTimestamp > 0
-        ? new Date(numericTimestamp < 1_000_000_000_000 ? numericTimestamp * 1000 : numericTimestamp).toISOString()
-        : String(rawTimestamp)
-    if (Number.isNaN(Date.parse(recordedAt))) return null
+    const finiteNumber = (...values: unknown[]): number | null => {
+      const value = values.find((candidate) => candidate !== undefined && candidate !== null)
+      if (value == null) return null
+      const number = Number(value)
+      return Number.isFinite(number) ? number : null
+    }
 
     return {
-      latitude,
-      longitude,
-      speed_kmh: raw.speed_kmh ?? raw.speed ?? null,
-      heading: raw.heading ?? raw.bearing ?? raw.course ?? null,
-      battery_pct: raw.battery_pct ?? raw.battery_percent ?? raw.battery ?? null,
-      recorded_at: recordedAt,
-      satellites: raw.satellites ?? raw.sat_count ?? null,
+      ...raw,
+      latitude: fix.latitude,
+      longitude: fix.longitude,
+      speed_kmh: finiteNumber(raw.speed_kmh, raw.speed),
+      heading: finiteNumber(raw.heading, raw.bearing, raw.course),
+      battery_pct: finiteNumber(raw.battery_pct, raw.battery_percent, raw.battery),
+      recorded_at: fix.recordedAt,
+      gps_source: fix.source,
+      accuracy_m: fix.accuracy,
+      satellites: finiteNumber(raw.satellites, raw.sat_count),
       gps_fix: true,
-      status: gpsStatus || null,
-      gps_status: gpsStatus || null,
-      validity: gpsStatus || null,
+      gps_valid: true,
+      status: fix.status,
+      gps_status: fix.status,
+      validity: fix.status,
       raw,
     }
   } catch (error) {
@@ -603,14 +576,29 @@ export const getGpsHistory = async (
   signal?: AbortSignal
 ): Promise<GpsLocation[]> => {
   const response = await request<unknown>(`/gps/${deviceId}/history?limit=${limit}`, { signal })
-  if (Array.isArray(response)) return response as GpsLocation[]
-  if (typeof response === 'object' && response !== null) {
-    const wrapped = response as { value?: unknown; data?: unknown }
-    if (Array.isArray(wrapped.value)) return wrapped.value as GpsLocation[]
-    if (Array.isArray(wrapped.data)) return wrapped.data as GpsLocation[]
+  const wrapper = typeof response === 'object' && response !== null
+    ? response as Record<string, unknown>
+    : null
+  const history = Array.isArray(response)
+    ? response
+    : [wrapper?.value, wrapper?.data, wrapper?.history, wrapper?.items]
+      .find(Array.isArray)
+  if (!Array.isArray(history)) {
+    console.warn(`GPS history response for device ${deviceId} was not a list.`)
+    return []
   }
-  console.warn(`GPS history response for device ${deviceId} was not a list.`)
-  return []
+  return mergeVerifiedGpsFixes(history, null).history.map((fix) => ({
+    latitude: fix.latitude,
+    longitude: fix.longitude,
+    timestamp: fix.recordedAt,
+    recorded_at: fix.recordedAt,
+    accuracy_m: fix.accuracy,
+    gps_fix: true,
+    gps_valid: true,
+    gps_status: fix.status,
+    status: fix.status,
+    gps_source: fix.source,
+  }))
 }
 
 /** Force GPS poll (sends CR command to wake watch GPS chip) */

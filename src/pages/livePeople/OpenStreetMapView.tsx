@@ -4,6 +4,7 @@ import { FullscreenOutlined, Navigation } from '@mui/icons-material'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import type { Device } from '../../services/api'
+import { isFreshGpsTimestamp, normalizeVerifiedGpsFix } from '../../services/gpsNormalization'
 import { subscribeToDeviceTrips, type TripRecord } from '../../lib/firebase'
 import type { SelectedGpsRouteStatus } from '../dashboard/useSelectedGpsRoute'
 
@@ -41,7 +42,10 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
     : null
 
   const located = useMemo(
-    () => devices.filter(device => device.last_latitude != null && device.last_longitude != null && Number.isFinite(device.last_latitude) && Number.isFinite(device.last_longitude)),
+    () => devices.filter(device => {
+      const fix = normalizeVerifiedGpsFix(device)
+      return Boolean(fix && isFreshGpsTimestamp(fix.timestamp))
+    }),
     [devices],
   )
 
@@ -160,11 +164,16 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
         {activeTrip.status === 'in_progress' ? 'Active Journey' : 'Last Trip'}: {activeTrip.total_distance_km.toFixed(2)} km
       </Box>
     )}
-    {(gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'history-mismatch') && (
+    {(gpsRouteStatus === 'unavailable' ||
+      gpsRouteStatus === 'history-sync' ||
+      gpsRouteStatus === 'unavailable-history-sync') && (
       <Box role="status" sx={{ position: 'absolute', left: 20, bottom: 20, zIndex: 1000, bgcolor: 'rgba(239, 246, 255, 0.96)', color: '#1e3a8a', px: 1.5, py: 1, borderRadius: 1, fontSize: 12, border: '1px solid #bfdbfe', maxWidth: 420 }}>
-        {gpsRouteStatus === 'history-mismatch'
-          ? 'A newer source-verified Firestore GPS fix is missing from backend history; it is not added to the recorded trail.'
-          : 'No fresh valid GPS fix received. Any visible trail contains recorded GPS points only; no movement is simulated.'}
+        {(gpsRouteStatus === 'history-sync' || gpsRouteStatus === 'unavailable-history-sync') && (
+          <div>A valid latest GPS fix is missing from backend history and is not added to the recorded trail.</div>
+        )}
+        {(gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'unavailable-history-sync') && (
+          <div>No fresh verified GPS fix is available. Any visible trail contains verified recorded history only.</div>
+        )}
       </Box>
     )}
     {movementSegments.some(segment => segment.length > 1) && activeTrip?.status !== 'in_progress' && (

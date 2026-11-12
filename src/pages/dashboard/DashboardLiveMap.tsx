@@ -28,6 +28,10 @@ import {
   type Device,
   type GpsLocation,
 } from '../../services/api'
+import {
+  isFreshGpsTimestamp,
+  normalizeVerifiedGpsFix,
+} from '../../services/gpsNormalization'
 import { isValidGpsCoord } from '../../lib/firebase'
 import { Link } from 'react-router-dom'
 import {
@@ -296,11 +300,10 @@ export default function DashboardLiveMap({
     },
   }
 
-  // Only devices that have a known, valid coordinate to show on the map
-  const locatedDevices = devices.filter((d) => {
-    const lat = d.last_latitude ?? (d as any).latitude
-    const lng = d.last_longitude ?? (d as any).longitude
-    return isAcceptableFix(Number(lat), Number(lng))
+  // Only show a current marker when the fix is verified and fresh.
+  const locatedDevices = devices.filter((device) => {
+    const fix = normalizeVerifiedGpsFix(device)
+    return Boolean(fix && isFreshGpsTimestamp(fix.timestamp))
   })
 
   const selectedDevice = devices.find(
@@ -312,31 +315,28 @@ export default function DashboardLiveMap({
     ? String(selectedDevice.device_id || selectedDevice.imei || selectedDevice.serial_number || selectedDevice.id)
     : null
   const firestoreLatest = useMemo<GpsLocation | null>(() => {
-    if (
-      selectedDevice?.gps_fix_source !== 'firestore_last_fix' ||
-      selectedDevice.has_gps_fix !== true ||
-      selectedDevice.last_latitude == null ||
-      selectedDevice.last_longitude == null ||
-      !selectedDevice.gps_update_time
-    ) return null
+    if (!selectedDevice) return null
+    const fix = normalizeVerifiedGpsFix(selectedDevice)
+    if (!fix) return null
     return {
       device_id: trackingDeviceId ?? undefined,
-      latitude: selectedDevice.last_latitude,
-      longitude: selectedDevice.last_longitude,
-      recorded_at: selectedDevice.gps_update_time,
+      latitude: fix.latitude,
+      longitude: fix.longitude,
+      recorded_at: fix.recordedAt,
       gps_fix: true,
-      gps_status: 'GPS Locked',
-      status: 'GPS Locked',
+      gps_valid: true,
+      gps_source: fix.source,
+      gps_status: fix.status,
+      status: fix.status,
     }
   }, [selectedDevice, trackingDeviceId])
 
   const handleFreshGpsPoint = useCallback((point: GpsLocation) => {
     if (selectedDeviceId == null) return
     const markerKey = String(selectedDevice?.id ?? selectedDeviceId)
-    const latitude = Number(point.latitude)
-    const longitude = Number(point.longitude)
-    const timestamp = timestampMillis(point.recorded_at)
-    if (timestamp === null || !isAcceptableFix(latitude, longitude)) return
+    const fix = normalizeVerifiedGpsFix(point)
+    if (!fix || !isFreshGpsTimestamp(fix.timestamp)) return
+    const { latitude, longitude, timestamp } = fix
     let entry = markersMapRef.current.get(markerKey)
     if (!entry) {
       const map = mapInstanceRef.current
@@ -347,6 +347,9 @@ export default function DashboardLiveMap({
         last_latitude: latitude,
         last_longitude: longitude,
         gps_update_time: new Date(timestamp).toISOString(),
+        gps_fix_source: fix.source,
+        has_gps_fix: true,
+        gps_fix: true,
       }
       const marker = L.marker([latitude, longitude], {
         icon: createDeviceIcon({
@@ -380,6 +383,9 @@ export default function DashboardLiveMap({
       last_latitude: latitude,
       last_longitude: longitude,
       gps_update_time: new Date(timestamp).toISOString(),
+      gps_fix_source: fix.source,
+      has_gps_fix: true,
+      gps_fix: true,
       ...(point.speed_kmh != null ? { speed_kmh: Number(point.speed_kmh) } : {}),
       ...(point.heading != null ? { heading: Number(point.heading) } : {}),
       ...(point.battery_pct != null ? { battery_pct: Number(point.battery_pct) } : {}),
@@ -596,14 +602,10 @@ export default function DashboardLiveMap({
 
     let isCancelled = false
     const applyGpsFix = (entry: MarkerEntry, fix: GpsLocation) => {
-      const latitude = Number(fix.latitude)
-      const longitude = Number(fix.longitude)
-      const timestamp = timestampMillis(fix.recorded_at)
-      const status = String(fix.status ?? fix.gps_status ?? '').toUpperCase()
+      const verifiedFix = normalizeVerifiedGpsFix(fix)
+      if (!verifiedFix || !isFreshGpsTimestamp(verifiedFix.timestamp)) return
+      const { latitude, longitude, timestamp } = verifiedFix
       if (
-        fix.gps_fix === false ||
-        status === 'V' ||
-        timestamp === null ||
         !isAcceptableFix(latitude, longitude) ||
         (entry.latestFixAt !== null && timestamp <= entry.latestFixAt)
       ) return
@@ -621,6 +623,7 @@ export default function DashboardLiveMap({
         gps_update_time: new Date(timestamp).toISOString(),
         has_gps_fix: true,
         gps_fix: true,
+        gps_fix_source: verifiedFix.source,
         ...(fix.speed_kmh != null ? { speed_kmh: speed } : {}),
         ...(fix.heading != null ? { heading: Number(fix.heading) } : {}),
         ...(fix.battery_pct != null ? { battery_pct: Number(fix.battery_pct) } : {}),
@@ -814,11 +817,16 @@ export default function DashboardLiveMap({
 
       {/* ── Map canvas ── */}
       <div className="map-canvas-container" ref={mapContainerRef}>
-        {selectedDevice && (gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'history-mismatch') && (
+        {selectedDevice && (gpsRouteStatus === 'unavailable' ||
+          gpsRouteStatus === 'history-sync' ||
+          gpsRouteStatus === 'unavailable-history-sync') && (
           <div className="gps-route-status" role="status">
-            {gpsRouteStatus === 'history-mismatch'
-              ? 'A newer source-verified Firestore GPS fix is not in backend history. The marker may show that fix, but it is not added to the recorded trail until the backend history confirms it.'
-              : 'No fresh valid GPS fix received from the backend. Any visible trail contains recorded GPS points only; no movement is simulated.'}
+            {(gpsRouteStatus === 'history-sync' || gpsRouteStatus === 'unavailable-history-sync') && (
+              <p>A valid latest GPS fix is missing from backend history and is not added to the recorded trail.</p>
+            )}
+            {(gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'unavailable-history-sync') && (
+              <p>No fresh verified GPS fix is available. Any visible trail contains verified recorded history only.</p>
+            )}
           </div>
         )}
         {locatedDevices.length === 0 && (

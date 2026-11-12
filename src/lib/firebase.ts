@@ -120,6 +120,8 @@ export function extractLatestBattery(data: Record<string, any>): number | null {
   return candidates[0].value
 }
 
+import { normalizeVerifiedGpsFix } from '../services/gpsNormalization'
+
 export interface ExtractedGps {
   latitude: number | null
   longitude: number | null
@@ -200,36 +202,25 @@ export function extractLatestGps(
     return nLat >= -90 && nLat <= 90 && nLon >= -180 && nLon <= 180
   }
   const isValidFix = (location: Record<string, unknown>): boolean => {
-    const status = String(
-      location.gps_status ??
-        location.status ??
-        location.validity ??
-        (typeof location.gps_fix === 'string' ? location.gps_fix : '')
-    ).trim().toUpperCase()
-    const isValidFlag = (flag: unknown) =>
-      flag !== false &&
-      flag !== 0 &&
-      String(flag).trim().toLowerCase() !== 'false' &&
-      String(flag).trim() !== '0' &&
-      String(flag).trim().toUpperCase() !== 'V'
-    return (
-      isValidFlag(location.gps_fix) &&
-      isValidFlag(location.gps_valid) &&
-      status !== 'V'
-    )
+    return normalizeVerifiedGpsFix(location) !== null
   }
 
   // 1. Highest Priority: Parse actual hardware GPS packet directly from watch
   const rawLoc = data.latest?.location || data.latest?.location_on_demand || data.latest?.other
   if (rawLoc?.raw) {
     const parsed = parseRawGpsPacket(rawLoc.raw)
-    if (parsed?.gps_fix && isValidCoord(parsed.latitude, parsed.longitude)) {
-      lat = parsed.latitude
-      lon = parsed.longitude
-      hasGpsFix = parsed.gps_fix
-      speed = parsed.speed_kmh
-      timeStr = rawLoc.received_at ?? rawLoc.gps_time ?? null
-      gpsSource = 'latest.location.raw'
+    const fix = parsed && normalizeVerifiedGpsFix({
+      ...rawLoc,
+      ...parsed,
+      gps_status: parsed.gps_fix ? 'A' : 'V',
+    })
+    if (fix) {
+      lat = fix.latitude
+      lon = fix.longitude
+      hasGpsFix = true
+      speed = parsed?.speed_kmh ?? null
+      timeStr = fix.recordedAt
+      gpsSource = fix.source
     }
   }
 
@@ -248,7 +239,7 @@ export function extractLatestGps(
       timeStr = loc.received_at ?? loc.device_timestamp ?? loc.gps_time ?? null
       speed = loc.speed_kmh ?? loc.speed ?? speed
       heading = loc.heading ?? loc.bearing ?? loc.course ?? null
-      gpsSource = 'latest.location'
+      gpsSource = String(loc.gps_source ?? loc.source ?? loc.location_source ?? loc.provider)
     }
   }
 
@@ -263,7 +254,7 @@ export function extractLatestGps(
       hasGpsFix = loc.gps_fix !== false
       timeStr = loc.received_at ?? loc.gps_time ?? null
       speed = loc.speed_kmh ?? speed
-      gpsSource = 'latest.location_on_demand'
+      gpsSource = String(loc.gps_source ?? loc.source ?? loc.location_source ?? loc.provider)
     }
   }
 
@@ -272,12 +263,12 @@ export function extractLatestGps(
     const loc = data.last_location
     const cLat = loc.lat ?? loc.latitude
     const cLon = loc.lon ?? loc.lng ?? loc.longitude
-    if (isValidFix(loc) && loc.location_source === 'gps' && isValidCoord(cLat, cLon)) {
+    if (isValidFix(loc) && isValidCoord(cLat, cLon)) {
       lat = Number(cLat)
       lon = Number(cLon)
       hasGpsFix = true
       timeStr = loc.received_at ?? loc.device_timestamp ?? null
-      gpsSource = 'last_location'
+      gpsSource = String(loc.gps_source ?? loc.source ?? loc.location_source ?? loc.provider)
     }
   }
 
@@ -293,7 +284,7 @@ export function extractLatestGps(
       timeStr = rootFixValid
         ? data.gps_update_time ?? data.gps_recorded_at ?? data.gps_time ?? data.device_timestamp ?? null
         : data.gps_update_time ?? data.gps_recorded_at ?? data.gps_time ?? null
-      gpsSource = 'device_document'
+      gpsSource = String(data.gps_source ?? data.source ?? data.location_source ?? data.provider)
     }
   }
 
@@ -301,46 +292,21 @@ export function extractLatestGps(
     ? data.last_fix as Record<string, unknown>
     : null
   if (lastFix) {
-    const source = String(
-      lastFix.source ?? lastFix.location_source ?? lastFix.provider ?? ''
-    ).trim().toLowerCase()
-    const status = String(
-      lastFix.gps_status ?? lastFix.status ?? lastFix.validity ?? ''
-    ).trim().toUpperCase()
-    const sourceIsGps = /(?:^|[^a-z])(gps|gnss|satellite)(?:$|[^a-z])/.test(source)
-    const statusIsValid = !status || ['A', 'ACTIVE', 'VALID', 'GPS LOCKED', 'GPS VALID'].includes(status)
-    const fixFlagsValid = [lastFix.gps_fix, lastFix.gps_valid, lastFix.valid].every((flag) =>
-      flag !== false &&
-      flag !== 0 &&
-      String(flag).trim().toLowerCase() !== 'false' &&
-      String(flag).trim() !== '0' &&
-      String(flag).trim().toUpperCase() !== 'V'
-    )
-    const fixLat = lastFix.lat ?? lastFix.latitude
-    const fixLon = lastFix.lon ?? lastFix.lng ?? lastFix.longitude
-    const fixTimeValue = lastFix.at ?? lastFix.recorded_at ?? lastFix.timestamp
-    const fixTime = parseTimestamp(fixTimeValue)
+    const fix = normalizeVerifiedGpsFix(lastFix)
     const currentTime = parseTimestamp(timeStr)
     if (
-      sourceIsGps &&
-      statusIsValid &&
-      fixFlagsValid &&
-      isValidCoord(fixLat, fixLon) &&
-      fixTime !== null &&
-      fixTime <= Date.now() + 60_000 &&
-      (lat == null || currentTime === null || fixTime > currentTime)
+      fix &&
+      (lat == null || currentTime === null || fix.timestamp > currentTime)
     ) {
-      lat = Number(fixLat)
-      lon = Number(fixLon)
+      lat = fix.latitude
+      lon = fix.longitude
       hasGpsFix = true
-      timeStr = typeof fixTimeValue === 'string'
-        ? fixTimeValue
-        : new Date(fixTime).toISOString()
+      timeStr = fix.recordedAt
       const lastFixSpeed = lastFix.speed_kmh ?? lastFix.speed
       const lastFixHeading = lastFix.heading ?? lastFix.bearing ?? lastFix.course
       if (lastFixSpeed != null && Number.isFinite(Number(lastFixSpeed))) speed = Number(lastFixSpeed)
       if (lastFixHeading != null && Number.isFinite(Number(lastFixHeading))) heading = Number(lastFixHeading)
-      gpsSource = 'firestore_last_fix'
+      gpsSource = fix.source
     }
   }
 

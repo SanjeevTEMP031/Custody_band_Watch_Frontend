@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Box, Typography } from '@mui/material'
 import { importLibrary, setOptions } from '@googlemaps/js-api-loader'
 import type { Device, GpsLocation } from '../../services/api'
-import { isValidGpsCoord } from '../../lib/firebase'
+import { isFreshGpsTimestamp, normalizeVerifiedGpsFix } from '../../services/gpsNormalization'
 import {
   useSelectedGpsRoute,
   type SelectedGpsRouteSegment,
@@ -15,6 +15,7 @@ const mapsKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY?.trim()
 if (mapsKey) setOptions({ key: mapsKey, v: 'weekly' })
 
 type MovementPoint = { lat: number; lng: number }
+type VerifiedMovementPoint = MovementPoint & { recordedAt: string; source: string }
 type MovementSegment = MovementPoint[]
 
 export default function MonitoringMap({ devices, selectedId, showNames, aggregate, provider, mapStyle }: { devices: Device[]; selectedId: number | string | null; showNames: boolean; aggregate: boolean; provider: string; mapStyle: OpenStreetMapStyle }) {
@@ -27,7 +28,7 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
   const [error, setError] = useState('')
   const [mapVersion, setMapVersion] = useState(0)
   const [movementTrail, setMovementTrail] = useState<{ deviceKey: string | null; segments: MovementSegment[] }>({ deviceKey: null, segments: [] })
-  const [selectedGpsPosition, setSelectedGpsPosition] = useState<{ deviceKey: string | null; position: MovementPoint | null }>({ deviceKey: null, position: null })
+  const [selectedGpsPosition, setSelectedGpsPosition] = useState<{ deviceKey: string | null; position: VerifiedMovementPoint | null }>({ deviceKey: null, position: null })
   const [gpsRouteStatus, setGpsRouteStatus] = useState<SelectedGpsRouteStatus>('loading')
   const selectedKey = selectedId == null ? null : String(selectedId)
   const selectedDevice = devices.find(device =>
@@ -37,21 +38,19 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
     ? String(selectedDevice.device_id || selectedDevice.imei || selectedDevice.serial_number || selectedDevice.id)
     : null
   const firestoreLatest = useMemo<GpsLocation | null>(() => {
-    if (
-      selectedDevice?.gps_fix_source !== 'firestore_last_fix' ||
-      selectedDevice.has_gps_fix !== true ||
-      selectedDevice.last_latitude == null ||
-      selectedDevice.last_longitude == null ||
-      !selectedDevice.gps_update_time
-    ) return null
+    if (!selectedDevice) return null
+    const fix = normalizeVerifiedGpsFix(selectedDevice)
+    if (!fix) return null
     return {
       device_id: trackingDeviceId ?? undefined,
-      latitude: selectedDevice.last_latitude,
-      longitude: selectedDevice.last_longitude,
-      recorded_at: selectedDevice.gps_update_time,
+      latitude: fix.latitude,
+      longitude: fix.longitude,
+      recorded_at: fix.recordedAt,
       gps_fix: true,
-      gps_status: 'GPS Locked',
-      status: 'GPS Locked',
+      gps_valid: true,
+      gps_source: fix.source,
+      gps_status: fix.status,
+      status: fix.status,
     }
   }, [selectedDevice, trackingDeviceId])
   const movementSegments = useMemo(
@@ -60,10 +59,17 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
   )
   const handleFreshGpsPoint = useCallback((point: GpsLocation) => {
     if (selectedKey == null) return
-    const latitude = Number(point.latitude)
-    const longitude = Number(point.longitude)
-    if (!isValidGpsCoord(latitude, longitude)) return
-    setSelectedGpsPosition({ deviceKey: selectedKey, position: { lat: latitude, lng: longitude } })
+    const fix = normalizeVerifiedGpsFix(point)
+    if (!fix || !isFreshGpsTimestamp(fix.timestamp)) return
+    setSelectedGpsPosition({
+      deviceKey: selectedKey,
+      position: {
+        lat: fix.latitude,
+        lng: fix.longitude,
+        recordedAt: fix.recordedAt,
+        source: fix.source,
+      },
+    })
   }, [selectedKey])
   const handleRouteChange = useCallback((segments: SelectedGpsRouteSegment[]) => {
     setMovementTrail({
@@ -86,9 +92,20 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
       ? selectedGpsPosition.position
       : null
     if (!position || (String(device.id) !== selectedKey && String(device.device_id) !== selectedKey)) return device
-    return { ...device, last_latitude: position.lat, last_longitude: position.lng }
+    return {
+      ...device,
+      last_latitude: position.lat,
+      last_longitude: position.lng,
+      gps_update_time: position.recordedAt,
+      gps_fix_source: position.source,
+      has_gps_fix: true,
+      gps_fix: true,
+    }
   }), [devices, selectedGpsPosition, selectedKey])
-  const located = displayDevices.filter(d => d.last_latitude != null && d.last_longitude != null && Number.isFinite(d.last_latitude) && Number.isFinite(d.last_longitude))
+  const located = useMemo(() => displayDevices.filter(device => {
+    const fix = normalizeVerifiedGpsFix(device)
+    return Boolean(fix && isFreshGpsTimestamp(fix.timestamp))
+  }), [displayDevices])
   const focus = located.find(d => String(d.id) === selectedKey || String(d.device_id) === selectedKey) ?? located[0]
   const hasCoords = focus?.last_latitude != null && focus?.last_longitude != null
   const lat = hasCoords ? focus.last_latitude! : 20.5937
@@ -157,7 +174,7 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
     googleMarkers.current = []
     const bounds = new google.maps.LatLngBounds()
 
-    displayDevices.forEach(device => {
+    located.forEach(device => {
       if (device.last_latitude == null || device.last_longitude == null || !Number.isFinite(device.last_latitude) || !Number.isFinite(device.last_longitude)) return
       const position = { lat: device.last_latitude, lng: device.last_longitude }
       bounds.extend(position)
@@ -173,7 +190,7 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
     if (aggregate && googleMarkers.current.length > 1) map.fitBounds(bounds, 40)
     else if (movementSegments.some(segment => segment.length > 1)) map.fitBounds(bounds, 40)
     else if (hasCoords) map.panTo({ lat, lng })
-  }, [mapVersion, displayDevices, showNames, aggregate, movementSegments, hasCoords, lat, lng])
+  }, [mapVersion, located, showNames, aggregate, movementSegments, hasCoords, lat, lng])
   if (provider === 'google') {
     if (!mapsKey) {
       if (!hasCoords) {
@@ -193,9 +210,19 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
         <Alert severity="info" sx={{ position: 'absolute', left: 12, bottom: 12, maxWidth: 430, boxShadow: 2 }}>
           Google Maps is shown in embedded mode. Add <code>VITE_GOOGLE_MAPS_API_KEY</code> to <code>trackin360-admin/.env</code> to enable device markers and aggregate view.
         </Alert>
+        {selectedKey && (gpsRouteStatus === 'unavailable' ||
+          gpsRouteStatus === 'history-sync' ||
+          gpsRouteStatus === 'unavailable-history-sync') && (
+          <Alert severity="warning" sx={{ position: 'absolute', left: 12, bottom: 90, maxWidth: 430 }}>
+            {(gpsRouteStatus === 'history-sync' || gpsRouteStatus === 'unavailable-history-sync') &&
+              'A valid latest GPS fix is missing from backend history and is not added to the recorded trail. '}
+            {(gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'unavailable-history-sync') &&
+              'No fresh verified GPS fix is available.'}
+          </Alert>
+        )}
       </Box>
     }
-    return <Box sx={{ height: '100%', position: 'relative' }}><Box ref={container} sx={{ height: '100%' }} />{error && <Typography role="alert" sx={{ position: 'absolute', top: 10, left: 10, bgcolor: 'white', p: 1 }}>{error}</Typography>}{selectedKey && (gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'history-mismatch') && <Alert severity="info" sx={{ position: 'absolute', left: 12, bottom: 12, maxWidth: 430 }}>{gpsRouteStatus === 'history-mismatch' ? 'A newer source-verified Firestore GPS fix is missing from backend history; it is not added to the recorded trail.' : 'No fresh valid GPS fix received. Only recorded GPS points are shown; no movement is simulated.'}</Alert>}</Box>
+    return <Box sx={{ height: '100%', position: 'relative' }}><Box ref={container} sx={{ height: '100%' }} />{error && <Typography role="alert" sx={{ position: 'absolute', top: 10, left: 10, bgcolor: 'white', p: 1 }}>{error}</Typography>}{selectedKey && (gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'history-sync' || gpsRouteStatus === 'unavailable-history-sync') && <Alert severity="warning" sx={{ position: 'absolute', left: 12, bottom: 12, maxWidth: 430 }}>{(gpsRouteStatus === 'history-sync' || gpsRouteStatus === 'unavailable-history-sync') && 'A valid latest GPS fix is missing from backend history and is not added to the recorded trail. '}{(gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'unavailable-history-sync') && 'No fresh verified GPS fix is available. Only verified recorded GPS points are shown.'}</Alert>}</Box>
   }
   return <OpenStreetMapView devices={displayDevices} selectedId={selectedId} showNames={showNames} aggregate={aggregate} mapStyle={mapStyle} movementSegments={movementSegments} gpsRouteStatus={selectedKey ? gpsRouteStatus : null} />
 }

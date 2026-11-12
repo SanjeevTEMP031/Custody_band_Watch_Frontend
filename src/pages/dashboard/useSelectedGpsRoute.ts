@@ -1,12 +1,17 @@
 import { useEffect, useRef } from 'react'
 import L from 'leaflet'
 import { getGpsHistory, getLatestGpsLocation, type GpsLocation } from '../../services/api'
+import {
+  isFreshGpsTimestamp,
+  normalizeVerifiedGpsFix,
+} from '../../services/gpsNormalization'
 
 interface RoutePoint {
   latitude: number
   longitude: number
   timestamp: number
   accuracy: number | null
+  source: string
   key: string
 }
 
@@ -18,10 +23,13 @@ interface RouteState {
   dots: L.CircleMarker[]
   dotKeys: Set<string>
   latest: RoutePoint | null
+  currentFix: RoutePoint | null
+  latestApiFix: RoutePoint | null
   lastMovementPoint: RoutePoint | null
   historyLatestTimestamp: number | null
   historyLoaded: boolean
   firestoreHistoryMismatch: boolean
+  latestHistoryMismatch: boolean
 }
 
 export const SELECTED_GPS_POLL_INTERVAL_MS = 3_000
@@ -33,7 +41,12 @@ export const GPS_TRAIL_CONFIG = {
   minMovementMeters: 5,
 } as const
 
-export type SelectedGpsRouteStatus = 'loading' | 'available' | 'unavailable' | 'history-mismatch'
+export type SelectedGpsRouteStatus =
+  | 'loading'
+  | 'available'
+  | 'unavailable'
+  | 'history-sync'
+  | 'unavailable-history-sync'
 export type SelectedGpsRouteSegment = Array<{
   latitude: number
   longitude: number
@@ -42,97 +55,17 @@ export type SelectedGpsRouteSegment = Array<{
 
 const MAX_FIX_GAP_MS = 5 * 60_000
 const MAX_PLAUSIBLE_SPEED_KMH = 180
-const GPS_FRESHNESS_MS = 5 * 60_000
-
-function timestampMs(value: unknown): number | null {
-  if (value == null || value === '') return null
-  if (typeof value === 'object') {
-    const timestamp = value as { seconds?: unknown; toDate?: () => Date }
-    if (typeof timestamp.toDate === 'function') {
-      const time = timestamp.toDate().getTime()
-      return Number.isFinite(time) ? time : null
-    }
-    if (typeof timestamp.seconds === 'number') return timestamp.seconds * 1000
-  }
-  const numeric = Number(value)
-  if (Number.isFinite(numeric) && numeric > 0) {
-    return numeric < 1_000_000_000_000 ? numeric * 1000 : numeric
-  }
-  const text = String(value).trim()
-  const withTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text) ? text : `${text}Z`
-  const parsed = Date.parse(withTimezone)
-  return Number.isFinite(parsed) ? parsed : null
-}
-
+const HISTORY_REFRESH_INTERVAL_MS = 30_000
 function parsePoint(value: unknown): RoutePoint | null {
-  if (typeof value !== 'object' || value === null) return null
-  const record = value as Record<string, unknown>
-  const rawData =
-    typeof record.raw === 'object' && record.raw !== null
-      ? record.raw as Record<string, unknown>
-      : null
-  const status = String(
-    record.gps_status ??
-      record.status ??
-      record.validity ??
-      rawData?.gps_status ??
-      rawData?.status ??
-      rawData?.validity ??
-      ''
-  ).trim().toUpperCase()
-  const isValidFixFlag = (flag: unknown) =>
-    flag !== false &&
-    flag !== 0 &&
-    String(flag).trim().toLowerCase() !== 'false' &&
-    String(flag).trim() !== '0' &&
-    String(flag).trim().toUpperCase() !== 'V'
-  if (
-    status === 'V' ||
-    ![record.gps_fix, record.gps_valid, rawData?.gps_fix, rawData?.gps_valid].every(isValidFixFlag)
-  ) return null
-
-  const rawPacket = [
-    record.raw,
-    record.raw_packet,
-    record.gps_packet,
-    rawData?.raw,
-    rawData?.raw_packet,
-    rawData?.gps_packet,
-  ].find((candidate): candidate is string => typeof candidate === 'string')
-  if (rawPacket) {
-    const rawStatus = rawPacket.replace(/^\[+|\]+$/g, '').split(',')[3]?.trim().toUpperCase()
-    if (rawStatus === 'V') return null
-  }
-
-  const rawLatitude = record.latitude ?? record.lat ?? record.last_latitude ??
-    rawData?.latitude ?? rawData?.lat ?? rawData?.last_latitude
-  const rawLongitude = record.longitude ?? record.lon ?? record.lng ?? record.last_longitude ??
-    rawData?.longitude ?? rawData?.lon ?? rawData?.lng ?? rawData?.last_longitude
-  if (
-    rawLatitude == null ||
-    rawLongitude == null ||
-    String(rawLatitude).trim() === '' ||
-    String(rawLongitude).trim() === ''
-  ) return null
-  const latitude = Number(rawLatitude)
-  const longitude = Number(rawLongitude)
-  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null
-  if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null
-  if (latitude === 0 && longitude === 0) return null
-  const timestamp = timestampMs(
-    record.recorded_at ?? record.received_at ?? record.device_timestamp ?? record.timestamp ?? record.gps_time ??
-      rawData?.recorded_at ?? rawData?.received_at ?? rawData?.device_timestamp ?? rawData?.timestamp ?? rawData?.gps_time
-  )
-  if (timestamp === null || timestamp > Date.now() + 60_000) return null
-
-  const accuracyValue = Number(record.accuracy_m ?? record.accuracy)
-  const accuracy = Number.isFinite(accuracyValue) && accuracyValue > 0 ? accuracyValue : null
+  const fix = normalizeVerifiedGpsFix(value)
+  if (!fix) return null
   return {
-    latitude,
-    longitude,
-    timestamp,
-    accuracy,
-    key: `${timestamp}|${latitude.toFixed(6)},${longitude.toFixed(6)}`,
+    latitude: fix.latitude,
+    longitude: fix.longitude,
+    timestamp: fix.timestamp,
+    accuracy: fix.accuracy,
+    source: fix.source,
+    key: fix.key,
   }
 }
 
@@ -194,6 +127,15 @@ function routeSegments(route: RouteState): SelectedGpsRouteSegment[] {
     longitude,
     timestamp,
   })))
+}
+
+function getRouteStatus(route: RouteState): SelectedGpsRouteStatus {
+  const freshHistoryFix = route.latest && isFreshGpsTimestamp(route.latest.timestamp)
+  const freshCurrentFix = route.currentFix && isFreshGpsTimestamp(route.currentFix.timestamp)
+  const hasFreshFix = Boolean(freshHistoryFix || freshCurrentFix)
+  const historySync = route.firestoreHistoryMismatch || route.latestHistoryMismatch
+  if (historySync) return hasFreshFix ? 'history-sync' : 'unavailable-history-sync'
+  return hasFreshFix ? 'available' : 'unavailable'
 }
 
 function syncLayers(map: L.Map | null, route: RouteState, visible: boolean): void {
@@ -276,13 +218,7 @@ export function useSelectedGpsRoute(
       !route.historyPointKeys.has(firestorePoint.key) &&
       (route.historyLatestTimestamp === null || firestorePoint.timestamp > route.historyLatestTimestamp)
     )
-    onStatusChangeRef.current?.(
-      route.firestoreHistoryMismatch
-        ? 'history-mismatch'
-        : route.latest && Date.now() - route.latest.timestamp <= GPS_FRESHNESS_MS
-          ? 'available'
-          : 'unavailable'
-    )
+    onStatusChangeRef.current?.(getRouteStatus(route))
   }, [firestoreLatest])
   useEffect(() => {
     visibleRef.current = visible
@@ -304,14 +240,18 @@ export function useSelectedGpsRoute(
       dots: [],
       dotKeys: new Set(),
       latest: null,
+      currentFix: null,
+      latestApiFix: null,
       lastMovementPoint: null,
       historyLatestTimestamp: null,
       historyLoaded: false,
       firestoreHistoryMismatch: false,
+      latestHistoryMismatch: false,
     }
     routeRef.current = route
     let cancelled = false
     let timer: number | undefined
+    let lastHistoryRefreshAt = 0
     const requestController = new AbortController()
     onRouteChangeRef.current?.([])
     onStatusChangeRef.current?.('loading')
@@ -321,36 +261,19 @@ export function useSelectedGpsRoute(
       try {
         const latest = await getLatestGpsLocation(deviceId, requestController.signal)
         const point = latest ? parsePoint(latest) : null
-        if (latest && point && Date.now() - point.timestamp <= GPS_FRESHNESS_MS) {
-          if (!route.firestoreHistoryMismatch) onStatusChangeRef.current?.('available')
-          if (addPoint(route, point)) {
-            syncLayers(map, route, visibleRef.current)
-            onRouteChangeRef.current?.(routeSegments(route))
-          }
-          if (
-            route.latest === point ||
-            (route.latest?.timestamp === point.timestamp &&
-              route.latest.latitude === point.latitude &&
-              route.latest.longitude === point.longitude)
-          ) onFreshPointRef.current(latest)
-        } else {
-          onStatusChangeRef.current?.(
-            route.firestoreHistoryMismatch
-              ? 'history-mismatch'
-              : route.latest && Date.now() - route.latest.timestamp <= GPS_FRESHNESS_MS
-              ? 'available'
-              : 'unavailable'
-          )
+        route.latestApiFix = point
+        route.currentFix = point && isFreshGpsTimestamp(point.timestamp) ? point : null
+        route.latestHistoryMismatch = Boolean(point && !route.historyPointKeys.has(point.key))
+        if (latest && point && route.currentFix) {
+          onFreshPointRef.current(latest)
+        }
+        onStatusChangeRef.current?.(getRouteStatus(route))
+        if (Date.now() - lastHistoryRefreshAt >= HISTORY_REFRESH_INTERVAL_MS) {
+          await refreshHistory()
         }
       } catch (error) {
         if (!cancelled) {
-          onStatusChangeRef.current?.(
-            route.firestoreHistoryMismatch
-              ? 'history-mismatch'
-              : route.latest && Date.now() - route.latest.timestamp <= GPS_FRESHNESS_MS
-              ? 'available'
-              : 'unavailable'
-          )
+          onStatusChangeRef.current?.(getRouteStatus(route))
           console.warn(`Unable to refresh GPS route for device ${deviceId}.`, error)
         }
       } finally {
@@ -358,43 +281,55 @@ export function useSelectedGpsRoute(
       }
     }
 
+    const refreshHistory = async () => {
+      lastHistoryRefreshAt = Date.now()
+      const history = await getGpsHistory(deviceId, 500, requestController.signal)
+      if (cancelled) return
+      const points = history
+        .map(parsePoint)
+        .filter((point): point is RoutePoint => point !== null)
+      const uniquePoints = new Map(points.map((point) => [point.key, point]))
+      const sortedPoints = [...uniquePoints.values()]
+        .sort((first, second) => first.timestamp - second.timestamp)
+      route.historyPointKeys = new Set(sortedPoints.map((point) => point.key))
+      route.historyLatestTimestamp = sortedPoints.length > 0
+        ? sortedPoints[sortedPoints.length - 1].timestamp
+        : null
+      route.historyLoaded = true
+      for (const point of sortedPoints) {
+        if (addPoint(route, point)) syncLayers(map, route, visibleRef.current)
+      }
+      route.latestHistoryMismatch = Boolean(
+        route.latestApiFix && !route.historyPointKeys.has(route.latestApiFix.key)
+      )
+      const firestorePoint = firestoreLatestRef.current
+        ? parsePoint(firestoreLatestRef.current)
+        : null
+      route.firestoreHistoryMismatch = Boolean(
+        firestorePoint &&
+        !route.historyPointKeys.has(firestorePoint.key) &&
+        (route.historyLatestTimestamp === null || firestorePoint.timestamp > route.historyLatestTimestamp)
+      )
+      syncLayers(map, route, visibleRef.current)
+      onRouteChangeRef.current?.(routeSegments(route))
+      onStatusChangeRef.current?.(getRouteStatus(route))
+      if (route.latest && isFreshGpsTimestamp(route.latest.timestamp)) {
+        onFreshPointRef.current({
+          latitude: route.latest.latitude,
+          longitude: route.latest.longitude,
+          recorded_at: new Date(route.latest.timestamp).toISOString(),
+          accuracy_m: route.latest.accuracy,
+          gps_fix: true,
+          gps_valid: true,
+          gps_source: route.latest.source,
+          gps_status: 'GPS VALID',
+        })
+      }
+    }
+
     const loadHistory = async () => {
       try {
-        const history = await getGpsHistory(deviceId, 500, requestController.signal)
-        if (cancelled) return
-        const points = history
-          .map(parsePoint)
-          .filter((point): point is RoutePoint => point !== null)
-          .sort((first, second) => first.timestamp - second.timestamp)
-        route.historyPointKeys = new Set(points.map((point) => point.key))
-        route.historyLatestTimestamp = points.length > 0
-          ? points[points.length - 1].timestamp
-          : null
-        route.historyLoaded = true
-        for (const point of points) {
-          if (addPoint(route, point)) syncLayers(map, route, visibleRef.current)
-        }
-        const firestorePoint = firestoreLatestRef.current
-          ? parsePoint(firestoreLatestRef.current)
-          : null
-        route.firestoreHistoryMismatch = Boolean(
-          firestorePoint &&
-          !route.historyPointKeys.has(firestorePoint.key) &&
-          (route.historyLatestTimestamp === null || firestorePoint.timestamp > route.historyLatestTimestamp)
-        )
-        syncLayers(map, route, visibleRef.current)
-        onRouteChangeRef.current?.(routeSegments(route))
-        if (route.firestoreHistoryMismatch) onStatusChangeRef.current?.('history-mismatch')
-        if (route.latest && Date.now() - route.latest.timestamp <= GPS_FRESHNESS_MS) {
-          if (!route.firestoreHistoryMismatch) onStatusChangeRef.current?.('available')
-          onFreshPointRef.current({
-            latitude: route.latest.latitude,
-            longitude: route.latest.longitude,
-            recorded_at: new Date(route.latest.timestamp).toISOString(),
-            accuracy_m: route.latest.accuracy,
-            gps_fix: true,
-          })
-        }
+        await refreshHistory()
       } catch (error) {
         if (!cancelled) console.warn(`Unable to load GPS history for device ${deviceId}.`, error)
       }
