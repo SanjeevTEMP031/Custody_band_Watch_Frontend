@@ -30,7 +30,7 @@ import {
 } from '@mui/icons-material'
 import { useApiData } from '../../hooks/useApiData'
 import { useRealtimeDevices } from '../../hooks/useRealtimeDevices'
-import { getAccessToken, listDevices, type Device } from '../../services/api'
+import { listDevices, type Device } from '../../services/api'
 import MonitoringMap from './MonitoringMap'
 import type { OpenStreetMapStyle } from './OpenStreetMapView'
 
@@ -60,7 +60,7 @@ export default function LivePeoplePage() {
   // Real-time Firestore devices
   const { devices: realtimeDevices, loading: realtimeLoading } = useRealtimeDevices()
 
-  const load = useCallback(() => (getAccessToken() ? listDevices(0, 500) : Promise.resolve([])), [])
+  const load = useCallback(() => listDevices(0, 500), [])
   const { data: apiData, loading: apiLoading, error, reload } = useApiData(load)
 
   const data = useMemo(() => {

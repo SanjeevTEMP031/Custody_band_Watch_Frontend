@@ -4,12 +4,16 @@
 // =============================================================================
 
 import {
+  collectLastReportedGpsCandidates,
+  collectGpsLatestCandidates,
   getGpsFixRejectionReasons,
   logGpsValidationDiagnostics,
   mergeVerifiedGpsFixes,
-  normalizeVerifiedGpsFix,
+  normalizeLastReportedGpsLocation,
+  selectNewestLastReportedGpsLocation,
+  selectNewestVerifiedGpsCandidate,
   unwrapGpsHistoryResponse,
-  unwrapGpsLatestResponse,
+  type LastReportedGpsLocation,
 } from './gpsNormalization'
 import { getJsonContentTypeError } from './apiResponse'
 
@@ -128,6 +132,8 @@ export interface Device {
   gps_fix?: boolean
   gps_status?: string | null
   gps_fix_source?: string | null
+  gps_last_fix?: unknown
+  gps_last_known_location?: unknown
   heading?: number | null
 }
 
@@ -495,6 +501,9 @@ function normaliseDevice(d: any, idx: number): Device {
   }
 
   const deviceId = d.device_id ?? d.imei ?? d.serial_number ?? String(d.id ?? idx + 1)
+  const lastReportedLocation = selectNewestLastReportedGpsLocation(
+    collectLastReportedGpsCandidates(d).map(({ record }) => record)
+  )
 
   return {
     ...d,
@@ -513,6 +522,11 @@ function normaliseDevice(d: any, idx: number): Device {
     battery_pct: batteryVal,
     battery_percent: batteryVal,
     last_seen: d.last_seen ?? d.device_timestamp ?? null,
+    gps_last_fix: d.gps_last_fix ?? d.last_fix ?? null,
+    gps_last_known_location:
+      d.gps_last_known_location ??
+      d.last_known_location ??
+      lastReportedLocation,
     gps_update_time:
       d.gps_update_time ??
       d.gps_recorded_at ??
@@ -570,29 +584,36 @@ export const assignDevice = (deviceId: number | string, _custodyPersonId: number
 /** All active wearers' latest coordinates — ideal for live map dashboard */
 export const getLiveLocations = () => request<GpsLocation[]>('/gps/live')
 
-/** Latest GPS fix for a specific device */
-export const getLatestGpsLocation = async (
+export interface LatestGpsSnapshot {
+  latest: LatestGpsLocation | null
+  lastReported: LastReportedGpsLocation | null
+}
+
+/** Latest verified fix and a separate display-only historical location. */
+export const getLatestGpsSnapshot = async (
   deviceId: string | number,
   signal?: AbortSignal
-): Promise<LatestGpsLocation | null> => {
+): Promise<LatestGpsSnapshot> => {
   try {
     const response = await request<unknown>(`/gps/${deviceId}/latest`, { signal })
-    const raw = unwrapGpsLatestResponse(response)
-    if (!raw) {
-      logGpsValidationDiagnostics('GPS latest response', [{
-        name: 'response',
-        reasons: ['unrecognized-response-shape'],
-      }])
-      return null
+    const candidates = collectGpsLatestCandidates(response)
+    const selection = selectNewestVerifiedGpsCandidate(candidates)
+    const lastReportedCandidates = collectLastReportedGpsCandidates(response)
+      .map(({ record }) => normalizeLastReportedGpsLocation(record))
+      .filter((location): location is LastReportedGpsLocation => location !== null)
+      .sort((first, second) => (first.timestamp ?? 0) - (second.timestamp ?? 0))
+    const lastReported = lastReportedCandidates[lastReportedCandidates.length - 1] ?? null
+    if (!selection.selected) {
+      logGpsValidationDiagnostics(
+        'GPS latest response',
+        candidates.length > 0
+          ? selection.rejected
+          : [{ name: 'response', reasons: ['unrecognized-response-shape'] }]
+      )
+      return { latest: null, lastReported }
     }
-    const fix = normalizeVerifiedGpsFix(raw)
-    if (!fix) {
-      logGpsValidationDiagnostics('GPS latest response', [{
-        name: 'latest',
-        reasons: getGpsFixRejectionReasons(raw),
-      }])
-      return null
-    }
+    const raw = selection.selected.record as Record<string, unknown>
+    const fix = selection.selected.fix
 
     const finiteNumber = (...values: unknown[]): number | null => {
       const value = values.find((candidate) => candidate !== undefined && candidate !== null)
@@ -602,30 +623,42 @@ export const getLatestGpsLocation = async (
     }
 
     return {
-      ...raw,
-      latitude: fix.latitude,
-      longitude: fix.longitude,
-      speed_kmh: finiteNumber(raw.speed_kmh, raw.speed),
-      heading: finiteNumber(raw.heading, raw.bearing, raw.course),
-      battery_pct: finiteNumber(raw.battery_pct, raw.battery_percent, raw.battery),
-      recorded_at: fix.recordedAt,
-      gps_source: fix.source,
-      accuracy_m: fix.accuracy,
-      satellites: finiteNumber(raw.satellites, raw.sat_count),
-      gps_fix: true,
-      gps_valid: true,
-      status: fix.status,
-      gps_status: fix.status,
-      validity: fix.status,
-      raw,
+      latest: {
+        ...raw,
+        latitude: fix.latitude,
+        longitude: fix.longitude,
+        speed_kmh: finiteNumber(raw.speed_kmh, raw.speed),
+        heading: finiteNumber(raw.heading, raw.bearing, raw.course),
+        battery_pct: finiteNumber(raw.battery_pct, raw.battery_percent, raw.battery),
+        recorded_at: fix.recordedAt,
+        gps_source: fix.source,
+        accuracy_m: fix.accuracy,
+        satellites: finiteNumber(raw.satellites, raw.sat_count),
+        gps_fix: true,
+        gps_valid: true,
+        status: fix.status,
+        gps_status: fix.status,
+        validity: fix.status,
+        raw,
+      },
+      lastReported,
     }
   } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') return null
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      return { latest: null, lastReported: null }
+    }
     if (error instanceof ApiError && error.configurationError) throw error
     console.warn('Unable to load latest GPS fix.', error)
-    return null
+    return { latest: null, lastReported: null }
   }
 }
+
+/** Latest GPS fix for a specific device */
+export const getLatestGpsLocation = async (
+  deviceId: string | number,
+  signal?: AbortSignal
+): Promise<LatestGpsLocation | null> =>
+  (await getLatestGpsSnapshot(deviceId, signal)).latest
 
 /** Location history / breadcrumbs for route replay */
 export const getGpsHistory = async (

@@ -121,8 +121,10 @@ export function extractLatestBattery(data: Record<string, any>): number | null {
 }
 
 import {
+  collectLastReportedGpsCandidates,
   collectFirestoreGpsCandidates,
   logGpsValidationDiagnostics,
+  selectNewestLastReportedGpsLocation,
   selectNewestVerifiedGpsCandidate,
 } from '../services/gpsNormalization'
 
@@ -278,6 +280,9 @@ export function mapFirestoreDocToDevice(
 ): Device {
   const batteryPct = extractLatestBattery(data)
   const gps = extractLatestGps(data, prevDevice)
+  const lastReportedGps = selectNewestLastReportedGpsLocation(
+    collectLastReportedGpsCandidates(data).map(({ record }) => record)
+  )
   const online = isDeviceOnline(data)
 
   const rawLastSeen =
@@ -338,6 +343,9 @@ export function mapFirestoreDocToDevice(
       has_gps_fix: gps.hasGpsFix,
       gps_update_time: gps.gpsUpdateTime,
       gps_fix_source: gps.gpsSource,
+      gps_status: data.gps_status ?? data.validity ?? null,
+      gps_last_fix: data.gps_last_fix ?? data.last_fix ?? null,
+      gps_last_known_location: data.last_known_location ?? lastReportedGps,
       speed_kmh: gps.speed_kmh,
       heading: gps.heading,
       wearer_name: isDemo ? null : (data.wearer_name ?? data.assigned_person_name ?? null),

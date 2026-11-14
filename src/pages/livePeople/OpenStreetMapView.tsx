@@ -4,7 +4,11 @@ import { FullscreenOutlined, Navigation } from '@mui/icons-material'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import type { Device } from '../../services/api'
-import { isFreshGpsTimestamp, normalizeVerifiedGpsFix } from '../../services/gpsNormalization'
+import {
+  isFreshGpsTimestamp,
+  normalizeVerifiedGpsFix,
+  selectNewestLastReportedGpsLocation,
+} from '../../services/gpsNormalization'
 import { subscribeToDeviceTrips, type TripRecord } from '../../lib/firebase'
 import type { SelectedGpsRouteStatus } from '../dashboard/useSelectedGpsRoute'
 
@@ -36,6 +40,7 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
   const markers = useRef<L.LayerGroup | null>(null)
   const routeLayers = useRef<L.LayerGroup | null>(null)
   const tileLayer = useRef<L.TileLayer | null>(null)
+  const lastCenteredSelectionRef = useRef<string | null>(null)
   const [tripSelection, setTripSelection] = useState<{ deviceId: string; trip: TripRecord | null }>({ deviceId: '', trip: null })
   const activeTrip = selectedId != null && tripSelection.deviceId === String(selectedId)
     ? tripSelection.trip
@@ -44,10 +49,47 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
   const located = useMemo(
     () => devices.filter(device => {
       const fix = normalizeVerifiedGpsFix(device)
-      return Boolean(fix && isFreshGpsTimestamp(fix.timestamp))
+      return fix !== null
     }),
     [devices],
   )
+  const selectedLocatedDevice = located.find(device =>
+    String(device.id) === String(selectedId) || String(device.device_id) === String(selectedId),
+  )
+  const lastReported = useMemo(() => devices.flatMap(device => {
+    const location = selectNewestLastReportedGpsLocation([
+      device.gps_last_fix,
+      device.gps_last_known_location,
+    ])
+    if (!location) return []
+    const fix = normalizeVerifiedGpsFix(device)
+    if (fix && isFreshGpsTimestamp(fix.timestamp)) return []
+    if (fix && fix.latitude === location.latitude && fix.longitude === location.longitude) return []
+    return [{ device, location }]
+  }), [devices])
+  const selectedFix = selectedLocatedDevice
+    ? normalizeVerifiedGpsFix(selectedLocatedDevice)
+    : null
+  const selectedLastReported = lastReported.find(({ device }) =>
+    String(device.id) === String(selectedId) || String(device.device_id) === String(selectedId),
+  )?.location
+  const hasSelectedLastKnown = Boolean(
+    (selectedFix && !isFreshGpsTimestamp(selectedFix.timestamp)) || selectedLastReported
+  )
+  const hasSelectedVerifiedPosition = selectedId != null && selectedLocatedDevice !== undefined
+  const centerDevice = selectedLocatedDevice ??
+    lastReported.find(({ device }) => String(device.id) === String(selectedId) ||
+      String(device.device_id) === String(selectedId))?.device ??
+    located[0] ??
+    lastReported[0]?.device
+  const centerFix = centerDevice ? normalizeVerifiedGpsFix(centerDevice) : null
+  const centerLastReported = centerDevice
+    ? selectNewestLastReportedGpsLocation([
+        centerDevice.gps_last_fix,
+        centerDevice.gps_last_known_location,
+      ])
+    : null
+  const hasCoords = Boolean(centerFix || centerLastReported)
 
   // Subscribe to trips for selected device to show route polyline
   useEffect(() => {
@@ -119,40 +161,99 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
   useEffect(() => {
     if (!map.current || !markers.current) return
     markers.current.clearLayers()
-    const routePoints = movementSegments.flatMap(segment =>
-      segment.map(point => [point.lat, point.lng] as L.LatLngTuple),
-    )
     // Draw device markers
     located.forEach(device => {
       const isSelected = String(device.id) === String(selectedId) || String(device.device_id) === String(selectedId)
+      const fix = normalizeVerifiedGpsFix(device)
+      const isFresh = isFreshGpsTimestamp(fix?.timestamp ?? null)
       const marker = L.circleMarker([device.last_latitude!, device.last_longitude!], {
         radius: isSelected ? 10 : 7,
         color: '#fff',
         weight: 2,
-        fillColor: isSelected ? '#2196ff' : '#00998c',
+        fillColor: isFresh ? (isSelected ? '#2196ff' : '#00998c') : '#64748b',
         fillOpacity: 1
       })
       const name = document.createElement('span')
-      name.textContent = device.device_name ?? device.serial_number ?? ''
+      name.textContent = `${device.device_name ?? device.serial_number ?? ''} — ${
+        isFresh ? 'Live GPS Fix' : 'Last Known Location'
+      }`
       marker.bindTooltip(name, { permanent: showNames, direction: 'top' })
       marker.addTo(markers.current!)
     })
 
-    const selected = located.find(device =>
-      String(device.id) === String(selectedId) || String(device.device_id) === String(selectedId),
-    ) ?? located[0]
-    if (aggregate && located.length > 1) {
+    lastReported.forEach(({ device, location }) => {
+      const marker = L.circleMarker([location.latitude, location.longitude], {
+        radius: 9,
+        color: '#ffffff',
+        weight: 2,
+        fillColor: '#f59e0b',
+        fillOpacity: 1,
+      })
+      const popup = document.createElement('div')
+      const title = document.createElement('strong')
+      title.textContent = `Last Reported Location — Unverified${location.isStale ? ' (Stale)' : ''}`
+      title.style.color = '#92400e'
+      popup.append(title)
+      const rows: Array<[string, string]> = [
+        ['Device ID', String(device.device_id || device.imei || device.serial_number || device.id)],
+        ['Latitude', location.latitude.toFixed(6)],
+        ['Longitude', location.longitude.toFixed(6)],
+        ['Location timestamp', location.recordedAt
+          ? new Date(location.recordedAt).toLocaleString()
+          : 'Timestamp unavailable'],
+        ['GPS status', String(device.gps_status || 'No Fix')],
+        ['Location type', 'Historical / Unverified'],
+      ]
+      rows.forEach(([label, value]) => {
+        const row = document.createElement('div')
+        row.textContent = `${label}: ${value}`
+        popup.append(row)
+      })
+      marker.bindPopup(popup)
+      const name = document.createElement('span')
+      name.textContent = `${device.device_name ?? device.serial_number ?? ''} — Last Reported (Unverified)`
+      marker.bindTooltip(name, { permanent: showNames, direction: 'top' })
+      marker.addTo(markers.current!)
+    })
+  }, [devices, selectedId, showNames, located, lastReported, movementSegments])
+
+  useEffect(() => {
+    const instance = map.current
+    if (!instance || !hasCoords) return
+    const selectionKey = `${selectedId == null ? '__initial__' : String(selectedId)}:${aggregate}`
+    if (lastCenteredSelectionRef.current === selectionKey) return
+
+    if (aggregate) {
       const boundsPoints = [
         ...located.map(device => [device.last_latitude!, device.last_longitude!] as L.LatLngTuple),
-        ...routePoints,
+        ...lastReported.map(({ location }) =>
+          [location.latitude, location.longitude] as L.LatLngTuple
+        ),
+        ...movementSegments.flatMap(segment =>
+          segment.map(point => [point.lat, point.lng] as L.LatLngTuple)
+        ),
       ]
-      map.current.fitBounds(L.latLngBounds(boundsPoints), { padding: [40, 40], maxZoom: 16 })
-    } else if (routePoints.length > 1) {
-      map.current.fitBounds(L.latLngBounds(routePoints), { padding: [40, 40], maxZoom: 16 })
-    } else if (selected) {
-      map.current.setView([selected.last_latitude!, selected.last_longitude!], 15)
+      if (boundsPoints.length > 1) {
+        instance.fitBounds(L.latLngBounds(boundsPoints), { padding: [40, 40], maxZoom: 16 })
+      } else if (boundsPoints.length === 1) {
+        instance.setView(boundsPoints[0], 15)
+      } else {
+        return
+      }
+      lastCenteredSelectionRef.current = selectionKey
+      return
     }
-  }, [devices, selectedId, showNames, aggregate, located, movementSegments])
+
+    const position = centerFix
+      ? [centerFix.latitude, centerFix.longitude] as L.LatLngTuple
+      : centerLastReported
+        ? [centerLastReported.latitude, centerLastReported.longitude] as L.LatLngTuple
+        : null
+    if (!position) return
+
+    instance.setView(position, 15)
+    lastCenteredSelectionRef.current = selectionKey
+  }, [selectedId, aggregate, hasCoords, centerFix, centerLastReported, located, lastReported, movementSegments])
 
   return <Box ref={root} sx={{ position: 'relative', width: '100%', height: '100%', minHeight: 520, zIndex: 0, '&:fullscreen': { height: '100vh', width: '100vw' } }}>
     <Box ref={canvas} aria-label="Device location map" sx={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }} />
@@ -176,7 +277,13 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
           <div>A valid latest GPS fix is missing from backend history and is not added to the recorded trail.</div>
         )}
         {(gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'unavailable-history-sync') && (
-          <div>No fresh verified GPS fix is available. Any visible trail contains verified recorded history only.</div>
+          <div>{hasSelectedLastKnown
+            ? (selectedLastReported
+              ? 'GPS No Fix — Showing Last Reported Location — Unverified; this historical position may be outdated. The trail contains verified history only.'
+              : 'No live GPS fix is available. Showing the last verified location; the trail contains verified history only.')
+            : selectedId != null && !hasSelectedVerifiedPosition && !selectedLastReported
+              ? 'No GPS Location Available for this device. No usable coordinates were returned.'
+              : 'No fresh verified GPS fix is available. Any visible trail contains verified recorded history only.'}</div>
         )}
       </Box>
     )}
@@ -187,9 +294,14 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
       </Box>
     )}
 
-    {located.length === 0 && (
+    {located.length === 0 && lastReported.length === 0 && (
       <Box sx={{ position: 'absolute', top: 20, left: 20, zIndex: 1000, bgcolor: 'rgba(15, 23, 42, 0.85)', color: '#f8fafc', px: 2, py: 1, borderRadius: 1, fontSize: 13, border: '1px solid rgba(255,255,255,0.2)', boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
-        No GPS Fix Available
+        No GPS Location Available
+      </Box>
+    )}
+    {(selectedLastReported || (located.length === 0 && lastReported.length > 0)) && (
+      <Box role="status" sx={{ position: 'absolute', top: 20, left: 20, zIndex: 1000, bgcolor: 'rgba(255, 251, 235, 0.96)', color: '#92400e', px: 2, py: 1, borderRadius: 1, fontSize: 13, border: '1px solid #fcd34d', boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
+        GPS No Fix — Showing Last Reported Location — Unverified
       </Box>
     )}
     <IconButton aria-label="Expand map to full screen" onClick={() => { if (document.fullscreenElement) void document.exitFullscreen().catch(() => {}); else void root.current?.requestFullscreen().catch(() => {}) }} sx={{ position: 'absolute', right: 10, top: 85, zIndex: 1000, bgcolor: '#fff', border: '1px solid #bbb', borderRadius: .5, '&:hover': { bgcolor: '#f4f4f4' } }}><FullscreenOutlined /></IconButton>

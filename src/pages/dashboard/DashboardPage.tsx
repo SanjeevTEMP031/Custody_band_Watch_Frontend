@@ -20,7 +20,6 @@ import {
   listDevices,
   resolveAlert,
   type ApiAlert,
-  type Device
 } from '../../services/api'
 import { useApiData } from '../../hooks/useApiData'
 import { useRealtimeDevices } from '../../hooks/useRealtimeDevices'
@@ -54,8 +53,13 @@ export default function DashboardPage() {
 
   // Load alerts and fallback device data from backend API
   const loadDashboard = useCallback(async () => {
-    if (!getAccessToken()) return { devices: [] as Device[], alerts: [] as ApiAlert[] }
-    const [devices, alerts] = await Promise.all([listDevices(0, 500), listAlerts(0, 500)])
+    const alertsPromise = getAccessToken()
+      ? listAlerts(0, 500)
+      : Promise.resolve([] as ApiAlert[])
+    const [devices, alerts] = await Promise.all([
+      listDevices(0, 500),
+      alertsPromise,
+    ])
     return { devices, alerts }
   }, [])
 

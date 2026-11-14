@@ -24,13 +24,15 @@ import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { Maximize2, Minimize2, Radio, Compass, Eye, EyeOff } from 'lucide-react'
 import {
-  getLatestGpsLocation,
+  getLatestGpsSnapshot,
   type Device,
   type GpsLocation,
 } from '../../services/api'
 import {
   isFreshGpsTimestamp,
   normalizeVerifiedGpsFix,
+  selectNewestLastReportedGpsLocation,
+  type LastReportedGpsLocation,
 } from '../../services/gpsNormalization'
 import { isValidGpsCoord } from '../../lib/firebase'
 import { Link } from 'react-router-dom'
@@ -60,6 +62,12 @@ interface MarkerEntry {
   currentLat: number
   currentLng: number
   latestFixAt: number | null
+}
+
+interface LastReportedMarkerEntry {
+  device: Device
+  marker: L.CircleMarker
+  location: LastReportedGpsLocation
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -146,7 +154,7 @@ function createDeviceIcon(options: {
     : `<div style="width:8px;height:8px;border-radius:50%;background:#ffffff;box-shadow:0 0 3px rgba(0,0,0,0.4);"></div>`
 
   const staleBadge = isStale
-    ? ` <span style="color:#fbbf24;">⚠ Stale</span>`
+    ? ` <span style="color:#fbbf24;">⚠ Last Known</span>`
     : ''
 
   const namePill = deviceName
@@ -221,6 +229,7 @@ function createPopupHtml(
     null
   const fixTimestamp = timestampMillis(recordedAt)
   const isStale = isStaleGps(fixTimestamp)
+  const lastCommunicationTimestamp = timestampMillis(device.last_seen)
 
   const speed = overrides?.speed_kmh ?? d.speed_kmh ?? d.speed ?? null
   const heading = overrides?.heading ?? d.heading ?? null
@@ -230,7 +239,10 @@ function createPopupHtml(
     d.battery_percent ??
     d.battery ??
     null
-  const lastSeenStr = fixTimestamp !== null ? new Date(fixTimestamp).toLocaleString() : '—'
+  const gpsTimeStr = fixTimestamp !== null ? new Date(fixTimestamp).toLocaleString() : '—'
+  const lastCommunicationStr = lastCommunicationTimestamp !== null
+    ? new Date(lastCommunicationTimestamp).toLocaleString()
+    : '—'
 
   const rawName = device.device_name || d.wearer_name || device.serial_number || `Watch #${device.id}`
   const wearer = String(rawName).toLowerCase().includes('demo') ? `Watch #${device.id}` : rawName
@@ -250,9 +262,11 @@ function createPopupHtml(
       <div style="color:#475569;font-size:11px;margin-bottom:3px;"><strong>Battery:</strong> <span style="font-weight:600;color:${battery != null && battery <= 20 ? '#dc2626' : '#16a34a'};">${battery != null ? `${battery}%` : 'N/A'}</span></div>
       ${speed != null && speed > 0 ? `<div style="color:#475569;font-size:11px;margin-bottom:3px;"><strong>Speed:</strong> ${Number(speed).toFixed(1)} km/h</div>` : ''}
       ${heading != null && heading >= 0 ? `<div style="color:#475569;font-size:11px;margin-bottom:3px;"><strong>Heading:</strong> ${Math.round(Number(heading))}°</div>` : ''}
-      <div style="color:#475569;font-size:11px;margin-bottom:3px;"><strong>GPS Status:</strong> <span style="font-weight:600;color:${isStale ? '#d97706' : '#16a34a'};">${isStale ? '🟡 Stale' : fixTimestamp !== null ? '🟢 Recent Fix' : '⚪ Time Unknown'}</span></div>
+      <div style="color:#475569;font-size:11px;margin-bottom:3px;"><strong>GPS Status:</strong> <span style="font-weight:600;color:${isStale ? '#d97706' : '#16a34a'};">${isStale ? '🟡 Last Known Location' : fixTimestamp !== null ? '🟢 Live GPS Fix' : '⚪ No Verified GPS Location'}</span></div>
+      <div style="color:#475569;font-size:11px;margin-bottom:3px;"><strong>Location:</strong> ${isStale ? 'Last Known Location' : 'Live GPS Fix'}</div>
       <div style="color:#64748b;font-size:10px;margin-bottom:3px;"><strong>Coordinates:</strong> ${lat.toFixed(5)}, ${lng.toFixed(5)}</div>
-      <div style="color:#64748b;font-size:10px;margin-bottom:8px;"><strong>GPS Time:</strong> ${lastSeenStr}</div>
+      <div style="color:#64748b;font-size:10px;margin-bottom:3px;"><strong>GPS fix time:</strong> ${gpsTimeStr}</div>
+      <div style="color:#64748b;font-size:10px;margin-bottom:8px;"><strong>Last communication:</strong> ${lastCommunicationStr}</div>
       <a href="/admin/journeys?device=${device.id}" style="display:block;text-align:center;background:#2563eb;color:#ffffff;text-decoration:none;padding:6px 12px;border-radius:6px;font-size:11px;font-weight:700;margin-bottom:4px;">
         View Live Route &amp; Journey →
       </a>
@@ -261,6 +275,38 @@ function createPopupHtml(
       </a>
     </div>
   `
+}
+
+function createLastReportedPopup(device: Device, location: LastReportedGpsLocation): HTMLElement {
+  const popup = document.createElement('div')
+  popup.style.cssText = 'font-family:Arial,sans-serif;font-size:12px;line-height:1.5;min-width:210px;'
+  const title = document.createElement('strong')
+  title.textContent = `Last Reported Location — Unverified${location.isStale ? ' (Stale)' : ''}`
+  title.style.color = '#92400e'
+  popup.append(title)
+
+  const rows: Array<[string, string]> = [
+    ['Device ID', String(device.device_id || device.imei || device.serial_number || device.id)],
+    ['Latitude', location.latitude.toFixed(6)],
+    ['Longitude', location.longitude.toFixed(6)],
+    ['Location timestamp', location.recordedAt
+      ? new Date(location.recordedAt).toLocaleString()
+      : 'Timestamp unavailable'],
+    ['GPS status', String(device.gps_status || 'No Fix')],
+    ['Location type', 'Historical / Unverified'],
+  ]
+  if (location.source) rows.push(['Reported source', location.source])
+
+  rows.forEach(([label, value]) => {
+    const row = document.createElement('div')
+    const name = document.createElement('strong')
+    name.textContent = `${label}: `
+    const text = document.createElement('span')
+    text.textContent = value
+    row.append(name, text)
+    popup.append(row)
+  })
+  return popup
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
@@ -275,14 +321,29 @@ export default function DashboardLiveMap({
   const markerGroupRef = useRef<L.LayerGroup | null>(null)
   const tileLayerRef = useRef<L.TileLayer | null>(null)
   const markersMapRef = useRef<Map<string, MarkerEntry>>(new Map())
+  const lastReportedMarkersRef = useRef<Map<string, LastReportedMarkerEntry>>(new Map())
+  const lastCenteredSelectionRef = useRef<string | null>(null)
   const hasInitialFittedRef = useRef<boolean>(false)
   const wrapperRef = useRef<HTMLDivElement>(null)
+  const devicesRef = useRef(devices)
+  const onSelectDeviceRef = useRef(onSelectDevice)
 
   const [mapStyle, setMapStyle] = useState<'standard' | 'humanitarian' | 'voyager'>('standard')
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [isTrailVisible, setIsTrailVisible] = useState(true)
   const [mapForTracking, setMapForTracking] = useState<L.Map | null>(null)
   const [gpsRouteStatus, setGpsRouteStatus] = useState<SelectedGpsRouteStatus>('loading')
+  const [apiVerifiedMarkerIds, setApiVerifiedMarkerIds] = useState<Set<string>>(() => new Set())
+  const [apiLastReportedLocations, setApiLastReportedLocations] = useState<
+    Map<string, LastReportedGpsLocation>
+  >(() => new Map())
+  const [apiCurrentGpsDeviceIds, setApiCurrentGpsDeviceIds] = useState<Set<string>>(
+    () => new Set()
+  )
+  const [selectedGpsTimestamp, setSelectedGpsTimestamp] = useState<{
+    deviceKey: string
+    timestamp: number
+  } | null>(null)
 
   // Map tile providers
   const mapTileProviders = {
@@ -300,11 +361,35 @@ export default function DashboardLiveMap({
     },
   }
 
-  // Only show a current marker when the fix is verified and fresh.
+  // Show verified last-known fixes too; stale markers are styled separately.
   const locatedDevices = devices.filter((device) => {
-    const fix = normalizeVerifiedGpsFix(device)
-    return Boolean(fix && isFreshGpsTimestamp(fix.timestamp))
+    return normalizeVerifiedGpsFix(device) !== null
   })
+  const deviceIdsKey = devices.map((device) => device.id).join(',')
+  const apiOnlyVerifiedMarkerCount = [...apiVerifiedMarkerIds].filter((id) =>
+    !locatedDevices.some((device) => String(device.id) === id)
+  ).length
+  const verifiedMarkerCount = locatedDevices.length + apiOnlyVerifiedMarkerCount
+  const lastReportedLocations = useMemo(() => devices.flatMap((device) => {
+    const key = String(device.id)
+    if (apiCurrentGpsDeviceIds.has(key)) return []
+    const verifiedFix = normalizeVerifiedGpsFix(device)
+    if (verifiedFix && isFreshGpsTimestamp(verifiedFix.timestamp)) return []
+
+    const location = selectNewestLastReportedGpsLocation([
+      device.gps_last_fix,
+      device.gps_last_known_location,
+      apiLastReportedLocations.get(key) ?? null,
+    ])
+    if (!location) return []
+    if (
+      verifiedFix &&
+      verifiedFix.latitude === location.latitude &&
+      verifiedFix.longitude === location.longitude
+    ) return []
+    return [{ device, location }]
+  }), [devices, apiCurrentGpsDeviceIds, apiLastReportedLocations])
+  const lastReportedMarkerCount = lastReportedLocations.length
 
   const selectedDevice = devices.find(
     (device) =>
@@ -330,13 +415,46 @@ export default function DashboardLiveMap({
       status: fix.status,
     }
   }, [selectedDevice, trackingDeviceId])
+  const selectedMarkerKey = String(selectedDevice?.id ?? selectedDeviceId ?? '')
+  const previousSelectedMarkerKeyRef = useRef<string | null>(null)
+  const selectedLastReported = lastReportedLocations.find(({ device }) =>
+    String(device.id) === selectedMarkerKey || String(device.device_id) === selectedMarkerKey
+  )?.location ?? null
+  const selectedFixTimestamp = selectedGpsTimestamp?.deviceKey === selectedMarkerKey
+    ? selectedGpsTimestamp.timestamp
+    : normalizeVerifiedGpsFix(selectedDevice)?.timestamp ?? null
+  const selectedHasVerifiedPosition = Boolean(selectedDevice && selectedFixTimestamp !== null)
+  const selectedMarkerIsLastKnown = Boolean(
+    (selectedFixTimestamp !== null && isStaleGps(selectedFixTimestamp)) ||
+    selectedLastReported
+  )
 
-  const handleFreshGpsPoint = useCallback((point: GpsLocation) => {
+  useEffect(() => {
+    const previousKey = previousSelectedMarkerKeyRef.current
+    if (previousKey && previousKey !== selectedMarkerKey) {
+      setApiCurrentGpsDeviceIds((current) => {
+        const next = new Set(current)
+        next.delete(previousKey)
+        return next
+      })
+    }
+    previousSelectedMarkerKeyRef.current = selectedDeviceId == null ? null : selectedMarkerKey
+  }, [selectedDeviceId, selectedMarkerKey])
+
+  useEffect(() => {
+    devicesRef.current = devices
+  }, [devices])
+  useEffect(() => {
+    onSelectDeviceRef.current = onSelectDevice
+  }, [onSelectDevice])
+
+  const handleVerifiedGpsPoint = useCallback((point: GpsLocation) => {
     if (selectedDeviceId == null) return
     const markerKey = String(selectedDevice?.id ?? selectedDeviceId)
     const fix = normalizeVerifiedGpsFix(point)
-    if (!fix || !isFreshGpsTimestamp(fix.timestamp)) return
+    if (!fix) return
     const { latitude, longitude, timestamp } = fix
+    const isStale = isStaleGps(timestamp)
     let entry = markersMapRef.current.get(markerKey)
     if (!entry) {
       const map = mapInstanceRef.current
@@ -355,7 +473,7 @@ export default function DashboardLiveMap({
         icon: createDeviceIcon({
           isOnline: device.online === true || device.is_online === true,
           isSelected: true,
-          isStale: false,
+          isStale,
           heading: point.heading ?? device.heading,
           deviceName: device.device_name || `Watch #${device.id}`,
         }),
@@ -372,8 +490,12 @@ export default function DashboardLiveMap({
         latestFixAt: null,
       }
       markersMapRef.current.set(markerKey, entry)
+      setApiVerifiedMarkerIds((current) => new Set(current).add(markerKey))
     }
-    if (entry.latestFixAt !== null && timestamp <= entry.latestFixAt) return
+    if (entry.latestFixAt !== null && timestamp <= entry.latestFixAt) {
+      setSelectedGpsTimestamp({ deviceKey: markerKey, timestamp: entry.latestFixAt })
+      return
+    }
 
     entry.currentLat = latitude
     entry.currentLng = longitude
@@ -399,38 +521,69 @@ export default function DashboardLiveMap({
     entry.marker.setIcon(createDeviceIcon({
       isOnline: entry.device.online === true || entry.device.is_online === true,
       isSelected: true,
-      isStale: false,
+      isStale,
       heading: point.heading ?? entry.device.heading,
       deviceName: entry.device.device_name || `Watch #${entry.device.id}`,
     }))
     entry.marker.setPopupContent(
       createPopupHtml(entry.device, latitude, longitude, point)
     )
+    setSelectedGpsTimestamp({ deviceKey: markerKey, timestamp })
+    setApiVerifiedMarkerIds((current) => new Set(current).add(markerKey))
   }, [onSelectDevice, selectedDevice, selectedDeviceId])
+
+  const handleLastReportedLocation = useCallback((
+    location: LastReportedGpsLocation | null,
+    currentGpsAvailable: boolean
+  ) => {
+    const markerKey = String(selectedDevice?.id ?? selectedDeviceId ?? '')
+    if (!markerKey) return
+    setApiCurrentGpsDeviceIds((current) => {
+      const next = new Set(current)
+      if (currentGpsAvailable) next.add(markerKey)
+      else next.delete(markerKey)
+      return next
+    })
+    setApiLastReportedLocations((current) => {
+      if (!location && !currentGpsAvailable) return current
+      const next = new Map(current)
+      if (location) next.set(markerKey, location)
+      else next.delete(markerKey)
+      return next
+    })
+  }, [selectedDevice, selectedDeviceId])
 
   useSelectedGpsRoute(
     mapForTracking,
     trackingDeviceId,
     isTrailVisible,
-    handleFreshGpsPoint,
+    handleVerifiedGpsPoint,
     undefined,
     setGpsRouteStatus,
     mapForTracking !== null,
-    firestoreLatest
+    firestoreLatest,
+    selectedDevice?.gps_last_fix,
+    handleVerifiedGpsPoint,
+    handleLastReportedLocation
   )
 
   // ── Effect 1: Initialise Leaflet map (runs ONCE) ──────────────────────────
   useEffect(() => {
     if (!mapContainerRef.current) return
 
+    const markersMap = markersMapRef.current
+    const lastReportedMarkers = lastReportedMarkersRef.current
     const firstLocated = locatedDevices[0]
+    const firstLastReported = lastReportedLocations[0]?.location
     const initialCenter: [number, number] = firstLocated
       ? [
           Number(firstLocated.last_latitude ?? (firstLocated as any).latitude),
           Number(firstLocated.last_longitude ?? (firstLocated as any).longitude),
         ]
-      : [20.5937, 78.9629] // India centre as fallback
-    const initialZoom = firstLocated ? 15 : 4
+      : firstLastReported
+        ? [firstLastReported.latitude, firstLastReported.longitude]
+        : [20.5937, 78.9629] // India centre as fallback
+    const initialZoom = firstLocated || firstLastReported ? 15 : 4
 
     const map = L.map(mapContainerRef.current, {
       center: initialCenter,
@@ -465,7 +618,8 @@ export default function DashboardLiveMap({
     return () => {
       clearTimeout(sizeTimer)
       resizeObserver.disconnect()
-      markersMapRef.current.clear()
+      markersMap.clear()
+      lastReportedMarkers.clear()
       map.remove()
       mapInstanceRef.current = null
       markerGroupRef.current = null
@@ -493,15 +647,18 @@ export default function DashboardLiveMap({
     const markersGroup = markerGroupRef.current
     if (!map || !markersGroup) return
 
-    const currentDeviceKeys = new Set<string>()
+    const currentDeviceKeys = new Set(devices.map((device) => String(device.id)))
+    const locatedDeviceKeys = new Set<string>()
     const bounds: [number, number][] = []
 
     locatedDevices.forEach((device) => {
       const key = String(device.id)
-      currentDeviceKeys.add(key)
+      locatedDeviceKeys.add(key)
 
-      const lat = Number(device.last_latitude ?? (device as any).latitude)
-      const lng = Number(device.last_longitude ?? (device as any).longitude)
+      const verifiedFix = normalizeVerifiedGpsFix(device)
+      if (!verifiedFix) return
+      const lat = verifiedFix.latitude
+      const lng = verifiedFix.longitude
       bounds.push([lat, lng])
 
       const isSelected =
@@ -516,9 +673,8 @@ export default function DashboardLiveMap({
       const deviceName = String(rawName).toLowerCase().includes('demo') ? `Watch #${device.id}` : rawName
       const heading = (device as any).heading ?? null
       let entry = markersMapRef.current.get(key)
-      const gpsTimestamp = timestampMillis(device.gps_update_time)
+      const gpsTimestamp = verifiedFix.timestamp
       const preserveTrackedFix =
-        isSelected &&
         entry?.latestFixAt !== null &&
         entry?.latestFixAt !== undefined &&
         (gpsTimestamp === null || gpsTimestamp < entry.latestFixAt)
@@ -549,7 +705,7 @@ export default function DashboardLiveMap({
           zIndexOffset: isSelected ? 1200 : 1000,
         })
         marker.bindPopup(popupHtml, { maxWidth: 280 })
-        marker.on('click', () => onSelectDevice?.(device))
+        marker.on('click', () => onSelectDeviceRef.current?.(device))
         marker.addTo(markersGroup)
 
         entry = {
@@ -563,24 +719,64 @@ export default function DashboardLiveMap({
       } else {
         // ── B. Device already on map — Firestore pushed updated last_lat/last_lng ──
         entry.device = markerDevice
-        if (!preserveTrackedFix && gpsTimestamp !== null) {
+        const hasNewerFix = gpsTimestamp !== null &&
+          (entry.latestFixAt === null || gpsTimestamp > entry.latestFixAt)
+        if (!preserveTrackedFix && hasNewerFix) {
           entry.latestFixAt = gpsTimestamp
+          entry.currentLat = lat
+          entry.currentLng = lng
+          entry.marker.setLatLng([lat, lng])
         }
         entry.marker.setIcon(icon)
         entry.marker.setZIndexOffset(isSelected ? 1200 : 1000)
-        entry.marker.setPopupContent(popupHtml)
+        entry.marker.setPopupContent(
+          createPopupHtml(entry.device, entry.currentLat, entry.currentLng)
+        )
 
           // ── Extend the purple trail with the new Firestore-confirmed position
           // Trail path: [previous last_lat, last_lng] → [new last_lat, last_lng]
       }
     })
+    lastReportedLocations.forEach(({ location }) => {
+      bounds.push([location.latitude, location.longitude])
+    })
 
-    // Remove markers/trails for devices no longer in the list
+    // Keep an existing verified marker when its document temporarily has no fix.
     for (const [key, entry] of markersMapRef.current.entries()) {
       if (!currentDeviceKeys.has(key)) {
-        if (key === String(selectedDevice?.id) && entry.latestFixAt !== null) continue
         entry.marker.remove()
         markersMapRef.current.delete(key)
+        setApiVerifiedMarkerIds((current) => {
+          const next = new Set(current)
+          next.delete(key)
+          return next
+        })
+        continue
+      }
+      if (!locatedDeviceKeys.has(key)) {
+        const device = devices.find((candidate) => String(candidate.id) === key)
+        if (device) {
+          entry.device = {
+            ...entry.device,
+            last_seen: device.last_seen,
+            online: device.online,
+            is_online: device.is_online,
+            status: device.status,
+          }
+          const isSelected =
+            String(selectedDeviceId) === key ||
+            String(selectedDeviceId) === String(device.device_id)
+          entry.marker.setIcon(createDeviceIcon({
+            isOnline: device.online === true || device.is_online === true,
+            isSelected,
+            isStale: isStaleGps(entry.latestFixAt),
+            heading: entry.device.heading,
+            deviceName: entry.device.device_name || `Watch #${entry.device.id}`,
+          }))
+          entry.marker.setPopupContent(
+            createPopupHtml(entry.device, entry.currentLat, entry.currentLng)
+          )
+        }
       }
     }
 
@@ -593,22 +789,129 @@ export default function DashboardLiveMap({
         map.fitBounds(bounds, { padding: [40, 40], maxZoom: 15 })
       }
     }
-  }, [devices, selectedDeviceId]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [devices, selectedDeviceId, lastReportedLocations]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const markersGroup = markerGroupRef.current
+    if (!markersGroup) return
+
+    const currentKeys = new Set<string>()
+    lastReportedLocations.forEach(({ device, location }) => {
+      const key = String(device.id)
+      currentKeys.add(key)
+      let entry = lastReportedMarkersRef.current.get(key)
+      if (!entry) {
+        const marker = L.circleMarker([location.latitude, location.longitude], {
+          radius: 9,
+          color: '#ffffff',
+          weight: 2,
+          fillColor: '#f59e0b',
+          fillOpacity: 1,
+          className: 'last-reported-gps-marker',
+        })
+        marker.bindPopup(createLastReportedPopup(device, location), { maxWidth: 280 })
+        marker.addTo(markersGroup)
+        entry = { device, marker, location }
+        lastReportedMarkersRef.current.set(key, entry)
+      } else {
+        entry.device = device
+        entry.location = location
+        entry.marker.setLatLng([location.latitude, location.longitude])
+        entry.marker.setPopupContent(createLastReportedPopup(device, location))
+      }
+    })
+
+    for (const [key, entry] of lastReportedMarkersRef.current) {
+      if (currentKeys.has(key)) continue
+      entry.marker.remove()
+      lastReportedMarkersRef.current.delete(key)
+    }
+
+    if (!hasInitialFittedRef.current && currentKeys.size > 0) {
+      hasInitialFittedRef.current = true
+      const positions = lastReportedLocations.map(({ location }) =>
+        [location.latitude, location.longitude] as [number, number]
+      )
+      if (positions.length === 1) mapInstanceRef.current?.setView(positions[0], 15)
+      else mapInstanceRef.current?.fitBounds(positions, { padding: [40, 40], maxZoom: 15 })
+    }
+  }, [lastReportedLocations, mapForTracking])
+
+  useEffect(() => {
+    if (!mapInstanceRef.current || selectedDeviceId == null) return
+    const selectionKey = String(selectedDeviceId)
+    if (lastCenteredSelectionRef.current === selectionKey) return
+
+    const verifiedFix = normalizeVerifiedGpsFix(selectedDevice)
+    const lastReported = lastReportedLocations.find(({ device }) =>
+      String(device.id) === selectionKey || String(device.device_id) === selectionKey
+    )?.location
+    const position: [number, number] | null = verifiedFix
+      ? [verifiedFix.latitude, verifiedFix.longitude]
+      : lastReported
+        ? [lastReported.latitude, lastReported.longitude]
+        : null
+    if (!position) return
+
+    mapInstanceRef.current.setView(position, 15)
+    lastCenteredSelectionRef.current = selectionKey
+  }, [selectedDeviceId, selectedDevice, mapForTracking, lastReportedLocations])
 
   // ── Effect 4: Live GPS polling every 10 s ────────────────────────────────
   // Keep non-selected markers current; the selected device is polled by the route hook.
   useEffect(() => {
-    if (locatedDevices.length === 0) return
+    if (deviceIdsKey.length === 0) return
 
     let isCancelled = false
-    const applyGpsFix = (entry: MarkerEntry, fix: GpsLocation) => {
+    let isPolling = false
+    const requestController = new AbortController()
+    const applyGpsFix = (device: Device, fix: GpsLocation) => {
       const verifiedFix = normalizeVerifiedGpsFix(fix)
-      if (!verifiedFix || !isFreshGpsTimestamp(verifiedFix.timestamp)) return
+      if (!verifiedFix) return
       const { latitude, longitude, timestamp } = verifiedFix
-      if (
-        !isAcceptableFix(latitude, longitude) ||
-        (entry.latestFixAt !== null && timestamp <= entry.latestFixAt)
-      ) return
+      if (!isAcceptableFix(latitude, longitude)) return
+
+      const markerKey = String(device.id)
+      let entry = markersMapRef.current.get(markerKey)
+      if (!entry) {
+        const markerGroup = markerGroupRef.current
+        if (!markerGroup) return
+        const markerDevice: Device = {
+          ...device,
+          last_latitude: latitude,
+          last_longitude: longitude,
+          gps_update_time: verifiedFix.recordedAt,
+          gps_fix_source: verifiedFix.source,
+          has_gps_fix: true,
+          gps_fix: true,
+        }
+        const rawName = markerDevice.device_name || markerDevice.wearer_name || `Watch #${markerDevice.id}`
+        const deviceName = String(rawName).toLowerCase().includes('demo')
+          ? `Watch #${markerDevice.id}`
+          : rawName
+        const marker = L.marker([latitude, longitude], {
+          icon: createDeviceIcon({
+            isOnline: markerDevice.online === true || markerDevice.is_online === true,
+            isSelected: false,
+            isStale: isStaleGps(timestamp),
+            heading: fix.heading ?? markerDevice.heading,
+            deviceName,
+          }),
+          zIndexOffset: 1000,
+        })
+        marker.bindPopup(createPopupHtml(markerDevice, latitude, longitude, fix), { maxWidth: 280 })
+        marker.on('click', () => onSelectDeviceRef.current?.(device))
+        marker.addTo(markerGroup)
+        entry = {
+          device: markerDevice,
+          marker,
+          currentLat: latitude,
+          currentLng: longitude,
+          latestFixAt: null,
+        }
+        markersMapRef.current.set(markerKey, entry)
+      }
+      if (entry.latestFixAt !== null && timestamp <= entry.latestFixAt) return
 
       const speed = fix.speed_kmh == null ? null : Number(fix.speed_kmh)
 
@@ -636,43 +939,92 @@ export default function DashboardLiveMap({
       entry.marker.setIcon(
         createDeviceIcon({
           isOnline: entry.device.online === true || entry.device.is_online === true,
-          isSelected: String(selectedDeviceId) === String(entry.device.id),
+          isSelected: String(selectedDeviceId) === String(entry.device.id) ||
+            String(selectedDeviceId) === String(entry.device.device_id),
           isStale: isStaleGps(entry.latestFixAt),
           heading: fix.heading ?? entry.device.heading,
           deviceName,
         })
       )
       entry.marker.setPopupContent(createPopupHtml(entry.device, latitude, longitude, fix))
+      if (
+        String(selectedDeviceId) === String(device.id) ||
+        String(selectedDeviceId) === String(device.device_id)
+      ) {
+        setSelectedGpsTimestamp({ deviceKey: markerKey, timestamp })
+      }
+      setApiVerifiedMarkerIds((current) => new Set(current).add(markerKey))
     }
 
     const pollActiveWatches = async () => {
+      if (isPolling || isCancelled) return
+      isPolling = true
+      const currentDevices = devicesRef.current
       // Poll selected device first; otherwise poll up to 5 devices
       const targets = selectedDeviceId
-        ? locatedDevices.filter(
+        ? currentDevices.filter(
             (device) =>
               String(device.id) !== String(selectedDeviceId) &&
               String(device.device_id) !== String(selectedDeviceId)
           ).slice(0, 5)
-        : locatedDevices.slice(0, 5)
+        : currentDevices.slice(0, 5)
 
-      for (const dev of targets) {
-        if (isCancelled) break
-        try {
-          const latestGps = await getLatestGpsLocation(dev.id)
-          if (isCancelled || !latestGps) continue
+      try {
+        for (const dev of targets) {
+          if (isCancelled) break
+          try {
+            const snapshot = await getLatestGpsSnapshot(
+              dev.device_id || dev.id,
+              requestController.signal
+            )
+            if (isCancelled) continue
 
-          // ── C05 GPS fix validation ──────────────────────────────────────
-          // Reject: V-status (gps_fix = false) or zero/null coordinates
-          if (!latestGps.gps_fix) continue
-          if (!isAcceptableFix(latestGps.latitude, latestGps.longitude)) continue
+            const markerKey = String(dev.id)
+            const latestFix = snapshot.latest
+              ? normalizeVerifiedGpsFix(snapshot.latest)
+              : null
+            const hasCurrentFix = Boolean(
+              latestFix && isFreshGpsTimestamp(latestFix.timestamp)
+            )
+            setApiCurrentGpsDeviceIds((current) => {
+              const next = new Set(current)
+              if (hasCurrentFix) next.add(markerKey)
+              else next.delete(markerKey)
+              return next
+            })
+            if (hasCurrentFix) {
+              setApiLastReportedLocations((current) => {
+                const next = new Map(current)
+                next.delete(markerKey)
+                return next
+              })
+            } else if (snapshot.lastReported) {
+              const lastReported = snapshot.lastReported
+              setApiLastReportedLocations((current) => {
+                const next = new Map(current)
+                const previous = next.get(markerKey)
+                if (
+                  !previous ||
+                  (lastReported.timestamp ?? 0) >= (previous.timestamp ?? 0)
+                ) next.set(markerKey, lastReported)
+                return next
+              })
+            }
 
-          const entry = markersMapRef.current.get(String(dev.id))
-          if (!entry) continue
+            const latestGps = snapshot.latest
+            if (!latestGps) continue
 
-          applyGpsFix(entry, latestGps)
-        } catch (error) {
-          console.warn(`Unable to refresh GPS for device ${dev.id}; keeping the current route.`, error)
+            // Only verified API GPS data can create or move a live marker.
+            if (!latestGps.gps_fix) continue
+            if (!isAcceptableFix(latestGps.latitude, latestGps.longitude)) continue
+
+            applyGpsFix(dev, latestGps)
+          } catch (error) {
+            console.warn(`Unable to refresh GPS for device ${dev.id}; keeping the current route.`, error)
+          }
         }
+      } finally {
+        isPolling = false
       }
     }
 
@@ -682,9 +1034,10 @@ export default function DashboardLiveMap({
 
     return () => {
       isCancelled = true
+      requestController.abort()
       window.clearInterval(intervalId)
     }
-  }, [locatedDevices.map((d) => d.id).join(','), selectedDeviceId])
+  }, [deviceIdsKey, selectedDeviceId])
 
   useEffect(() => {
     const refreshGpsStatus = () => {
@@ -720,17 +1073,20 @@ export default function DashboardLiveMap({
   // ── Recenter / fit bounds handler ─────────────────────────────────────────
   const handleRecenter = useCallback(() => {
     if (!mapInstanceRef.current) return
-    if (locatedDevices.length === 0) return
     const bounds: [number, number][] = locatedDevices.map((d) => [
       Number(d.last_latitude ?? (d as any).latitude),
       Number(d.last_longitude ?? (d as any).longitude),
     ])
+    bounds.push(...lastReportedLocations.map(({ location }) =>
+      [location.latitude, location.longitude] as [number, number]
+    ))
+    if (bounds.length === 0) return
     if (bounds.length === 1) {
       mapInstanceRef.current.setView(bounds[0], 16)
     } else {
       mapInstanceRef.current.fitBounds(bounds, { padding: [40, 40] })
     }
-  }, [locatedDevices])
+  }, [locatedDevices, lastReportedLocations])
 
   // ── Fullscreen toggle ─────────────────────────────────────────────────────
   const toggleFullscreen = useCallback(() => {
@@ -758,7 +1114,13 @@ export default function DashboardLiveMap({
             <p className="map-subheading">
               OpenStreetMap real-time GPS positioning
               {' • '}
-              {locatedDevices.length} active marker{locatedDevices.length !== 1 ? 's' : ''}
+              {verifiedMarkerCount} verified marker{verifiedMarkerCount !== 1 ? 's' : ''}
+              {lastReportedMarkerCount > 0 && (
+                <>
+                  {' • '}
+                  {lastReportedMarkerCount} last-reported marker{lastReportedMarkerCount !== 1 ? 's' : ''}
+                </>
+              )}
               {' • '}
               Selected route refreshes every {SELECTED_GPS_POLL_INTERVAL_MS / 1000}s
             </p>
@@ -829,20 +1191,32 @@ export default function DashboardLiveMap({
               <p>A valid latest GPS fix is missing from backend history and is not added to the recorded trail.</p>
             )}
             {(gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'unavailable-history-sync') && (
-              <p>No fresh verified GPS fix is available. Any visible trail contains verified recorded history only.</p>
+              <p>{selectedMarkerIsLastKnown
+                ? (selectedLastReported
+                  ? 'GPS No Fix — Showing Last Reported Location — Unverified; the trail contains verified history only.'
+                  : 'No live GPS fix is available. Showing the last verified location; the trail contains verified history only.')
+                : !selectedHasVerifiedPosition
+                  ? 'No GPS Location Available for this device. No usable coordinates were returned.'
+                  : 'No fresh verified GPS fix is available. Any visible trail contains verified recorded history only.'}</p>
             )}
           </div>
         )}
-        {locatedDevices.length === 0 && (
+        {verifiedMarkerCount === 0 && lastReportedMarkerCount === 0 && (
           <div className="map-empty-overlay">
             <div className="map-empty-badge">
               <Compass size={24} className="text-cyan-600 mb-2" />
-              <h4>Awaiting GPS Coordinates</h4>
-              <p>Registered bands will appear live on this OpenStreetMap grid as soon as telemetry packets are received from the C05 GPS watch.</p>
+              <h4>No GPS Location Available</h4>
+              <p>No verified fix or usable historical coordinates are available for this device.</p>
               <Link to="/admin/device-management" className="map-empty-link">
                 Manage Devices &rarr;
               </Link>
             </div>
+          </div>
+        )}
+        {lastReportedMarkerCount > 0 &&
+          (verifiedMarkerCount === 0 || selectedLastReported !== null) && (
+          <div className="last-reported-status" role="status">
+            GPS No Fix — Showing Last Reported Location — Unverified. This historical location may be outdated.
           </div>
         )}
       </div>
@@ -887,13 +1261,36 @@ export default function DashboardLiveMap({
           position: absolute;
           z-index: 500;
           left: 12px;
-          bottom: 12px;
+          bottom: 58px;
           max-width: 420px;
           padding: 8px 12px;
           border: 1px solid #bfdbfe;
           border-radius: 6px;
           background: rgba(239, 246, 255, 0.96);
           color: #1e3a8a;
+          font-size: 12px;
+          line-height: 1.4;
+          box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12);
+        }
+
+        .last-reported-gps-marker {
+          fill: #f59e0b !important;
+          fill-opacity: 1 !important;
+          stroke: #ffffff !important;
+          stroke-width: 2px !important;
+        }
+
+        .last-reported-status {
+          position: absolute;
+          z-index: 500;
+          left: 12px;
+          bottom: 12px;
+          max-width: 460px;
+          padding: 8px 12px;
+          border: 1px solid #fcd34d;
+          border-radius: 6px;
+          background: rgba(255, 251, 235, 0.96);
+          color: #92400e;
           font-size: 12px;
           line-height: 1.4;
           box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12);

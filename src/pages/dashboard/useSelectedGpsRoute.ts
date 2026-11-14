@@ -3,12 +3,14 @@ import L from 'leaflet'
 import {
   ApiError,
   getGpsHistory,
-  getLatestGpsLocation,
+  getLatestGpsSnapshot,
   type GpsLocation,
 } from '../../services/api'
 import {
   isFreshGpsTimestamp,
+  matchLegacyGpsFixToVerifiedHistory,
   normalizeVerifiedGpsFix,
+  type LastReportedGpsLocation,
 } from '../../services/gpsNormalization'
 import {
   appendGpsTrailPoint,
@@ -154,17 +156,35 @@ export function useSelectedGpsRoute(
   onRouteChange?: (segments: SelectedGpsRouteSegment[]) => void,
   onStatusChange?: (status: SelectedGpsRouteStatus) => void,
   enabled = true,
-  firestoreLatest?: GpsLocation | null
+  firestoreLatest?: GpsLocation | null,
+  firestoreLastFix?: unknown,
+  onLastKnownPoint?: (point: GpsLocation) => void,
+  onLastReportedLocation?: (
+    location: LastReportedGpsLocation | null,
+    currentGpsAvailable: boolean
+  ) => void
 ): void {
   const onFreshPointRef = useRef(onFreshPoint)
+  const onLastKnownPointRef = useRef(onLastKnownPoint)
+  const onLastReportedLocationRef = useRef(onLastReportedLocation)
   const onRouteChangeRef = useRef(onRouteChange)
   const onStatusChangeRef = useRef(onStatusChange)
   const firestoreLatestRef = useRef(firestoreLatest)
+  const firestoreLastFixRef = useRef(firestoreLastFix)
   const routeRef = useRef<RouteState | null>(null)
   const visibleRef = useRef(visible)
   useEffect(() => {
     onFreshPointRef.current = onFreshPoint
   }, [onFreshPoint])
+  useEffect(() => {
+    onLastKnownPointRef.current = onLastKnownPoint
+  }, [onLastKnownPoint])
+  useEffect(() => {
+    onLastReportedLocationRef.current = onLastReportedLocation
+  }, [onLastReportedLocation])
+  useEffect(() => {
+    firestoreLastFixRef.current = firestoreLastFix
+  }, [firestoreLastFix])
   useEffect(() => {
     onRouteChangeRef.current = onRouteChange
   }, [onRouteChange])
@@ -193,6 +213,7 @@ export function useSelectedGpsRoute(
     if (!deviceId) {
       onRouteChangeRef.current?.([])
       onStatusChangeRef.current?.('unavailable')
+      onLastReportedLocationRef.current?.(null, false)
       return
     }
     const route: RouteState = {
@@ -222,13 +243,19 @@ export function useSelectedGpsRoute(
     const pollLatest = async () => {
       if (cancelled) return
       try {
-        const latest = await getLatestGpsLocation(deviceId, requestController.signal)
+        const snapshot = await getLatestGpsSnapshot(deviceId, requestController.signal)
+        const latest = snapshot.latest
         const point = latest ? parsePoint(latest) : null
         route.latestApiFix = point
         route.currentFix = point && isFreshGpsTimestamp(point.timestamp) ? point : null
         route.latestHistoryMismatch = Boolean(point && !route.historyPointKeys.has(point.key))
-        if (latest && point && route.currentFix) {
-          onFreshPointRef.current(latest)
+        onLastReportedLocationRef.current?.(
+          route.currentFix ? null : snapshot.lastReported,
+          Boolean(route.currentFix)
+        )
+        if (latest && point) {
+          if (route.currentFix) onFreshPointRef.current(latest)
+          else onLastKnownPointRef.current?.(latest)
         }
         onStatusChangeRef.current?.(getRouteStatus(route))
         if (Date.now() - lastHistoryRefreshAt >= HISTORY_REFRESH_INTERVAL_MS) {
@@ -257,6 +284,22 @@ export function useSelectedGpsRoute(
       const uniquePoints = new Map(points.map((point) => [point.key, point]))
       const sortedPoints = [...uniquePoints.values()]
         .sort((first, second) => first.timestamp - second.timestamp)
+      const corroboratedLastFix = matchLegacyGpsFixToVerifiedHistory(
+        firestoreLastFixRef.current,
+        history
+      )
+      const newestHistoryPoint = sortedPoints[sortedPoints.length - 1]
+      const lastKnownPoint = corroboratedLastFix &&
+        (!newestHistoryPoint || corroboratedLastFix.timestamp > newestHistoryPoint.timestamp)
+        ? {
+            latitude: corroboratedLastFix.latitude,
+            longitude: corroboratedLastFix.longitude,
+            timestamp: corroboratedLastFix.timestamp,
+            accuracy: corroboratedLastFix.accuracy,
+            source: corroboratedLastFix.source,
+            key: corroboratedLastFix.key,
+          }
+        : newestHistoryPoint
       route.historyPointKeys = new Set(sortedPoints.map((point) => point.key))
       route.historyLatestTimestamp = sortedPoints.length > 0
         ? sortedPoints[sortedPoints.length - 1].timestamp
@@ -279,6 +322,18 @@ export function useSelectedGpsRoute(
       syncLayers(map, route, visibleRef.current)
       onRouteChangeRef.current?.(routeSegments(route))
       onStatusChangeRef.current?.(getRouteStatus(route))
+      if (lastKnownPoint) {
+        onLastKnownPointRef.current?.({
+          latitude: lastKnownPoint.latitude,
+          longitude: lastKnownPoint.longitude,
+          recorded_at: new Date(lastKnownPoint.timestamp).toISOString(),
+          accuracy_m: lastKnownPoint.accuracy,
+          gps_fix: true,
+          gps_valid: true,
+          gps_source: lastKnownPoint.source,
+          gps_status: 'GPS VALID',
+        })
+      }
       if (route.latest && isFreshGpsTimestamp(route.latest.timestamp)) {
         onFreshPointRef.current({
           latitude: route.latest.latitude,
