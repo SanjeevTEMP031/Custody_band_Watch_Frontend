@@ -1,4 +1,4 @@
-# Trackin360 Admin
+# TrackGuard 360 Admin
 
 React, TypeScript, and Vite frontend for the Custody Band API.
 

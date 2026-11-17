@@ -4,6 +4,8 @@ import { Alert, Box, Button, Card, CardContent, Dialog, DialogActions, DialogCon
 import DeviceTable from './DeviceTable'
 import ApiFeedback from '../../components/common/ApiFeedback'
 import { useApiData } from '../../hooks/useApiData'
+import { useRealtimeDevices } from '../../hooks/useRealtimeDevices'
+import { mergeDevicesWithFirestore } from '../../lib/firebase'
 import { assignDevice, getAccessToken, listDevices, listPeople, unassignDevice } from '../../services/api'
 
 function DeviceManagementPage() {
@@ -27,7 +29,9 @@ function DeviceManagementPage() {
     return { devices, people }
   }, [])
   const { data, loading, error, reload } = useApiData(loadData)
-  const filteredDevices = (data?.devices ?? []).filter(device =>
+  const { devices: firestoreDevices, loading: firestoreLoading } = useRealtimeDevices()
+  const devices = mergeDevicesWithFirestore(data?.devices ?? [], firestoreDevices)
+  const filteredDevices = devices.filter(device =>
     (status === 'All' || device.status === status) &&
     (!lookup || `${device.imei ?? ''} ${device.serial_number}`.toLowerCase().includes(lookup.toLowerCase())),
   )
@@ -78,7 +82,7 @@ function DeviceManagementPage() {
         <TextField size="small" label="IMEI / Device Name" value={search} onChange={event => setSearch(event.target.value)} />
         <TextField select size="small" label="Status" value={status} onChange={event => { setStatus(event.target.value); setPage(0) }} sx={{ minWidth: 180 }}>
           <MenuItem value="All">All</MenuItem>
-          {[...new Set(data?.devices.map(device => device.status).filter((value): value is string => Boolean(value)))].map(value => <MenuItem key={value} value={value}>{value}</MenuItem>)}
+          {[...new Set(devices.map(device => device.status).filter((value): value is string => Boolean(value)))].map(value => <MenuItem key={value} value={value}>{value}</MenuItem>)}
         </TextField>
         <Button type="submit" variant="contained" sx={{ bgcolor: '#00998c', borderRadius: 0.5 }}>Lookup</Button>
                 <Button
@@ -103,7 +107,7 @@ function DeviceManagementPage() {
             onSelectionChange={setSelectedIds}
             onDeleteSingle={dev => setSingleDeleteDevice(dev)}
           />
-          {(loading || error) && <Box sx={{ p: 1 }}><ApiFeedback loading={loading} error={error} empty={false} emptyMessage="" /></Box>}
+          {(loading && firestoreLoading || error) && <Box sx={{ p: 1 }}><ApiFeedback loading={loading && firestoreLoading} error={error} empty={false} emptyMessage="" /></Box>}
         </CardContent>
       </Card>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap' }}>

@@ -6,16 +6,22 @@ import {
   collectGpsLatestCandidates,
   getGpsFixRejectionReasons,
   isFreshGpsTimestamp,
+  isNewerGpsTimestamp,
   matchLegacyGpsFixToVerifiedHistory,
   mergeVerifiedGpsFixes,
+  normalizeFirestoreGpsLog,
+  normalizeLatestGpsReportMetadata,
   normalizeLastReportedGpsLocation,
+  normalizeVerifiedHistoryGpsLocation,
   normalizeVerifiedGpsFix,
   parseGpsTimestamp,
+  selectPreferredLastReportedGpsLocation,
   selectNewestVerifiedGpsCandidate,
   unwrapGpsLatestResponse,
 } from '../src/services/gpsNormalization.ts'
 import {
   appendGpsTrailPoint,
+  buildGpsTrailSegments,
   DEFAULT_GPS_TRAIL_FILTERS,
 } from '../src/services/gpsTrail.ts'
 
@@ -48,6 +54,18 @@ test('accepts watch_frame as a trusted source for a strictly verified fix', () =
   assert.equal(fix?.source, 'watch_frame')
 })
 
+test('accepts watch_udp as a trusted source used by the backend', () => {
+  const fix = normalizeVerifiedGpsFix({
+    latitude: 17.446317,
+    longitude: 78.368395,
+    gps_fix: true,
+    gps_valid: true,
+    gps_source: 'watch_udp',
+    timestamp: '2026-11-12T07:09:00Z',
+  }, now)
+  assert.equal(fix?.source, 'watch_udp')
+})
+
 test('rejects a fix with missing source metadata', () => {
   assert.equal(normalizeVerifiedGpsFix({
     latitude: 17.446317,
@@ -56,6 +74,184 @@ test('rejects a fix with missing source metadata', () => {
     gps_valid: true,
     timestamp: '2026-11-12T07:09:00Z',
   }, now), null)
+})
+
+test('accepts verified TCP latest and history points without gps_source', () => {
+  const record = {
+    gps_fix: true,
+    lat: 17.446317,
+    lon: 78.368395,
+    gps_time: '2026-11-12T07:09:00Z',
+  }
+  const latest = selectNewestVerifiedGpsCandidate(
+    collectGpsLatestCandidates({ latest: record }),
+    now
+  )
+  const history = mergeVerifiedGpsFixes([record], null, now).history
+
+  assert.equal(latest.selected?.fix.source, 'watch_tcp')
+  assert.equal(history.length, 1)
+  assert.equal(history[0].source, 'watch_tcp')
+  assert.equal(selectNewestVerifiedGpsCandidate(
+    collectGpsLatestCandidates({ latest: { ...record, gps_fix: false } }),
+    now
+  ).selected, null)
+})
+
+test('accepts TCP-ingest device locations without gps_source using gps_time', () => {
+  const document = {
+    last_seen: '2026-11-12T07:09:30Z',
+    battery_percent: 87,
+    steps: 1234,
+    latitude: 17.446316,
+    longitude: 78.368394,
+    lat: 17.446316,
+    lon: 78.368394,
+    gps_fix: true,
+    speed_kmh: 4.1,
+    location_time: '2026-11-12T07:08:59Z',
+    last_fix: {
+      lat: 17.446316,
+      lon: 78.368394,
+      at: '2026-11-12T07:08:59Z',
+    },
+    latest: {
+      location: {
+        gps_fix: true,
+        lat: 17.446317,
+        lon: 78.368395,
+        gps_time: '2026-11-12T07:09:00Z',
+        received_at: '2026-11-12T07:09:01Z',
+        speed_kmh: 4.2,
+      },
+      status: { battery_percent: 87, steps: 1234 },
+      heart_rate: { heart_rate_bpm: 72 },
+      temperature: { temperature_c: 36.7 },
+      blood_pressure: { systolic: 120, diastolic: 80 },
+      blood_oxygen: { spo2_percent: 98 },
+      sleep: { awake_min: 10, light_min: 200, deep_min: 90, date: '2026-11-11' },
+    },
+  }
+  const selection = selectNewestVerifiedGpsCandidate(
+    collectFirestoreGpsCandidates(document),
+    now
+  )
+
+  assert.equal(selection.selected?.name, 'latest.location')
+  assert.equal(selection.selected?.fix.source, 'watch_tcp')
+  assert.equal(selection.selected?.fix.timestamp, Date.parse('2026-11-12T07:09:00Z'))
+
+  const rootFix = selectNewestVerifiedGpsCandidate(collectFirestoreGpsCandidates({
+    latitude: 17.446318,
+    longitude: 78.368396,
+    lat: 17.446318,
+    lon: 78.368396,
+    gps_fix: true,
+    location_time: '2026-11-12T07:08:00Z',
+  }), now)
+  assert.equal(rootFix.selected?.fix.timestamp, Date.parse('2026-11-12T07:08:00Z'))
+
+  const missingFlag = selectNewestVerifiedGpsCandidate(collectFirestoreGpsCandidates({
+    latitude: 17.446318,
+    longitude: 78.368396,
+    gps_status: 'A',
+    location_time: '2026-11-12T07:08:00Z',
+  }), now)
+  assert.equal(missingFlag.selected, null)
+})
+
+test('accepts TCP-ingest log history without gps_source and rejects invalid logs', () => {
+  const valid = normalizeFirestoreGpsLog({
+    device_id: '863758061830955',
+    type: 'location_on_demand',
+    gps_fix: true,
+    lat: 17.446317,
+    lon: 78.368395,
+    gps_time: '2026-11-12T07:09:00Z',
+    received_at: '2026-11-12T07:09:01Z',
+    raw: 'MNYD packet',
+  }, now)
+  assert.equal(valid?.source, 'watch_tcp')
+  assert.equal(valid?.timestamp, Date.parse('2026-11-12T07:09:00Z'))
+
+  const receivedAtFallback = normalizeFirestoreGpsLog({
+    type: 'location',
+    gps_fix: true,
+    lat: 17.446317,
+    lon: 78.368395,
+    received_at: '2026-11-12T07:09:00Z',
+  }, now)
+  assert.equal(receivedAtFallback?.timestamp, Date.parse('2026-11-12T07:09:00Z'))
+
+  assert.equal(normalizeFirestoreGpsLog({
+    type: 'location',
+    gps_status: 'A',
+    lat: 17.446317,
+    lon: 78.368395,
+    gps_time: '2026-11-12T07:09:00Z',
+  }, now), null)
+  assert.equal(normalizeFirestoreGpsLog({
+    type: 'location',
+    gps_fix: false,
+    lat: 17.446317,
+    lon: 78.368395,
+    gps_time: '2026-11-12T07:09:00Z',
+  }, now), null)
+  assert.equal(normalizeFirestoreGpsLog({
+    type: 'sos_alarm',
+    gps_fix: true,
+    gps_status: 'V',
+    lat: 17.446317,
+    lon: 78.368395,
+    received_at: '2026-11-12T07:09:00Z',
+  }, now), null)
+})
+
+test('reads wrapped device and recent_positions API responses without promoting no-fix data', () => {
+  const response = {
+    device: {
+      device_id: '863758061830955',
+      latitude: 17.446317,
+      longitude: 78.368395,
+      gps_fix: false,
+      gps_valid: false,
+      last_fix: {
+        lat: 17.441927,
+        lon: 78.384297,
+        at: '2026-11-16T04:25:50Z',
+      },
+      latest: {
+        location_on_demand: {
+          lat: null,
+          lon: null,
+          gps_fix: false,
+          gps_time: '2026-11-16T04:43:23Z',
+        },
+      },
+    },
+    recent_positions: [{
+      timestamp: '2026-11-06T08:49:17.664141Z',
+      gps_valid: 1,
+      latitude: 17.444978,
+      longitude: 78.365,
+      gps_source: 'watch_tcp',
+    }],
+  }
+  const latest = selectNewestVerifiedGpsCandidate(
+    collectGpsLatestCandidates(response),
+    Date.parse('2026-11-16T04:59:00Z')
+  )
+  const lastFixCandidate = collectLastReportedGpsCandidates(response)
+    .find(({ name }) => name.endsWith('.last_fix'))
+  const history = mergeVerifiedGpsFixes(response, null, Date.parse('2026-11-16T04:59:00Z'))
+
+  assert.equal(latest.selected, null)
+  assert.equal(
+    normalizeLastReportedGpsLocation(lastFixCandidate?.record)?.latitude,
+    17.441927
+  )
+  assert.equal(history.history.length, 1)
+  assert.equal(history.history[0].source, 'watch_tcp')
 })
 
   test('does not treat online heartbeats or last-seen times as GPS fixes', () => {
@@ -100,10 +296,24 @@ test('rejects invalid coordinates and unverified status', () => {
     gps_valid: false,
   }, now), null)
   assert.equal(normalizeVerifiedGpsFix({
+    ...valid,
+    latitude: 17,
+    longitude: 78,
+    gps_fix: false,
+    gps_valid: true,
+  }, now), null)
+  assert.equal(normalizeVerifiedGpsFix({
     latitude: 17,
     longitude: 78,
     gps_valid: true,
     gps_source: 'watch_tcp',
+  }, now), null)
+  assert.equal(normalizeVerifiedGpsFix({
+    latitude: 17,
+    longitude: 78,
+    gps_status: 'A',
+    gps_source: 'watch_tcp',
+    timestamp: '2026-11-12T07:09:00Z',
   }, now), null)
 })
 
@@ -119,6 +329,51 @@ test('marks old timestamps stale without removing them from verified history', (
   }], null, now)
   assert.equal(merged.history.length, 1)
   assert.equal(merged.current, null)
+})
+
+test('marks the newest verified history location as stale fallback and rejects no-fix data', () => {
+  const fallback = normalizeVerifiedHistoryGpsLocation({
+    latitude: 17.444978,
+    longitude: 78.365,
+    timestamp: '2026-11-12T06:00:00Z',
+    gps_valid: true,
+    gps_fix: true,
+    gps_source: 'watch_tcp',
+  }, now)
+
+  assert.equal(fallback?.verified, true)
+  assert.equal(fallback?.locationType, 'last_verified_history')
+  assert.equal(fallback?.isStale, true)
+  assert.equal(fallback?.latitude, 17.444978)
+  assert.equal(normalizeVerifiedHistoryGpsLocation({
+    latitude: 17.444978,
+    longitude: 78.365,
+    timestamp: '2026-11-12T07:09:00Z',
+    gps_valid: false,
+    gps_source: 'watch_tcp',
+  }, now), null)
+})
+
+test('accepts backend stale-labeled verified history without treating it as current', () => {
+  const record = {
+    latitude: 17.4,
+    longitude: 78.3,
+    timestamp: '2026-11-06T08:49:17.664141Z',
+    gps_fix: true,
+    gps_valid: true,
+    gps_source: 'watch_tcp',
+    gps_status: 'Location Stale',
+  }
+
+  assert.ok(normalizeVerifiedGpsFix(record, now))
+  const merged = mergeVerifiedGpsFixes([record], null, now)
+  assert.equal(merged.history.length, 1)
+  assert.equal(merged.current, null)
+})
+
+test('uses the backend 15-minute window to determine GPS freshness', () => {
+  assert.equal(isFreshGpsTimestamp(Date.parse('2026-11-12T06:55:01Z'), now), true)
+  assert.equal(isFreshGpsTimestamp(Date.parse('2026-11-12T06:54:59Z'), now), false)
 })
 
 test('sorts and deduplicates history while keeping a latest-only fix out of history', () => {
@@ -288,6 +543,26 @@ test('uses verified nested last-known metadata when the latest packet has no fix
   assert.equal(unwrapGpsLatestResponse(response)?.verified, true)
 })
 
+test('keeps latest packet time separate from the last verified GPS fix', () => {
+  const metadata = normalizeLatestGpsReportMetadata({
+    gps_fix: false,
+    gps_valid: false,
+    coordinate_source: 'last_known',
+    last_seen: '2026-11-14T07:47:39.181920+00:00',
+    last_valid_gps_time: '2026-11-06T08:49:17.664141+00:00',
+    last_known_location: {
+      latitude: 17.446317,
+      longitude: 78.368395,
+      received_at: '2026-11-14T07:47:39.181920+00:00',
+    },
+  })
+
+  assert.deepEqual(metadata, {
+    receivedAt: Date.parse('2026-11-14T07:47:39.181920Z'),
+    noFixReported: true,
+  })
+})
+
 test('rejects last-known backend coordinates without verified provenance', () => {
   const response = {
     latitude: null,
@@ -319,7 +594,7 @@ test('normalizes last_fix as display-only unverified data without promoting it t
     last_fix: {
       lat: 17.446683,
       lon: 78.37006,
-      at: '2026-11-13T07:45:40.683324Z',
+      at: '2026-11-13T07:30:40.683324Z',
     },
   }
   const candidate = collectLastReportedGpsCandidates(response)[0]
@@ -327,7 +602,7 @@ test('normalizes last_fix as display-only unverified data without promoting it t
 
   assert.equal(location?.latitude, 17.446683)
   assert.equal(location?.longitude, 78.37006)
-  assert.equal(location?.recordedAt, '2026-11-13T07:45:40.683Z')
+  assert.equal(location?.recordedAt, '2026-11-13T07:30:40.683Z')
   assert.equal(location?.verified, false)
   assert.equal(location?.locationType, 'last_reported_unverified')
   assert.equal(location?.isStale, true)
@@ -338,6 +613,7 @@ test('uses explicit root last-known coordinates despite false current-fix flags'
   const response = {
     latitude: 17.446317,
     longitude: 78.368395,
+    timestamp: '2026-11-12T07:00:00Z',
     gps_fix: false,
     gps_valid: false,
     gps_status: 'Location Stale',
@@ -353,9 +629,53 @@ test('uses explicit root last-known coordinates despite false current-fix flags'
   assert.equal(location?.latitude, 17.446317)
   assert.equal(location?.longitude, 78.368395)
   assert.equal(location?.recordedAt, '2026-11-12T06:00:00.000Z')
+  assert.equal(location?.coordinateSource, 'last_known')
+  assert.equal(location?.isStale, true)
   assert.equal(location?.source, 'watch_tcp')
   assert.equal(location?.verified, false)
   assert.equal(normalizeVerifiedGpsFix(candidate?.record, now), null)
+})
+
+test('rejects last-known coordinates as a verified live fix even when flags claim validity', () => {
+  const candidate = {
+    latitude: 17.446317,
+    longitude: 78.368395,
+    gps_fix: true,
+    gps_valid: true,
+    gps_source: 'watch_tcp',
+    coordinate_source: 'last_known',
+    timestamp: '2026-11-12T07:09:00Z',
+  }
+
+  assert.equal(normalizeVerifiedGpsFix(candidate, now), null)
+  assert.ok(getGpsFixRejectionReasons(candidate, now).includes('cached-location-not-a-live-fix'))
+})
+
+test('uses last-valid GPS time instead of a later no-fix packet time for cached coordinates', () => {
+  const response = {
+    latitude: 17.446317,
+    longitude: 78.368395,
+    coordinate_source: 'last_known',
+    location_is_current: false,
+    timestamp: '2026-11-16T04:48:29Z',
+    received_at: '2026-11-16T04:48:43Z',
+    last_valid_gps_time: '2026-11-06T08:49:17Z',
+    last_known_location: {
+      latitude: 17.446317,
+      longitude: 78.368395,
+      timestamp: '2026-11-16T04:48:29Z',
+    },
+  }
+  const candidate = collectLastReportedGpsCandidates(response)
+    .find(({ name }) => name.endsWith('.last_known_location'))
+  const location = normalizeLastReportedGpsLocation(
+    candidate?.record,
+    Date.parse('2026-11-17T00:00:00Z')
+  )
+
+  assert.equal(location?.coordinateSource, 'last_known')
+  assert.equal(location?.recordedAt, '2026-11-06T08:49:17.000Z')
+  assert.equal(location?.isStale, true)
 })
 
 test('rejects invalid coordinates, invalid GPS flags, and V packets from last-reported display', () => {
@@ -386,6 +706,36 @@ test('rejects invalid coordinates, invalid GPS flags, and V packets from last-re
     lat: 17,
     lon: 78,
   }, now)?.recordedAt, null)
+})
+
+test('only accepts strictly newer GPS fix timestamps for marker updates', () => {
+  assert.equal(isNewerGpsTimestamp(200, 100), true)
+  assert.equal(isNewerGpsTimestamp(100, 100), false)
+  assert.equal(isNewerGpsTimestamp(99, 100), false)
+  assert.equal(isNewerGpsTimestamp(null, 100), false)
+  assert.equal(isNewerGpsTimestamp(100, null), true)
+})
+
+test('prefers the latest API-reported position over a newer-timestamped Firestore fallback', () => {
+  const apiLocation = {
+    latitude: 17.446317,
+    longitude: 78.368395,
+    timestamp: Date.parse('2026-11-12T06:00:00Z'),
+  }
+  const firestoreLastFix = {
+    lat: 17.444978,
+    lon: 78.365,
+    at: '2026-11-12T07:00:00Z',
+  }
+
+  const location = selectPreferredLastReportedGpsLocation(
+    apiLocation,
+    [firestoreLastFix],
+    now
+  )
+
+  assert.equal(location?.latitude, apiLocation.latitude)
+  assert.equal(location?.longitude, apiLocation.longitude)
 })
 
 test('corroborates a legacy last_fix only against an exact verified history record', () => {
@@ -452,7 +802,7 @@ test('rejects invalid coordinates, malformed or missing timestamps, and future f
     ...valid,
     gps_status: 'GPS_VALID',
     gps_valid: undefined,
-  }, now)?.status, 'GPS VALID')
+  }, now), null)
   assert.equal(normalizeVerifiedGpsFix({ ...valid, timestamp: 'not-a-time' }, now), null)
   assert.equal(normalizeVerifiedGpsFix({ ...valid, timestamp: undefined }, now), null)
   assert.equal(
@@ -566,6 +916,16 @@ test('filters stationary GPS jitter, deduplicates fixes, and retains accepted mo
   ])
 })
 
+test('does not let reported GPS accuracy hide visible route movement', () => {
+  const route = makeRoute()
+  const start = Date.parse('2026-11-12T07:00:00Z')
+  assert.equal(appendGpsTrailPoint(route, makePoint(17.4, start, 'start', 25)), true)
+  assert.equal(appendGpsTrailPoint(route, makePoint(17.4001, start + 5_000, 'move', 25)), true)
+  assert.deepEqual(route.segments.map((segment) => segment.map((point) => point.key)), [
+    ['start', 'move'],
+  ])
+})
+
 test('starts a new trail segment after a long GPS gap', () => {
   const route = makeRoute()
   const start = Date.parse('2026-11-12T07:00:00Z')
@@ -576,4 +936,30 @@ test('starts a new trail segment after a long GPS gap', () => {
   )
 
   assert.deepEqual(route.segments.map((segment) => segment.length), [1, 1])
+})
+
+test('collapses an idle session to its latest location point', () => {
+  const start = Date.parse('2026-11-12T07:00:00Z')
+  const segments = buildGpsTrailSegments([
+    makePoint(17.4, start, 'first'),
+    makePoint(17.4, start + 5 * 60_000, 'idle'),
+  ])
+
+  assert.deepEqual(segments.map((segment) => segment.map((point) => point.key)), [
+    ['idle'],
+  ])
+})
+
+test('keeps moving GPS fixes as a line and breaks the line after a long gap', () => {
+  const start = Date.parse('2026-11-12T07:00:00Z')
+  const segments = buildGpsTrailSegments([
+    makePoint(17.4, start, 'start'),
+    makePoint(17.4001, start + 60_000, 'move'),
+    makePoint(17.401, start + 2 * DEFAULT_GPS_TRAIL_FILTERS.maxGapMs, 'after-idle'),
+  ])
+
+  assert.deepEqual(segments.map((segment) => segment.map((point) => point.key)), [
+    ['start', 'move'],
+    ['after-idle'],
+  ])
 })

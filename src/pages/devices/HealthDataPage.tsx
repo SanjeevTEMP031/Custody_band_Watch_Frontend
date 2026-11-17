@@ -2,18 +2,32 @@
 import { useSearchParams } from 'react-router-dom'
 import { Alert, Box, Button, MenuItem, Stack, TextField, Typography } from '@mui/material'
 import { useApiData } from '../../hooks/useApiData'
+import { useRealtimeDevices } from '../../hooks/useRealtimeDevices'
+import { mergeDevicesWithFirestore } from '../../lib/firebase'
 import { getAccessToken, listDevices, type Device } from '../../services/api'
 import DeviceTable from './DeviceTable'
 import HealthDeviceDetail from './HealthDeviceDetail'
 
-const metrics = ['Heart rate', 'Blood pressure', 'Temperature', 'Step counter', 'Sleep', 'Blood Oxygen']
-const metricValue = (d: Device, metric: string) => [d.heart_rate, d.blood_pressure, d.temperature, d.step_counter, d.sleep, d.blood_oxygen][metrics.indexOf(metric)] ?? '-'
+const metrics = ['Heart rate', 'Blood pressure', 'Temperature', 'Step counter', 'Sleep', 'Blood Oxygen', 'Blood glucose', 'HRV']
+const metricValue = (d: Device, metric: string) => [
+  d.heart_rate,
+  d.blood_pressure,
+  d.temperature,
+  d.step_counter,
+  d.sleep,
+  d.blood_oxygen,
+  d.blood_glucose,
+  d.hrv,
+][metrics.indexOf(metric)] ?? '-'
 const localDate = (date: Date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}T${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
 
 export default function HealthDataPage({ geofenceView = false }: { geofenceView?: boolean }) {
   const [params] = useSearchParams()
   const loadDevices = useCallback(() => getAccessToken() ? listDevices(0, 500) : Promise.resolve([] as Device[]), [])
-  const { data, loading, error, reload } = useApiData(loadDevices)
+  const { data: apiDevices, loading: apiLoading, error, reload } = useApiData(loadDevices)
+  const { devices: firestoreDevices, loading: firestoreLoading } = useRealtimeDevices()
+  const data = mergeDevicesWithFirestore(apiDevices ?? [], firestoreDevices)
+  const loading = apiLoading && firestoreLoading
   const [query, setQuery] = useState(''), [status, setStatus] = useState('All')
   const [filters, setFilters] = useState({ query: '', status: 'All' })
   const [metric, setMetric] = useState('Heart rate')
@@ -37,7 +51,14 @@ export default function HealthDataPage({ geofenceView = false }: { geofenceView?
     ]), 'Health Data')
     writeFile(workbook, 'Health Data.xls', { bookType: 'biff8' })
   }
-  if (detail) return <HealthDeviceDetail device={detail} onBack={() => setDetail(null)} />
+  const liveDetail = detail
+    ? data.find(device =>
+        String(device.id) === String(detail.id) ||
+        String(device.device_id) === String(detail.device_id) ||
+        String(device.imei) === String(detail.imei)
+      ) ?? detail
+    : null
+  if (liveDetail) return <HealthDeviceDetail device={liveDetail} onBack={() => setDetail(null)} />
   return <Stack spacing={2} sx={{ bgcolor: '#fff', p: 1.5 }}>
     {!geofenceView && <Typography sx={{ color: '#00998c', fontWeight: 600 }}>Health Data</Typography>}
     <Box component="form" onSubmit={event => { event.preventDefault(); lookup() }} sx={{ display: 'flex', flexWrap: 'wrap', gap: .5 }}>

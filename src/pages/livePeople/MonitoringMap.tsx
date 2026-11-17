@@ -113,7 +113,8 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
     firestoreLatest,
     selectedDevice?.gps_last_fix,
     handleVerifiedGpsPoint,
-    handleLastReportedLocation
+    handleLastReportedLocation,
+    false
   )
   const selectedReportedLocation = selectedLastReported.deviceKey === selectedKey
     ? selectedLastReported.currentGpsAvailable
@@ -379,7 +380,7 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
           {focusIsLastKnown
             ? 'Showing Last Reported Location — Unverified. No live GPS fix is currently available; this position may be outdated. '
             : ''}
-          Google Maps is shown in embedded mode. Add <code>VITE_GOOGLE_MAPS_API_KEY</code> to <code>trackin360-admin/.env</code> to enable device markers and aggregate view.
+          Google Maps is shown in embedded mode. Add <code>VITE_GOOGLE_MAPS_API_KEY</code> to your local <code>.env</code> file to enable device markers and aggregate view.
         </Alert>
         {selectedKey && (gpsRouteStatus === 'unavailable' ||
           gpsRouteStatus === 'history-sync' ||
@@ -389,20 +390,20 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
             {gpsRouteStatus === 'configuration-error' &&
               'GPS API configuration error: requests must return application/json. Check VITE_API_BASE_URL and the hosting proxy; an HTTPS page also requires an HTTPS backend or proxy. '}
             {(gpsRouteStatus === 'history-sync' || gpsRouteStatus === 'unavailable-history-sync') &&
-              'A valid latest GPS fix is missing from backend history and is not added to the recorded trail. '}
+              'A current verified GPS fix is not available. Historical tracks are in Device Management Tracking and Playback. '}
             {(gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'unavailable-history-sync') &&
               (selectedIsLastKnown
                 ? (selectedReportedLocation
-                  ? 'GPS No Fix — Showing Last Reported Location — Unverified; this historical position may be outdated.'
-                  : 'No live GPS fix is available. Showing the last verified location.')
+                  ? 'GPS No Fix — Showing Last Reported Location — Unverified; this position may be outdated. '
+                  : 'No live GPS fix is available. Showing the last verified location. ')
                 : !selectedLocatedDevice && !selectedReportedLocation
                   ? 'No GPS Location Available for this device.'
-                  : 'No fresh verified GPS fix is available.')}
+                  : 'No fresh verified GPS fix is available. Historical tracks are in Device Management Tracking and Playback.')}
           </Alert>
         )}
       </Box>
     }
-    return <Box sx={{ height: '100%', position: 'relative' }}><Box ref={container} sx={{ height: '100%' }} />{error && <Typography role="alert" sx={{ position: 'absolute', top: 10, left: 10, bgcolor: 'white', p: 1 }}>{error}</Typography>}{selectedKey && (gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'history-sync' || gpsRouteStatus === 'unavailable-history-sync') && <Alert severity="warning" sx={{ position: 'absolute', left: 12, bottom: 12, maxWidth: 430 }}>{(gpsRouteStatus === 'history-sync' || gpsRouteStatus === 'unavailable-history-sync') && 'A valid latest GPS fix is missing from backend history and is not added to the recorded trail. '}{(gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'unavailable-history-sync') && (selectedIsLastKnown ? (selectedReportedLocation ? 'GPS No Fix — Showing Last Reported Location — Unverified; this historical position may be outdated. ' : 'No live GPS fix is available. Showing the last verified location. ') : !selectedLocatedDevice && !selectedReportedLocation ? 'No GPS Location Available for this device. ' : 'No fresh verified GPS fix is available. ')}Only verified recorded GPS points are shown.</Alert>}</Box>
+    return <Box sx={{ height: '100%', position: 'relative' }}><Box ref={container} sx={{ height: '100%' }} />{error && <Typography role="alert" sx={{ position: 'absolute', top: 10, left: 10, bgcolor: 'white', p: 1 }}>{error}</Typography>}{selectedKey && (gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'history-sync' || gpsRouteStatus === 'unavailable-history-sync') && <Alert severity="warning" sx={{ position: 'absolute', left: 12, bottom: 12, maxWidth: 430 }}>{(gpsRouteStatus === 'history-sync' || gpsRouteStatus === 'unavailable-history-sync') && 'A current verified GPS fix is not available. Historical tracks are in Device Management Tracking and Playback. '}{(gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'unavailable-history-sync') && (selectedIsLastKnown ? (selectedReportedLocation ? 'GPS No Fix — Showing Last Reported Location — Unverified; this position may be outdated. ' : 'No live GPS fix is available. Showing the last verified location. ') : !selectedLocatedDevice && !selectedReportedLocation ? 'No GPS Location Available for this device. ' : 'No fresh verified GPS fix is available. Historical tracks are in Device Management Tracking and Playback. ')}Only fresh verified points received while Monitoring Center is open are traced.</Alert>}</Box>
   }
   return <OpenStreetMapView devices={displayDevices} selectedId={selectedId} showNames={showNames} aggregate={aggregate} mapStyle={mapStyle} movementSegments={movementSegments} gpsRouteStatus={selectedKey ? gpsRouteStatus : null} />
 }

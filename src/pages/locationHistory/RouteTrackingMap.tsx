@@ -13,6 +13,11 @@ import {
   Sparkles,
 } from 'lucide-react'
 import { isValidGpsCoord, type TripPoint, type TripRecord } from '../../lib/firebase'
+import {
+  buildGpsTrailSegments,
+  DEFAULT_GPS_TRAIL_FILTERS,
+  type GpsTrailPoint,
+} from '../../services/gpsTrail'
 import { getRoute, getMultiPointRoute, geocode, type Coords, type RouteData } from './RouteMap'
 
 import markerIcon from 'leaflet/dist/images/marker-icon.png'
@@ -28,6 +33,37 @@ L.Icon.Default.mergeOptions({
 
 export type MapTileProvider = 'standard' | 'humanitarian' | 'voyager'
 export type PathStyleOption = 'purple-dotted' | 'blue-solid' | 'both'
+
+type DrawableTrailPoint =
+  Omit<TripPoint, 'timestamp'> &
+  Omit<GpsTrailPoint, 'timestamp'> & { timestamp: number }
+
+function getDrawableTrailSegments(points: TripPoint[]): TripPoint[][] {
+  const trailPoints = points
+    .map((point) => {
+      const timestamp = Date.parse(point.timestamp)
+      return Number.isFinite(timestamp)
+        ? {
+            ...point,
+            timestamp,
+            accuracy: point.accuracy_m ?? null,
+            key: `${timestamp}|${point.latitude}|${point.longitude}`,
+          }
+        : null
+    })
+    .filter((point): point is DrawableTrailPoint => point !== null)
+    .sort((first, second) => first.timestamp - second.timestamp)
+  const segments = buildGpsTrailSegments(trailPoints, DEFAULT_GPS_TRAIL_FILTERS)
+  return segments.map((segment) => segment.map((point) => ({
+    latitude: point.latitude,
+    longitude: point.longitude,
+    timestamp: new Date(point.timestamp).toISOString(),
+    speed_kmh: point.speed_kmh,
+    heading: point.heading,
+    accuracy_m: point.accuracy_m,
+    battery_pct: point.battery_pct,
+  })))
+}
 
 const TILE_PROVIDERS: Record<MapTileProvider, { name: string; url: string; attribution: string }> = {
   standard: {
@@ -50,6 +86,15 @@ const TILE_PROVIDERS: Record<MapTileProvider, { name: string; url: string; attri
 interface RouteTrackingMapProps {
   trip: TripRecord | null
   points?: TripPoint[]
+  routes?: Array<{
+    id: string
+    label: string
+    color: string
+    status: TripRecord['status']
+    points: TripPoint[]
+  }>
+  routeColor?: string
+  playbackPoint?: TripPoint | null
   currentLocation?: {
     latitude: number
     longitude: number
@@ -178,6 +223,9 @@ function createCurrentLocationIcon(heading?: number | null): L.DivIcon {
 export default function RouteTrackingMap({
   trip,
   points,
+  routes,
+  routeColor = '#2563eb',
+  playbackPoint = null,
   currentLocation,
   height = 540,
   autoFitOnUpdate = true,
@@ -190,10 +238,12 @@ export default function RouteTrackingMap({
   const polylineMainRef = useRef<L.Polyline | null>(null)
   const polylineOsrmRef = useRef<L.Polyline | null>(null)
   const markerGroupRef = useRef<L.LayerGroup | null>(null)
+  const playbackMarkerGroupRef = useRef<L.LayerGroup | null>(null)
+  const tripRouteGroupRef = useRef<L.LayerGroup | null>(null)
   const lastFittedTripIdRef = useRef<string | null>(null)
 
   const [mapStyle, setMapStyle] = useState<MapTileProvider>('standard')
-  const [pathStyle, setPathStyle] = useState<PathStyleOption>('purple-dotted')
+  const [pathStyle, setPathStyle] = useState<PathStyleOption>('blue-solid')
   const [isFullscreen, setIsFullscreen] = useState(false)
 
   // OSRM Driving Route State
@@ -210,8 +260,17 @@ export default function RouteTrackingMap({
   const [searchError, setSearchError] = useState<string>('')
 
   // Consolidate route points from prop or trip
-  const routePoints = points ?? trip?.route_points ?? []
-  const validRoute = routePoints.filter((p) => isValidGpsCoord(p.latitude, p.longitude))
+  const routePoints = routes ? [] : points ?? trip?.route_points ?? []
+  const gpsRouteSegments = getDrawableTrailSegments(
+    routePoints.filter((point) => isValidGpsCoord(point.latitude, point.longitude))
+  )
+  const validRoute = gpsRouteSegments.flat()
+  const routeSignature = validRoute.map((point) =>
+    `${point.latitude},${point.longitude},${point.timestamp}`
+  ).join('|')
+  const hasMultiTripPoints = Boolean(
+    routes?.some((route) => route.points.some((point) => isValidGpsCoord(point.latitude, point.longitude)))
+  )
 
   // Determine start, end, and current locations
   const startCoord = validRoute.length > 0 ? validRoute[0] : null
@@ -252,6 +311,8 @@ export default function RouteTrackingMap({
     }).addTo(map)
 
     const markers = L.layerGroup().addTo(map)
+    const playbackMarkers = L.layerGroup().addTo(map)
+    const tripRoutes = L.layerGroup().addTo(map)
 
     // Halo polyline for high contrast
     const halo = L.polyline([], {
@@ -282,6 +343,8 @@ export default function RouteTrackingMap({
     mapInstanceRef.current = map
     tileLayerRef.current = initialTiles
     markerGroupRef.current = markers
+    playbackMarkerGroupRef.current = playbackMarkers
+    tripRouteGroupRef.current = tripRoutes
     polylineHaloRef.current = halo
     polylineMainRef.current = mainLine
     polylineOsrmRef.current = osrmLine
@@ -295,11 +358,50 @@ export default function RouteTrackingMap({
       mapInstanceRef.current = null
       tileLayerRef.current = null
       markerGroupRef.current = null
+      playbackMarkerGroupRef.current = null
+      tripRouteGroupRef.current = null
       polylineHaloRef.current = null
       polylineMainRef.current = null
       polylineOsrmRef.current = null
     }
   }, [])
+
+  useEffect(() => {
+    const map = mapInstanceRef.current
+    const markerGroup = playbackMarkerGroupRef.current
+    if (!map || !markerGroup) return
+
+    markerGroup.clearLayers()
+    if (
+      !playbackPoint ||
+      !isValidGpsCoord(playbackPoint.latitude, playbackPoint.longitude)
+    ) return
+
+    const marker = L.marker(
+      [playbackPoint.latitude, playbackPoint.longitude],
+      {
+        icon: createCurrentLocationIcon(playbackPoint.heading),
+        zIndexOffset: 1400,
+      }
+    )
+    marker.bindPopup(`
+      <div style="font-family: inherit; font-size: 13px; line-height: 1.4;">
+        <strong>Playback position</strong>
+        <div>${playbackPoint.latitude.toFixed(5)}, ${playbackPoint.longitude.toFixed(5)}</div>
+        <div>${new Date(playbackPoint.timestamp).toLocaleString()}</div>
+      </div>
+    `)
+    marker.addTo(markerGroup)
+    map.panTo([playbackPoint.latitude, playbackPoint.longitude], {
+      animate: true,
+      duration: 0.6,
+    })
+  }, [
+    playbackPoint?.latitude,
+    playbackPoint?.longitude,
+    playbackPoint?.timestamp,
+    playbackPoint?.heading,
+  ])
 
   // 2. Tile layer change handler
   useEffect(() => {
@@ -314,7 +416,12 @@ export default function RouteTrackingMap({
 
   // 2b. Automatically compute OSRM Road-snapped Driving Route for Selected Journey
   useEffect(() => {
-    if (!startCoord) {
+    if (routes) {
+      setOsrmRoute(null)
+      setOsrmLoading(false)
+      return
+    }
+    if (!startCoord || validRoute.length < 2) {
       setOsrmRoute(null)
       return
     }
@@ -379,53 +486,115 @@ export default function RouteTrackingMap({
     endCoord?.longitude,
     liveCoord?.latitude,
     liveCoord?.longitude,
-    validRoute.length,
+    routeSignature,
     isTripCompleted,
+    routes,
   ])
 
   // 3. Render route polylines, start marker, end marker, search markers and live position marker
   useEffect(() => {
     const map = mapInstanceRef.current
     const markers = markerGroupRef.current
+    const tripRoutes = tripRouteGroupRef.current
     const halo = polylineHaloRef.current
     const mainLine = polylineMainRef.current
     const osrmLine = polylineOsrmRef.current
-    if (!map || !markers || !halo || !mainLine || !osrmLine) return
+    if (!map || !markers || !tripRoutes || !halo || !mainLine || !osrmLine) return
 
     markers.clearLayers()
+    tripRoutes.clearLayers()
 
     const latLngs: L.LatLngTuple[] = validRoute.map((p) => [p.latitude, p.longitude])
+    const allTripBounds: L.LatLngTuple[] = []
+
+    if (routes) {
+      routes.forEach((route) => {
+        const validPoints = route.points.filter((point) =>
+          isValidGpsCoord(point.latitude, point.longitude)
+        )
+        const segments = getDrawableTrailSegments(validPoints)
+        const routePoints = segments.flat()
+        segments.forEach((segment) => {
+          const routeCoordinates = segment.map(
+            (point): L.LatLngTuple => [point.latitude, point.longitude]
+          )
+          if (routeCoordinates.length > 1) {
+            L.polyline(routeCoordinates, {
+              color: route.color,
+              weight: 5,
+              opacity: 0.9,
+              lineCap: 'round',
+              lineJoin: 'round',
+            }).addTo(tripRoutes)
+          }
+        })
+        routePoints.forEach((point, index) => {
+          const dot = L.circleMarker([point.latitude, point.longitude], {
+            radius: routePoints.length === 1 ? 7 : 3.5,
+            color: '#ffffff',
+            weight: 1.5,
+            fillColor: route.color,
+            fillOpacity: 1,
+          })
+          if (index === 0) dot.bindTooltip(`${route.label} · start`)
+          else if (index === routePoints.length - 1) dot.bindTooltip(`${route.label} · end`)
+          dot.addTo(tripRoutes)
+        })
+        allTripBounds.push(...routePoints.map(
+          (point): L.LatLngTuple => [point.latitude, point.longitude]
+        ))
+      })
+      osrmLine.setLatLngs([])
+      halo.setLatLngs([])
+      mainLine.setLatLngs([])
+    }
 
     // In-progress journey: extend live polyline to the current live coordinate
-    if (!isTripCompleted && liveCoord && latLngs.length > 0) {
+    const latLngSegments: L.LatLngTuple[][] = gpsRouteSegments.map((segment) =>
+      segment.map(({ latitude, longitude }) => [latitude, longitude])
+    )
+    if (!routes && !isTripCompleted && liveCoord && latLngs.length > 0) {
       const lastPt = latLngs[latLngs.length - 1]
       if (lastPt[0] !== liveCoord.latitude || lastPt[1] !== liveCoord.longitude) {
         latLngs.push([liveCoord.latitude, liveCoord.longitude])
+        latLngSegments[latLngSegments.length - 1]?.push([
+          liveCoord.latitude,
+          liveCoord.longitude,
+        ])
       }
     }
 
     // Determine path to render for OSRM Dotted Purple line
-    const activeRoadPath: L.LatLngTuple[] =
-      searchRoute?.path ??
-      (osrmRoute?.path && osrmRoute.path.length > 0 ? osrmRoute.path : latLngs)
+    const activeRoadPath: L.LatLngTuple[] = searchRoute?.path ?? osrmRoute?.path ?? []
 
-    if (pathStyle === 'purple-dotted') {
+    if (!routes && pathStyle === 'purple-dotted') {
       osrmLine.setLatLngs(activeRoadPath)
       halo.setLatLngs([])
       mainLine.setLatLngs([])
-    } else if (pathStyle === 'blue-solid') {
+    } else if (!routes && pathStyle === 'blue-solid') {
       osrmLine.setLatLngs([])
-      halo.setLatLngs(latLngs)
-      mainLine.setLatLngs(latLngs)
-    } else {
+      halo.setLatLngs(latLngSegments)
+      mainLine.setLatLngs(latLngSegments)
+    } else if (!routes) {
       // Both
       osrmLine.setLatLngs(activeRoadPath)
-      halo.setLatLngs(latLngs)
-      mainLine.setLatLngs(latLngs)
+      halo.setLatLngs(latLngSegments)
+      mainLine.setLatLngs(latLngSegments)
+    }
+    if (!routes) {
+      validRoute.forEach((point) => {
+        L.circleMarker([point.latitude, point.longitude], {
+          radius: validRoute.length === 1 ? 7 : 3,
+          color: '#ffffff',
+          weight: 1,
+          fillColor: routeColor,
+          fillOpacity: 1,
+        }).addTo(markers)
+      })
     }
 
     // --- A. START MARKER (GREEN) ---
-    if (startCoord) {
+    if (!routes && startCoord) {
       const startMarker = L.marker([startCoord.latitude, startCoord.longitude], {
         icon: createStartIcon(),
         zIndexOffset: 1000,
@@ -448,7 +617,7 @@ export default function RouteTrackingMap({
     }
 
     // --- B. END MARKER (RED) ---
-    if (endCoord && isTripCompleted) {
+    if (!routes && endCoord && isTripCompleted) {
       const endMarker = L.marker([endCoord.latitude, endCoord.longitude], {
         icon: createEndIcon(trip?.total_distance_km),
         zIndexOffset: 1000,
@@ -471,7 +640,7 @@ export default function RouteTrackingMap({
     }
 
     // --- C. CURRENT LOCATION MARKER (BLUE PULSE) ---
-    if (liveCoord && (!isTripCompleted || !endCoord)) {
+    if (liveCoord && (routes || !isTripCompleted || !endCoord)) {
       const currentMarker = L.marker([liveCoord.latitude, liveCoord.longitude], {
         icon: createCurrentLocationIcon(liveCoord.heading),
         zIndexOffset: 1100,
@@ -512,6 +681,10 @@ export default function RouteTrackingMap({
 
     if (searchRoute && searchRoute.path.length > 0) {
       map.fitBounds(searchRoute.path, { padding: [40, 40] })
+    } else if (routes && allTripBounds.length > 0 && autoFitOnUpdate) {
+      const bounds = L.latLngBounds(allTripBounds)
+      if (allTripBounds.length === 1) map.setView(allTripBounds[0], 15)
+      else map.fitBounds(bounds, { padding: [50, 50], maxZoom: 16 })
     } else if (autoFitOnUpdate && (osrmRoute?.path?.length || latLngs.length > 0) && isNewJourney) {
       lastFittedTripIdRef.current = tripId
       const boundsTarget = osrmRoute?.path && osrmRoute.path.length > 0 ? osrmRoute.path : latLngs
@@ -539,6 +712,8 @@ export default function RouteTrackingMap({
     pathStyle,
     searchRoute,
     searchPoints,
+    routes,
+    routeColor,
   ])
 
   // Center on Start
@@ -559,7 +734,17 @@ export default function RouteTrackingMap({
   // Fit Entire Route Bounds
   const handleFitEntireRoute = () => {
     if (mapInstanceRef.current) {
-      const targetPath = searchRoute?.path ?? (osrmRoute?.path && osrmRoute.path.length > 0 ? osrmRoute.path : validRoute.map((p) => [p.latitude, p.longitude] as L.LatLngTuple))
+      const allRoutesPath = routes?.flatMap((route) =>
+        route.points
+          .filter((point) => isValidGpsCoord(point.latitude, point.longitude))
+          .map((point) => [point.latitude, point.longitude] as L.LatLngTuple)
+      ) ?? []
+      const targetPath = searchRoute?.path ??
+        (osrmRoute?.path && osrmRoute.path.length > 0
+          ? osrmRoute.path
+          : allRoutesPath.length > 0
+            ? allRoutesPath
+            : validRoute.map((point) => [point.latitude, point.longitude] as L.LatLngTuple))
       if (targetPath.length === 1) {
         mapInstanceRef.current.setView(targetPath[0], 15)
       } else if (targetPath.length > 1) {
@@ -653,7 +838,7 @@ export default function RouteTrackingMap({
       />
 
       {/* Empty State Overlay */}
-      {validRoute.length === 0 && !searchRoute && (
+      {validRoute.length === 0 && !hasMultiTripPoints && !liveCoord && !searchRoute && (
         <Box
           sx={{
             position: 'absolute',
@@ -762,7 +947,7 @@ export default function RouteTrackingMap({
             </Tooltip>
           )}
 
-          {(validRoute.length > 1 || searchRoute) && (
+          {(validRoute.length > 1 || hasMultiTripPoints || searchRoute) && (
             <Tooltip title="Fit complete journey route in view">
               <button
                 type="button"
@@ -810,7 +995,7 @@ export default function RouteTrackingMap({
         </ButtonGroup>
 
         {/* Path Style Selector */}
-        <Box
+        {!routes && <Box
           sx={{
             display: 'flex',
             bgcolor: '#ffffff',
@@ -878,10 +1063,10 @@ export default function RouteTrackingMap({
           >
             Both
           </button>
-        </Box>
+        </Box>}
 
         {/* Live OSRM Road Distance & Driving Time Pill */}
-        {osrmLoading && !searchRoute && (
+        {!routes && osrmLoading && !searchRoute && (
           <Box
             sx={{
               display: 'flex',
@@ -903,7 +1088,7 @@ export default function RouteTrackingMap({
           </Box>
         )}
 
-        {osrmRoute && !searchRoute && !osrmLoading && (
+        {!routes && osrmRoute && !searchRoute && !osrmLoading && (
           <Box
             sx={{
               display: 'flex',

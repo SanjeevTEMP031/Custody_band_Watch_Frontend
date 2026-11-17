@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { Box, IconButton } from '@mui/material'
 import { FullscreenOutlined, Navigation } from '@mui/icons-material'
 import L from 'leaflet'
@@ -9,7 +9,6 @@ import {
   normalizeVerifiedGpsFix,
   selectNewestLastReportedGpsLocation,
 } from '../../services/gpsNormalization'
-import { subscribeToDeviceTrips, type TripRecord } from '../../lib/firebase'
 import type { SelectedGpsRouteStatus } from '../dashboard/useSelectedGpsRoute'
 
 export type OpenStreetMapStyle = 'standard' | 'humanitarian' | 'cycle'
@@ -41,10 +40,6 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
   const routeLayers = useRef<L.LayerGroup | null>(null)
   const tileLayer = useRef<L.TileLayer | null>(null)
   const lastCenteredSelectionRef = useRef<string | null>(null)
-  const [tripSelection, setTripSelection] = useState<{ deviceId: string; trip: TripRecord | null }>({ deviceId: '', trip: null })
-  const activeTrip = selectedId != null && tripSelection.deviceId === String(selectedId)
-    ? tripSelection.trip
-    : null
 
   const located = useMemo(
     () => devices.filter(device => {
@@ -90,19 +85,6 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
       ])
     : null
   const hasCoords = Boolean(centerFix || centerLastReported)
-
-  // Subscribe to trips for selected device to show route polyline
-  useEffect(() => {
-    if (selectedId == null) return
-
-    const deviceId = String(selectedId)
-    const unsubscribe = subscribeToDeviceTrips(deviceId, (trips) => {
-      const active = trips.find(t => t.status === 'in_progress') ?? trips[0] ?? null
-      setTripSelection({ deviceId, trip: active })
-    })
-
-    return () => unsubscribe()
-  }, [selectedId])
 
   useEffect(() => {
     if (!canvas.current) return
@@ -258,11 +240,10 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
   return <Box ref={root} sx={{ position: 'relative', width: '100%', height: '100%', minHeight: 520, zIndex: 0, '&:fullscreen': { height: '100vh', width: '100vw' } }}>
     <Box ref={canvas} aria-label="Device location map" sx={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }} />
 
-    {/* Route & Distance Badge */}
-    {activeTrip && activeTrip.total_distance_km > 0 && (
+    {selectedFix && isFreshGpsTimestamp(selectedFix.timestamp) && (
       <Box sx={{ position: 'absolute', top: 20, left: 20, zIndex: 1000, bgcolor: 'rgba(37, 99, 235, 0.92)', color: '#ffffff', px: 2, py: 1, borderRadius: 1.5, fontSize: 13, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 1, boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
         <Navigation sx={{ fontSize: 16 }} />
-        {activeTrip.status === 'in_progress' ? 'Active Journey' : 'Last Trip'}: {activeTrip.total_distance_km.toFixed(2)} km
+        Live tracking
       </Box>
     )}
     {(gpsRouteStatus === 'unavailable' ||
@@ -274,26 +255,19 @@ export default function OpenStreetMapView({ devices, selectedId, showNames, aggr
           <div>GPS API configuration error: requests must return application/json. Check VITE_API_BASE_URL and the hosting proxy; an HTTPS page also requires an HTTPS backend or proxy.</div>
         )}
         {(gpsRouteStatus === 'history-sync' || gpsRouteStatus === 'unavailable-history-sync') && (
-          <div>A valid latest GPS fix is missing from backend history and is not added to the recorded trail.</div>
+          <div>A current verified GPS fix is not available. Historical tracks are in Device Management Tracking and Playback.</div>
         )}
         {(gpsRouteStatus === 'unavailable' || gpsRouteStatus === 'unavailable-history-sync') && (
           <div>{hasSelectedLastKnown
             ? (selectedLastReported
-              ? 'GPS No Fix — Showing Last Reported Location — Unverified; this historical position may be outdated. The trail contains verified history only.'
-              : 'No live GPS fix is available. Showing the last verified location; the trail contains verified history only.')
+              ? 'GPS No Fix — Showing Last Reported Location — Unverified; this position may be outdated.'
+              : 'No live GPS fix is available. Showing the last verified location.')
             : selectedId != null && !hasSelectedVerifiedPosition && !selectedLastReported
               ? 'No GPS Location Available for this device. No usable coordinates were returned.'
-              : 'No fresh verified GPS fix is available. Any visible trail contains verified recorded history only.'}</div>
+              : 'No fresh verified GPS fix is available. Historical tracks are in Device Management Tracking and Playback.'}</div>
         )}
       </Box>
     )}
-    {movementSegments.some(segment => segment.length > 1) && activeTrip?.status !== 'in_progress' && (
-      <Box sx={{ position: 'absolute', top: 20, left: 20, zIndex: 1000, bgcolor: 'rgba(37, 99, 235, 0.92)', color: '#ffffff', px: 2, py: 1, borderRadius: 1.5, fontSize: 13, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 1, boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
-        <Navigation sx={{ fontSize: 16 }} />
-        Live tracking
-      </Box>
-    )}
-
     {located.length === 0 && lastReported.length === 0 && (
       <Box sx={{ position: 'absolute', top: 20, left: 20, zIndex: 1000, bgcolor: 'rgba(15, 23, 42, 0.85)', color: '#f8fafc', px: 2, py: 1, borderRadius: 1, fontSize: 13, border: '1px solid rgba(255,255,255,0.2)', boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
         No GPS Location Available

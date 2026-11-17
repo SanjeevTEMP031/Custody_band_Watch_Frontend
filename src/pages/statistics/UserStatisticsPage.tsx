@@ -234,7 +234,7 @@ export default function UserStatisticsPage() {
             <TableBody>
               {users.map(user => (
                 <TableRow key={user.id} hover>
-                  <TableCell sx={cell}>{user.company || 'Trackin360 Global'}</TableCell>
+                  <TableCell sx={cell}>{user.company || 'TrackGuard 360'}</TableCell>
                   <TableCell sx={{ ...cell, fontWeight: 600 }}>{user.login_name ?? user.email}</TableCell>
                   <TableCell sx={cell}>{user.contact ?? user.full_name ?? '-'}</TableCell>
                   <TableCell sx={cell}>{user.phone || '+91 98765 43210'}</TableCell>

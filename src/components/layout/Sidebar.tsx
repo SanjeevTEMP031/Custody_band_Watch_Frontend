@@ -173,7 +173,7 @@ export default function Sidebar({
             {!collapsed && (
               <div className="brand-text-wrapper">
                 <span className="brand-title">
-                  Trackin<span className="brand-accent">360</span>
+                  TrackGuard <span className="brand-accent">360</span>
                 </span>
                 <span className="brand-badge">GPS &amp; MONITORING</span>
               </div>
@@ -254,7 +254,7 @@ export default function Sidebar({
             type="button"
             className="sidebar-logout-btn"
             onClick={handleLogout}
-            title="Sign out from Trackin360"
+            title="Sign out from TrackGuard 360"
           >
             <LogOut size={18} className="logout-icon" />
             {!collapsed && <span className="logout-label">Logout</span>}

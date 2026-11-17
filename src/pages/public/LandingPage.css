@@ -259,6 +259,8 @@
 .landing-page .footer-bottom { min-height: 56px; padding: 14px 0; display: flex; justify-content: space-between; align-items: center; gap: 18px; border-top: 1px solid rgba(160,190,212,.15); color: #91a5b5; font-size: 10px; }
 .landing-page .footer-bottom > div { display: flex; gap: 17px; }
 .landing-page .footer-concept { color: #677d8f; text-align: right; }
+.landing-page .powered-by-purview { border-top: 1px solid rgba(160,190,212,.15); color: #91a5b5; }
+.landing-page .powered-by-purview strong { color: #ffffff; }
 
 @media (max-width: 1000px) {
   .landing-page .main-nav { gap: 17px; }

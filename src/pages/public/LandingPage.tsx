@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import LandingMap from './LandingMap';
 import HeroMapCard from './HeroMapCard';
+import PoweredByFooter from '../../components/common/PoweredByFooter';
 import { subscribeToDevices } from '../../lib/firebase';
 import type { Device } from '../../services/api';
 import './LandingPage.css';
@@ -116,9 +117,9 @@ function Icon({ name, size = 20, className = '' }: {
 
 function Brand({ light = false }) {
   return (
-    <a className={`brand${light ? ' brand-light' : ''}`} href="#home" aria-label="Trackin360 home">
+    <a className={`brand${light ? ' brand-light' : ''}`} href="#home" aria-label="TrackGuard 360 home">
       <span className="brand-mark"><span /><span /><span /></span>
-      <span>trackin<span className="brand-blue">360</span></span>
+      <span>TrackGuard <span className="brand-blue">360</span></span>
       <span className="brand-badge-c05">C05 ECOSYSTEM</span>
     </a>
   );
@@ -206,7 +207,7 @@ function LandingPage() {
 
               <p className="hero-description">
                 The enterprise standard in electronic offender monitoring and secure parole enforcement.
-                Powered by the <strong>Trackin360 C05 4G Non-Removable GPS Tracking Bracelet</strong> with
+                Powered by the <strong>TrackGuard 360 C05 4G Non-Removable GPS Tracking Bracelet</strong> with
                 dual-circuit optical cut detection, quad-layer hybrid positioning, and continuous biometric vital signs.
               </p>
 
@@ -234,7 +235,7 @@ function LandingPage() {
           </div>
 
           <div className="hero-bottom container">
-            <span>OFFICIAL TRACKIN360 C05 HARDWARE INTEGRATION</span>
+            <span>OFFICIAL TRACKGUARD 360 C05 HARDWARE INTEGRATION</span>
             <div>
               <i></i> Quad GPS+BDS+WiFi+LBS
               <i></i> MNYD Protocol v2.1
@@ -314,10 +315,10 @@ function LandingPage() {
         <section className="section hardware-section" id="devices">
           <div className="container hardware-layout">
             <div className="hardware-info-col">
-              <div className="eyebrow"><span className="eyebrow-line" /> TRACKIN360 HARDWARE PROFILE</div>
-              <h2>Trackin360 C05 4G Tamper-Proof<br />Tracking Bracelet.</h2>
+              <div className="eyebrow"><span className="eyebrow-line" /> TRACKGUARD 360 HARDWARE PROFILE</div>
+              <h2>TrackGuard 360 C05 4G Tamper-Proof<br />Tracking Bracelet.</h2>
               <p>
-                Engineered by Trackin360 specifically for criminal justice parole,
+                Engineered by TrackGuard 360 specifically for criminal justice parole,
                 court-ordered electronic monitoring, dementia wandering safeguards, and hospital prisoner transfers.
               </p>
 
@@ -426,7 +427,7 @@ function LandingPage() {
             <div className="workflow-heading">
               <div className="eyebrow"><span className="eyebrow-line" /> PROTOCOL &amp; DISPATCH LIFECYCLE</div>
               <h2>From Physical Strap<br />to Judicial Decision.</h2>
-              <p>How the Trackin360 C05 bracelet integrates seamlessly with cloud dispatch and supervisory field officers.</p>
+              <p>How the TrackGuard 360 C05 bracelet integrates seamlessly with cloud dispatch and supervisory field officers.</p>
             </div>
 
             <div className="steps-track">
@@ -538,7 +539,7 @@ function LandingPage() {
               <Brand light />
               <p>
                 Continuous electronic custody monitoring &amp; judicial supervision platforms.
-                Integrating the Trackin360 C05 4G Tamper-Proof Smartwatch with enterprise cloud dispatch.
+                Integrating the TrackGuard 360 C05 4G Tamper-Proof Smartwatch with enterprise cloud dispatch.
               </p>
               <span className="footer-disclaimer">
                 Complies with judicial chain-of-custody and high-security corrections standards.
@@ -563,17 +564,18 @@ function LandingPage() {
 
             <div className="footer-column">
               <b>Deployment</b>
-              <p>Trackin360 Electronic Monitoring Systems</p>
+              <p>TrackGuard 360 Electronic Monitoring Systems</p>
               <p className="footer-disclaimer">Global Hardware OEM & ODM Solutions.</p>
             </div>
           </div>
 
           <div className="footer-bottom">
-            <span>&copy; {new Date().getFullYear()} Trackin360 Electronic Monitoring Solutions. All rights reserved.</span>
+            <span>&copy; {new Date().getFullYear()} TrackGuard 360 Electronic Monitoring Solutions. All rights reserved.</span>
             <span>MNYD Protocol v2.1 &bull; IP68 Submersible &bull; AES-256 Encrypted</span>
             <span className="footer-concept">Production Enterprise Release</span>
           </div>
         </div>
+        <PoweredByFooter />
       </footer>
     </div>
   );

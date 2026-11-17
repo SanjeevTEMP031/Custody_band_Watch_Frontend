@@ -343,7 +343,7 @@ export default function AlarmStatisticsPage() {
                 <TableCell sx={cell}>{device?.device_name ?? device?.serial_number ?? alert.device_name ?? '-'}</TableCell>
                 <TableCell sx={cell}>{device?.device_model ?? alert.device_model ?? 'C05 Watch'}</TableCell>
                 <TableCell sx={{ ...cell, fontFamily: 'monospace', fontWeight: 600 }}>{device?.imei ?? alert.imei ?? '-'}</TableCell>
-                <TableCell sx={cell}>{device?.company ?? (alert as any).company ?? 'Trackin360 Global'}</TableCell>
+                <TableCell sx={cell}>{device?.company ?? (alert as any).company ?? 'TrackGuard 360'}</TableCell>
                 <TableCell sx={{ ...cell, fontWeight: 600, color: '#dc2626' }}>{alert.message || alert.type}</TableCell>
                 <TableCell sx={cell}>{displayTime(alert.created_at)}</TableCell>
                 <TableCell sx={cell}>{displayTime(alert.location_time)}</TableCell>

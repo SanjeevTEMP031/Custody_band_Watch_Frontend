@@ -31,6 +31,7 @@ export function parseTimestamp(val: unknown): number | null {
     // If in seconds (10 digits), convert to ms
     return val < 1e11 ? val * 1000 : val
   }
+
   if (typeof val === 'string') {
     const parsed = Date.parse(val)
     return isNaN(parsed) ? null : parsed
@@ -74,9 +75,11 @@ export function extractLatestBattery(data: Record<string, any>): number | null {
   const candidates: Candidate[] = []
 
   const addCandidate = (val: unknown, timeVal: unknown, priority: number) => {
-    if (typeof val === 'number' && !isNaN(val) && val >= 0 && val <= 100) {
+    if (val !== null && val !== undefined && val !== '') {
+      const percentage = Number(val)
+      if (!Number.isFinite(percentage) || percentage < 0 || percentage > 100) return
       const time = parseTimestamp(timeVal) ?? 0
-      candidates.push({ value: Math.round(val), time, priority })
+      candidates.push({ value: Math.round(percentage), time, priority })
     }
   }
 
@@ -93,12 +96,11 @@ export function extractLatestBattery(data: Record<string, any>): number | null {
     data.latest?.location?.received_at ?? data.latest?.location?.device_timestamp,
     9
   )
-
-  // 3. Nested last_location
+  // 3. Nested latest.sos_alarm
   addCandidate(
-    data.last_location?.battery_level ?? data.last_location?.battery_percent,
-    data.last_location?.received_at ?? data.last_location?.device_timestamp,
-    8
+    data.latest?.sos_alarm?.battery_percent ?? data.latest?.sos_alarm?.battery,
+    data.latest?.sos_alarm?.received_at ?? data.latest?.sos_alarm?.gps_time,
+    7
   )
 
   // 4. Root level fields with general update/seen timestamps
@@ -108,6 +110,13 @@ export function extractLatestBattery(data: Record<string, any>): number | null {
   addCandidate(data.battery_pct, rootTime, 6)
   addCandidate(data.battery_level, rootTime, 5)
   addCandidate(data.battery, rootTime, 4)
+
+  // 5. Legacy nested last_location
+  addCandidate(
+    data.last_location?.battery_level ?? data.last_location?.battery_percent,
+    data.last_location?.received_at ?? data.last_location?.device_timestamp,
+    3
+  )
 
   if (candidates.length === 0) return null
 
@@ -124,6 +133,8 @@ import {
   collectLastReportedGpsCandidates,
   collectFirestoreGpsCandidates,
   logGpsValidationDiagnostics,
+  normalizeFirestoreGpsLog,
+  normalizeVerifiedGpsFix,
   selectNewestLastReportedGpsLocation,
   selectNewestVerifiedGpsCandidate,
 } from '../services/gpsNormalization'
@@ -195,16 +206,22 @@ export function extractLatestGps(
     : null
   const candidates = collectFirestoreGpsCandidates(data, previous)
   const latest = data.latest && typeof data.latest === 'object' ? data.latest : {}
-  const packetCandidates = ['location', 'location_on_demand', 'other'].flatMap((key) => {
+  const packetCandidates = ['location', 'location_on_demand', 'sos_alarm', 'other'].flatMap((key) => {
     const location = latest[key]
     if (!location || typeof location !== 'object' || typeof location.raw !== 'string') return []
     const parsed = parseRawGpsPacket(location.raw)
-    if (!parsed) return []
+    if (
+      !parsed ||
+      location.gps_fix === false ||
+      location.gps_valid === false ||
+      location.gps_status === 'V'
+    ) return []
     return [{
       name: `latest.${key}.raw`,
       record: {
         ...location,
         ...parsed,
+        gps_fix: location.gps_fix ?? parsed.gps_fix,
         gps_status: parsed.gps_fix ? 'A' : 'V',
       },
     }]
@@ -245,8 +262,7 @@ export function extractLatestGps(
 }
 
 /**
- * Checks if the device is currently online according to backend rules:
- * Heartbeat or location received within 300 seconds (5 minutes).
+ * Considers a device online when its last communication was within 11 minutes.
  */
 export function isDeviceOnline(data: Record<string, any>): boolean {
   if (data.deleted_at != null) return false
@@ -258,11 +274,11 @@ export function isDeviceOnline(data: Record<string, any>): boolean {
     parseTimestamp(data.updated_at) ??
     parseTimestamp(data.received_at) ??
     parseTimestamp(data.last_location?.received_at) ??
-    parseTimestamp(data.latest?.location?.received_at)
+    parseTimestamp(data.latest?.location?.received_at) ??
+    parseTimestamp(data.latest?.location_on_demand?.received_at)
 
   if (lastTime != null) {
-    // 300 seconds threshold (5 minutes)
-    return now - lastTime <= 300 * 1000
+    return now >= lastTime && now - lastTime <= 10 * 60 * 1000
   }
 
   const conn = String(data.connection_status || data.status || '').toLowerCase()
@@ -312,9 +328,34 @@ export function mapFirestoreDocToDevice(
   const deviceName = isDemo || !rawWearer ? `Watch #${id.slice(-6)}` : rawWearer
 
   const imei = data.imei || data.device_id || data.vendor_device_id || id
+  const latest = data.latest && typeof data.latest === 'object' ? data.latest : {}
+  const latestStatus = latest.status ?? {}
+  const latestLocation = latest.location ?? latest.location_on_demand ?? latest.sos_alarm ?? {}
+  const latestHeartRate = latest.heart_rate ?? {}
+  const latestBloodPressure = latest.blood_pressure ?? {}
+  const bloodPressureValue =
+    data.blood_pressure ??
+    (latestBloodPressure.systolic != null && latestBloodPressure.diastolic != null
+      ? `${latestBloodPressure.systolic}/${latestBloodPressure.diastolic}`
+      : latestBloodPressure)
+  const latestSleep = latest.sleep ?? latest.sleep_report ?? latest.sleep_allday
+  const sleep = latestSleep && typeof latestSleep === 'object'
+    ? ([
+        latestSleep.awake_min != null ? `Awake: ${latestSleep.awake_min} min` : null,
+        latestSleep.light_min != null ? `Light: ${latestSleep.light_min} min` : null,
+        latestSleep.deep_min != null ? `Deep: ${latestSleep.deep_min} min` : null,
+        latestSleep.total_min != null ? `Total: ${latestSleep.total_min} min` : null,
+        latestSleep.sleep_min != null ? `Sleep: ${latestSleep.sleep_min} min` : null,
+        latestSleep.date != null ? String(latestSleep.date) : null,
+      ].filter(Boolean).join(', ') || data.sleep) ?? null
+    : latestSleep ?? data.sleep ?? null
+  const heartRate = latestHeartRate.heart_rate_bpm ?? data.heart_rate_bpm ?? data.heart_rate ?? null
+  const bloodOxygen = latest.blood_oxygen?.spo2_percent ?? data.spo2_percent ?? data.blood_oxygen ?? null
+  const bloodGlucose = latest.blood_glucose?.glucose_mmol_l ?? data.glucose_mmol_l ?? data.blood_glucose ?? null
 
   return {
     id: data.id ?? id,
+    device_id: String(imei),
     device_name: deviceName,
     company: data.company ?? data.tenant_id ?? null,
     parent_customer: data.parent_customer ?? null,
@@ -323,17 +364,31 @@ export function mapFirestoreDocToDevice(
     device_model: data.model ?? data.device_model ?? 'Huateng C05',
     activation_time: data.activated_at ?? data.activation_time ?? null,
     expire_time: data.expires_at ?? data.expire_time ?? null,
-    heart_rate: data.heart_rate_bpm ?? data.heart_rate ?? null,
-    blood_pressure: data.blood_pressure ?? null,
-    temperature: data.temperature ?? null,
-    step_counter: data.steps ?? data.step_counter ?? null,
-    sleep: data.sleep ?? null,
-    blood_oxygen: data.blood_oxygen ?? null,
+    heart_rate: heartRate,
+    heart_rate_bpm: heartRate,
+    hrv: latestHeartRate.hrv ?? data.hrv ?? null,
+    blood_pressure: typeof bloodPressureValue === 'object' && bloodPressureValue !== null
+      ? `${bloodPressureValue.systolic ?? ''}${bloodPressureValue.systolic != null && bloodPressureValue.diastolic != null ? '/' : ''}${bloodPressureValue.diastolic ?? ''}`
+      : bloodPressureValue,
+    systolic: latestBloodPressure.systolic ?? data.systolic ?? null,
+    diastolic: latestBloodPressure.diastolic ?? data.diastolic ?? null,
+    temperature: latest.temperature?.temperature_c ?? data.temperature_c ?? data.temperature ?? null,
+    step_counter: data.steps ?? data.step_counter ?? latestStatus.steps ?? latestLocation.steps ?? null,
+    steps: data.steps ?? data.step_counter ?? latestStatus.steps ?? latestLocation.steps ?? null,
+    sleep,
+    blood_oxygen: bloodOxygen,
+    blood_glucose: bloodGlucose,
+    glucose_mmol_l: bloodGlucose,
     created_at: data.created_at ? String(data.created_at) : null,
     serial_number: imei,
     imei: imei,
     status: online ? 'active' : 'offline',
     battery_pct: batteryPct,
+    battery_percent: batteryPct,
+    battery_status: data.battery_status ?? (batteryPct == null ? null : batteryPct > 20 ? 'normal' : 'low'),
+    is_charging: Boolean(data.is_charging ?? data.charging ?? false),
+    charging: Boolean(data.charging ?? data.is_charging ?? false),
+    charge_status: data.charge_status ?? (data.is_charging || data.charging ? 'charging' : 'discharging'),
     last_seen: lastSeenStr,
     last_latitude: gps.latitude,
     last_longitude: gps.longitude,
@@ -343,11 +398,35 @@ export function mapFirestoreDocToDevice(
       has_gps_fix: gps.hasGpsFix,
       gps_update_time: gps.gpsUpdateTime,
       gps_fix_source: gps.gpsSource,
+      gps_source: gps.gpsSource,
+      gps_fix: gps.hasGpsFix,
+      gps_valid: gps.hasGpsFix,
       gps_status: data.gps_status ?? data.validity ?? null,
       gps_last_fix: data.gps_last_fix ?? data.last_fix ?? null,
       gps_last_known_location: data.last_known_location ?? lastReportedGps,
       speed_kmh: gps.speed_kmh,
+      speed: gps.speed_kmh,
       heading: gps.heading,
+      direction_deg: gps.heading ?? data.direction_deg ?? latestLocation.direction_deg ?? null,
+      altitude_m: data.altitude_m ?? latestLocation.altitude_m ?? null,
+      satellites: data.satellites ?? latestLocation.satellites ?? null,
+      signal_percent: data.signal_percent ?? latestLocation.signal_percent ?? null,
+      gsm_signal: data.gsm_signal ?? data.signal_percent ?? latestLocation.signal_percent ?? null,
+      rolls: data.rolls ?? latestLocation.rolls ?? null,
+      alarms: data.alarms ?? latestLocation.alarms ?? null,
+      cell_mcc: data.cell_mcc ?? latestLocation.cell_mcc ?? null,
+      cell_mnc: data.cell_mnc ?? latestLocation.cell_mnc ?? null,
+      cells: data.cells ?? latestLocation.cells ?? null,
+      wifi: data.wifi ?? latestLocation.wifi ?? null,
+      nearby_wifi_count: data.nearby_wifi_count ?? latestLocation.nearby_wifi_count ?? null,
+      mileage_km: data.mileage_km ?? latestStatus.mileage_km ?? null,
+      sleep_report: data.sleep_report ?? latest.sleep_report ?? null,
+      sleep_allday: data.sleep_allday ?? latest.sleep_allday ?? null,
+      latest,
+      last_packet_received: lastSeenStr,
+      last_valid_gps_time: gps.gpsUpdateTime,
+      tcp_connected: data.tcp_connected ?? null,
+      maps_url: data.maps_url ?? null,
       wearer_name: isDemo ? null : (data.wearer_name ?? data.assigned_person_name ?? null),
       connection_status: online ? 'online' : 'offline',
       tamper_status: data.tamper_status ?? 'normal',
@@ -392,6 +471,169 @@ export function subscribeToDevices(
   )
 }
 
+const DEVICE_TELEMETRY_FIELDS = [
+  'battery',
+  'battery_pct',
+  'battery_percent',
+  'battery_status',
+  'is_charging',
+  'charging',
+  'charge_status',
+  'heart_rate',
+  'heart_rate_bpm',
+  'hrv',
+  'blood_pressure',
+  'systolic',
+  'diastolic',
+  'temperature',
+  'step_counter',
+  'steps',
+  'sleep',
+  'sleep_report',
+  'sleep_allday',
+  'blood_oxygen',
+  'blood_glucose',
+  'glucose_mmol_l',
+  'altitude_m',
+  'satellites',
+  'signal_percent',
+  'gsm_signal',
+  'rolls',
+  'alarms',
+  'cell_mcc',
+  'cell_mnc',
+  'cells',
+  'wifi',
+  'nearby_wifi_count',
+  'mileage_km',
+  'direction_deg',
+  'gps_last_fix',
+  'gps_last_known_location',
+  'last_seen',
+  'last_packet_received',
+  'status',
+  'connection_status',
+  'online',
+  'is_online',
+  'is_active',
+] as const
+
+const DEVICE_POSITION_FIELDS = [
+  'last_latitude',
+  'last_longitude',
+  'latitude',
+  'longitude',
+  'gps_update_time',
+  'last_valid_gps_time',
+  'gps_fix_source',
+  'gps_source',
+  'has_gps_fix',
+  'gps_fix',
+  'gps_valid',
+  'gps_locked',
+  'gps_status',
+  'speed_kmh',
+  'speed',
+  'heading',
+  'maps_url',
+] as const
+
+function deviceIdentifiers(device: Device): string[] {
+  return [device.device_id, device.imei, device.serial_number, String(device.id)]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => value.trim())
+}
+
+/**
+ * Combines REST device metadata with Firestore's current TCP telemetry.
+ * Firestore contributes live GPS only when its fix passed validation.
+ */
+export function mergeDevicesWithFirestore(
+  apiDevices: readonly Device[],
+  firestoreDevices: readonly Device[]
+): Device[] {
+  const firestoreByIdentifier = new Map<string, Device>()
+  for (const device of firestoreDevices) {
+    for (const identifier of deviceIdentifiers(device)) {
+      firestoreByIdentifier.set(identifier, device)
+    }
+  }
+
+  const matchedFirestore = new Set<Device>()
+  const merged = apiDevices.map((apiDevice) => {
+    const firestoreDevice = deviceIdentifiers(apiDevice)
+      .map((identifier) => firestoreByIdentifier.get(identifier))
+      .find((device): device is Device => device !== undefined)
+    if (!firestoreDevice) return apiDevice
+    matchedFirestore.add(firestoreDevice)
+
+    const result: Device = { ...apiDevice }
+    const firestoreSeen = parseTimestamp(firestoreDevice.last_seen)
+    const apiSeen = parseTimestamp(apiDevice.last_seen)
+    const firestoreIsNewer = firestoreSeen !== null &&
+      (apiSeen === null || firestoreSeen >= apiSeen)
+    for (const field of DEVICE_TELEMETRY_FIELDS) {
+      const value = firestoreDevice[field]
+      const currentValue = apiDevice[field]
+      const isConnectionState = field === 'status' ||
+        field === 'connection_status' ||
+        field === 'online' ||
+        field === 'is_online' ||
+        field === 'is_active' ||
+        field === 'last_seen'
+      if (
+        value !== undefined &&
+        value !== null &&
+        value !== '' &&
+        (
+          isConnectionState ||
+          currentValue === undefined ||
+          currentValue === null ||
+          currentValue === '' ||
+          firestoreIsNewer
+        )
+      ) {
+        Object.assign(result, { [field]: value })
+      }
+    }
+    const firestoreFix = normalizeVerifiedGpsFix(firestoreDevice)
+    const apiFix = normalizeVerifiedGpsFix(apiDevice)
+    if (
+      firestoreFix &&
+      (!apiFix || firestoreFix.timestamp > apiFix.timestamp)
+    ) {
+      for (const field of DEVICE_POSITION_FIELDS) {
+        const value = firestoreDevice[field]
+        if (value !== undefined && value !== null && value !== '') {
+          Object.assign(result, { [field]: value })
+        }
+      }
+      Object.assign(result, {
+        last_latitude: firestoreFix.latitude,
+        last_longitude: firestoreFix.longitude,
+        latitude: firestoreFix.latitude,
+        longitude: firestoreFix.longitude,
+        gps_update_time: firestoreFix.recordedAt,
+        recorded_at: firestoreFix.recordedAt,
+        gps_time: firestoreFix.recordedAt,
+        gps_fix: true,
+        gps_valid: true,
+        has_gps_fix: true,
+        gps_source: firestoreFix.source,
+        gps_fix_source: firestoreFix.source,
+        coordinate_source: null,
+      })
+    }
+    result.device_id = firestoreDevice.device_id || apiDevice.device_id
+    return result
+  })
+
+  for (const device of firestoreDevices) {
+    if (!matchedFirestore.has(device)) merged.push(device)
+  }
+  return merged
+}
+
 /**
  * Subscribes to a single device document in real-time.
  */
@@ -433,6 +675,65 @@ export interface TripPoint {
   heading?: number | null
   accuracy_m?: number | null
   battery_pct?: number | null
+}
+
+function mapFirestoreGpsLogToTripPoint(data: Record<string, unknown>): TripPoint | null {
+  const fix = normalizeFirestoreGpsLog(data)
+  if (!fix) return null
+  const numberOrNull = (value: unknown): number | null => {
+    if (value == null || value === '') return null
+    const number = Number(value)
+    return Number.isFinite(number) ? number : null
+  }
+  return {
+    latitude: fix.latitude,
+    longitude: fix.longitude,
+    timestamp: fix.recordedAt,
+    speed_kmh: numberOrNull(data.speed_kmh ?? data.speed),
+    heading: numberOrNull(data.direction_deg ?? data.heading ?? data.bearing ?? data.course),
+    accuracy_m: numberOrNull(data.accuracy_meters ?? data.accuracy_m),
+    battery_pct: numberOrNull(data.battery_percent ?? data.battery_pct),
+  }
+}
+
+/**
+ * Subscribes to verified GPS log points so route views update as ingest logs arrive.
+ */
+export function subscribeToFirestoreLocationHistory(
+  deviceId: string,
+  maxPoints: number,
+  onUpdate: (points: TripPoint[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe {
+  const logsQuery = query(
+    collection(db, 'logs'),
+    where('device_id', '==', deviceId),
+    where('type', 'in', ['location', 'location_on_demand', 'sos_alarm']),
+    firestoreLimit(maxPoints)
+  )
+
+  return onSnapshot(
+    logsQuery,
+    (snapshot) => {
+      const points = new Map<string, TripPoint>()
+      snapshot.forEach((docSnapshot) => {
+        const point = mapFirestoreGpsLogToTripPoint(docSnapshot.data())
+        if (!point) return
+        const key = `${point.timestamp}|${point.latitude}|${point.longitude}`
+        points.set(key, point)
+      })
+      onUpdate(
+        [...points.values()].sort(
+          (first, second) =>
+            (parseTimestamp(first.timestamp) ?? 0) - (parseTimestamp(second.timestamp) ?? 0)
+        )
+      )
+    },
+    (error) => {
+      console.error(`Firestore GPS logs subscription failed for device ${deviceId}:`, error)
+      onError?.(error)
+    }
+  )
 }
 
 export interface TripLocation {
@@ -880,14 +1181,39 @@ export function subscribeToDeviceTrips(
 }
 
 /**
- * Retrieves raw GPS telemetry history from Firestore (`devices/{id}/history` or `locations`).
- * Maps them into sorted, valid TripPoints.
+ * Retrieves verified GPS telemetry from the TCP ingest `logs` collection,
+ * falling back to legacy history collections when no log fixes are available.
  */
 export async function fetchFirestoreLocationHistory(
   deviceId: string,
   maxPoints: number = 500
 ): Promise<TripPoint[]> {
-  const points: TripPoint[] = []
+  const points = new Map<string, TripPoint>()
+
+  // The TCP ingest script writes one record per message to logs/{autoId}.
+  try {
+    const logsQuery = query(
+      collection(db, 'logs'),
+      where('device_id', '==', deviceId),
+      where('type', 'in', ['location', 'location_on_demand', 'sos_alarm']),
+      firestoreLimit(maxPoints)
+    )
+    const logsSnapshot = await getDocs(logsQuery)
+    logsSnapshot.forEach((docSnapshot) => {
+      const point = mapFirestoreGpsLogToTripPoint(docSnapshot.data())
+      if (!point) return
+      const key = `${point.timestamp}|${point.latitude}|${point.longitude}`
+      points.set(key, point)
+    })
+  } catch (error) {
+    console.warn(`Firestore GPS logs query failed for device ${deviceId}:`, error)
+  }
+
+  if (points.size > 0) {
+    return [...points.values()].sort(
+      (first, second) => (parseTimestamp(first.timestamp) ?? 0) - (parseTimestamp(second.timestamp) ?? 0)
+    )
+  }
 
   // 1. Try devices/{id}/history subcollection first
   try {
@@ -897,24 +1223,28 @@ export async function fetchFirestoreLocationHistory(
       const data = docSnap.data()
       const lat = data.latitude ?? data.lat
       const lon = data.longitude ?? data.lon ?? data.lng
-      if (isValidGpsCoord(lat, lon)) {
-        points.push({
-          latitude: Number(lat),
-          longitude: Number(lon),
-          timestamp: data.timestamp ?? data.received_at ?? new Date().toISOString(),
-          speed_kmh: data.speed_kmh ?? data.speed ?? null,
-          heading: data.heading ?? data.bearing ?? data.course ?? null,
-          accuracy_m: data.accuracy_meters ?? null,
-          battery_pct: data.battery ?? data.battery_percent ?? null,
-        })
+      if (data.gps_fix === true || data.gps_valid === true) {
+        const timestamp = data.gps_time ?? data.timestamp ?? data.at ?? data.location_time ?? data.received_at
+        const fix = normalizeFirestoreGpsLog({ ...data, type: 'location', gps_time: timestamp })
+        if (fix && isValidGpsCoord(lat, lon)) {
+          points.set(fix.key, {
+            latitude: Number(lat),
+            longitude: Number(lon),
+            timestamp: fix.recordedAt,
+            speed_kmh: data.speed_kmh ?? data.speed ?? null,
+            heading: data.heading ?? data.bearing ?? data.course ?? null,
+            accuracy_m: data.accuracy_meters ?? null,
+            battery_pct: data.battery ?? data.battery_percent ?? null,
+          })
+        }
       }
     })
   } catch (err) {
-    // Continue to next source
+    console.warn(`Firestore GPS history query failed for device ${deviceId}:`, err)
   }
 
-  // 2. If subcollection was empty, query top-level `locations` collection
-  if (points.length === 0) {
+  // 2. If no verified records were found, check the legacy top-level locations collection.
+  if (points.size === 0) {
     try {
       const locCol = collection(db, 'locations')
       const q = query(locCol, where('device_id', '==', deviceId), firestoreLimit(maxPoints))
@@ -923,31 +1253,33 @@ export async function fetchFirestoreLocationHistory(
         const data = docSnap.data()
         const lat = data.latitude ?? data.lat
         const lon = data.longitude ?? data.lon ?? data.lng
-        if (isValidGpsCoord(lat, lon)) {
-          points.push({
-            latitude: Number(lat),
-            longitude: Number(lon),
-            timestamp: data.device_timestamp ?? data.timestamp ?? data.received_at ?? new Date().toISOString(),
-            speed_kmh: data.speed_kmh ?? null,
-            heading: data.heading_degrees ?? data.heading ?? null,
-            accuracy_m: data.accuracy_meters ?? null,
-            battery_pct: data.battery_level ?? null,
-          })
+        if (data.gps_fix === true || data.gps_valid === true) {
+          const timestamp = data.gps_time ?? data.device_timestamp ?? data.timestamp ?? data.received_at
+          const fix = normalizeFirestoreGpsLog({ ...data, type: 'location', gps_time: timestamp })
+          if (fix && isValidGpsCoord(lat, lon)) {
+            points.set(fix.key, {
+              latitude: Number(lat),
+              longitude: Number(lon),
+              timestamp: fix.recordedAt,
+              speed_kmh: data.speed_kmh ?? null,
+              heading: data.heading_degrees ?? data.heading ?? null,
+              accuracy_m: data.accuracy_meters ?? null,
+              battery_pct: data.battery_level ?? null,
+            })
+          }
         }
       })
     } catch (err) {
-      // Continue
+      console.warn(`Legacy Firestore location query failed for device ${deviceId}:`, err)
     }
   }
 
   // Sort ascending by timestamp
-  points.sort((a, b) => {
+  return [...points.values()].sort((a, b) => {
     const ta = parseTimestamp(a.timestamp) ?? 0
     const tb = parseTimestamp(b.timestamp) ?? 0
     return ta - tb
   })
-
-  return points
 }
 
 /**
@@ -969,7 +1301,7 @@ export function buildTripFromPoints(
   const totalKm = calculateRouteDistance(validPoints)
 
   return {
-    id: `history_${deviceId}_${Date.now()}`,
+    id: `history_${deviceId}_${Date.parse(startPt.timestamp) || startPt.timestamp}`,
     device_id: deviceId,
     wearer_name: wearerName ?? null,
     status: 'completed',

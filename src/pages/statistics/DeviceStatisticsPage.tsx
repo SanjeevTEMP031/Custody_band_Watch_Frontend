@@ -407,7 +407,7 @@ export default function DeviceStatisticsPage() {
                 const isOnline = (device?.status || '').toLowerCase() === 'online'
                 return (
                   <TableRow key={device.id} hover>
-                    <TableCell sx={cell}>{device.company || 'Trackin360 Global'}</TableCell>
+                    <TableCell sx={cell}>{device.company || 'TrackGuard 360'}</TableCell>
                     <TableCell sx={{ ...cell, fontWeight: 600 }}>{device.device_name ?? device.serial_number}</TableCell>
                     <TableCell sx={{ ...cell, fontFamily: 'monospace', fontWeight: 600 }}>{device.imei}</TableCell>
                     <TableCell sx={cell}>{device.device_sim || '+91 98765 43210'}</TableCell>

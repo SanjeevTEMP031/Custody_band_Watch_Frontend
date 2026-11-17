@@ -308,7 +308,7 @@ export default function UsersPage() {
               size="small"
               label="Login Email"
               type="email"
-              placeholder="e.g. john@trackin360.com"
+              placeholder="e.g. john@example.com"
               value={newUserEmail}
               onChange={e => setNewUserEmail(e.target.value)}
             />

@@ -22,7 +22,7 @@ export default class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    console.error('Trackin360 Dashboard ErrorBoundary caught:', error, errorInfo)
+    console.error('TrackGuard 360 Dashboard ErrorBoundary caught:', error, errorInfo)
   }
 
   handleReload = () => {

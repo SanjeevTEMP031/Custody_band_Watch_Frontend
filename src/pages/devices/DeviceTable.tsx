@@ -64,6 +64,8 @@ const columns: { label: string; value: (device: Device) => string | number }[] =
   } },
   { label: 'Sleep', value: d => d.sleep || 'N/A' },
   { label: 'Blood Oxygen', value: d => d.blood_oxygen != null ? `${d.blood_oxygen}%` : 'N/A' },
+  { label: 'Blood glucose', value: d => d.blood_glucose != null ? `${d.blood_glucose} mmol/L` : 'N/A' },
+  { label: 'HRV', value: d => d.hrv != null ? `${d.hrv} ms` : 'N/A' },
   { label: 'Create Time', value: d => d.created_at ? new Date(d.created_at).toLocaleDateString() : 'N/A' },
   { label: 'Status', value: d => d.status || 'offline' },
   { label: 'Person ID', value: d => d.custody_person_id ?? 'Unassigned' },
@@ -158,7 +160,7 @@ export default function DeviceTable({
   const getColumnWidth = (label: string) => {
     switch (label) {
       case 'Company':
-        return Math.round(230 * scale) // Generous space so "Trackin360 Global" is fully visible
+        return Math.round(230 * scale) // Generous space for the company name
       case 'Device SIM':
         return Math.round(185 * scale) // Generous space so "+91 98765 43210" is fully visible
       case 'Last communication time':
@@ -501,7 +503,7 @@ export default function DeviceTable({
                       <>
                         <Button
                           component={Link}
-                          to={`/admin/monitoring-center?device=${device.id}`}
+                          to={`/admin/location-history?device=${device.id}&tab=map`}
                           startIcon={<LocationOnOutlined sx={{ fontSize: 13 }} />}
                           sx={{ ...action, bgcolor: '#f59e0b', '&:hover': { bgcolor: '#d97706' } }}
                         >

@@ -222,7 +222,7 @@ export default function TripSummaryCard({
           {/* GPS Freshness / Stale Indicator */}
           {isInProgress && (
             isGpsStale ? (
-              <Tooltip title="No GPS update received in past 5 minutes">
+              <Tooltip title="No GPS fix received in the past 15 minutes">
                 <Chip
                   icon={<AlertTriangle size={14} color="#b45309" />}
                   label={`Stale GPS (${relativeTimeStr})`}

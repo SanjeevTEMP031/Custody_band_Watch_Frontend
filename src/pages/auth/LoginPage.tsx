@@ -29,6 +29,7 @@ import { useDispatch } from 'react-redux'
 import { useNavigate } from 'react-router-dom'
 import { login } from '../../store/authSlice'
 import { loginApi } from '../../services/api'
+import PoweredByFooter from '../../components/common/PoweredByFooter'
 import './LoginPage.css'
 
 const loginSchema = z.object({
@@ -145,7 +146,7 @@ function LoginPage() {
             <circle cx="39" cy="20" r="5" fill="#ff9825" />
             <path d="m39 27-2 12 7 11m-7-11-6 10m7-19-9 7m9-7 10 7" fill="none" stroke="#ff9825" strokeWidth="4" strokeLinecap="round" />
           </svg>
-          <Typography className="atlas-brand">TRACKIN360</Typography>
+          <Typography className="atlas-brand">TRACKGUARD 360</Typography>
           <Typography component="h1" className="atlas-title">Welcome back</Typography>
           
         </Box>
@@ -256,6 +257,7 @@ function LoginPage() {
           </Stack>
         </Box>
       </Card>
+      <PoweredByFooter />
     </Box>
   )
 }

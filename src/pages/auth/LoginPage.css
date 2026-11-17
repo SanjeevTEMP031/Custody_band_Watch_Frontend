@@ -3,9 +3,11 @@
   isolation: isolate;
   min-height: 100svh;
   display: grid;
+  grid-template-rows: 1fr auto;
   place-items: center;
   padding: 48px 20px;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   background: radial-gradient(ellipse at 50% 0%, #143967 0%, #0b2343 48%, #06152e 90%);
   color: #edf4ff;
 }
@@ -20,6 +22,8 @@
 }
 .atlas-heading { text-align: center; margin-bottom: 26px; }
 .atlas-login .atlas-brand { font-size: 16px; font-weight: 800; letter-spacing: 3px; margin: 8px 0 20px; }
+.atlas-login .powered-by-purview { color: #a9bfdc; }
+.atlas-login .powered-by-purview strong { color: #edf4ff; }
 .atlas-login .atlas-title { font-size: 26px; font-weight: 750; line-height: 1.25; margin-bottom: 9px; }
 .atlas-login .atlas-subtitle { font-size: 15px; line-height: 1.5; color: #a9bfdc; }
 .atlas-login .MuiOutlinedInput-root { color: #edf4ff; background: rgba(185, 203, 225, .14); border-radius: 12px; }

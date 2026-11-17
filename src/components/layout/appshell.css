@@ -299,6 +299,11 @@
   padding: 24px 28px 48px;
 }
 
+.app-main-viewport > .powered-by-purview {
+  border-top: 1px solid #e2e8f0;
+  background: #ffffff;
+}
+
 /* Mobile Responsiveness */
 @media (max-width: 1024px) {
   .app-main-viewport.sidebar-expanded,

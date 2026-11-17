@@ -6,6 +6,7 @@ import {
   getLatestGpsSnapshot,
   type GpsLocation,
 } from '../../services/api'
+import { subscribeToFirestoreLocationHistory } from '../../lib/firebase'
 import {
   isFreshGpsTimestamp,
   matchLegacyGpsFixToVerifiedHistory,
@@ -41,14 +42,18 @@ interface RouteState {
   historyLoaded: boolean
   firestoreHistoryMismatch: boolean
   latestHistoryMismatch: boolean
+  historyPoints: Map<string, RoutePoint>
+  livePoints: Map<string, RoutePoint>
+  startMarker: L.CircleMarker | null
+  endMarker: L.CircleMarker | null
 }
 
-export const SELECTED_GPS_POLL_INTERVAL_MS = 3_000
+export const SELECTED_GPS_POLL_INTERVAL_MS = 5_000
 export const GPS_TRAIL_CONFIG = {
   dotColor: '#2563EB',
   lineColor: '#2563EB',
   dotRadius: 3,
-  lineWidth: 3,
+  lineWidth: 5,
   minMovementMeters: 5,
 } as const
 
@@ -65,7 +70,6 @@ export type SelectedGpsRouteSegment = Array<{
   timestamp: number
 }>
 
-const HISTORY_REFRESH_INTERVAL_MS = 30_000
 function parsePoint(value: unknown): RoutePoint | null {
   const fix = normalizeVerifiedGpsFix(value)
   if (!fix) return null
@@ -94,6 +98,19 @@ function routeSegments(route: RouteState): SelectedGpsRouteSegment[] {
   })))
 }
 
+function rebuildRoute(map: L.Map | null, route: RouteState, visible: boolean): void {
+  const points = new Map([...route.historyPoints, ...route.livePoints])
+  const sortedPoints = [...points.values()].sort(
+    (first, second) => first.timestamp - second.timestamp
+  )
+  route.segments = []
+  route.keys.clear()
+  route.latest = null
+  route.lastMovementPoint = null
+  for (const point of sortedPoints) addPoint(route, point)
+  syncLayers(map, route, visible)
+}
+
 function getRouteStatus(route: RouteState): SelectedGpsRouteStatus {
   const freshHistoryFix = route.latest && isFreshGpsTimestamp(route.latest.timestamp)
   const freshCurrentFix = route.currentFix && isFreshGpsTimestamp(route.currentFix.timestamp)
@@ -111,6 +128,10 @@ function syncLayers(map: L.Map | null, route: RouteState, visible: boolean): voi
     route.dots.forEach((dot) => dot.remove())
     route.dots = []
     route.dotKeys.clear()
+    route.startMarker?.remove()
+    route.startMarker = null
+    route.endMarker?.remove()
+    route.endMarker = null
     return
   }
   route.segments.forEach((segment, index) => {
@@ -124,13 +145,14 @@ function syncLayers(map: L.Map | null, route: RouteState, visible: boolean): voi
       else {
         route.layers[index] = L.polyline(coordinates, {
           color: GPS_TRAIL_CONFIG.lineColor,
-          weight: GPS_TRAIL_CONFIG.lineWidth,
-          opacity: 0.9,
+          weight: 5,
+          opacity: 1,
           lineJoin: 'round',
           lineCap: 'round',
           className: 'gps-trail-line',
         }).addTo(map)
       }
+      route.layers[index].bringToFront()
     }
     segment.forEach((point) => {
       if (route.dotKeys.has(point.key)) return
@@ -146,6 +168,34 @@ function syncLayers(map: L.Map | null, route: RouteState, visible: boolean): voi
     })
   })
   route.layers.splice(route.segments.length).forEach((layer) => layer.remove())
+
+  const firstPoint = route.segments.find((segment) => segment.length > 0)?.[0]
+  const lastSegment = [...route.segments].reverse().find((segment) => segment.length > 0)
+  const lastPoint = lastSegment?.[lastSegment.length - 1]
+  if (firstPoint) {
+    if (route.startMarker) route.startMarker.setLatLng([firstPoint.latitude, firstPoint.longitude])
+    else {
+      route.startMarker = L.circleMarker([firstPoint.latitude, firstPoint.longitude], {
+        radius: 7,
+        color: '#ffffff',
+        weight: 2,
+        fillColor: '#16a34a',
+        fillOpacity: 1,
+      }).bindTooltip('Route start').addTo(map)
+    }
+  }
+  if (lastPoint) {
+    if (route.endMarker) route.endMarker.setLatLng([lastPoint.latitude, lastPoint.longitude])
+    else {
+      route.endMarker = L.circleMarker([lastPoint.latitude, lastPoint.longitude], {
+        radius: 8,
+        color: '#ffffff',
+        weight: 2,
+        fillColor: '#dc2626',
+        fillOpacity: 1,
+      }).bindTooltip('Latest route point').addTo(map)
+    }
+  }
 }
 
 export function useSelectedGpsRoute(
@@ -162,7 +212,8 @@ export function useSelectedGpsRoute(
   onLastReportedLocation?: (
     location: LastReportedGpsLocation | null,
     currentGpsAvailable: boolean
-  ) => void
+  ) => void,
+  includeHistory = true
 ): void {
   const onFreshPointRef = useRef(onFreshPoint)
   const onLastKnownPointRef = useRef(onLastKnownPoint)
@@ -231,11 +282,15 @@ export function useSelectedGpsRoute(
       historyLoaded: false,
       firestoreHistoryMismatch: false,
       latestHistoryMismatch: false,
+      historyPoints: new Map(),
+      livePoints: new Map(),
+      startMarker: null,
+      endMarker: null,
     }
     routeRef.current = route
     let cancelled = false
     let timer: number | undefined
-    let lastHistoryRefreshAt = 0
+    let apiHistoryRequested = false
     const requestController = new AbortController()
     onRouteChangeRef.current?.([])
     onStatusChangeRef.current?.('loading')
@@ -243,12 +298,27 @@ export function useSelectedGpsRoute(
     const pollLatest = async () => {
       if (cancelled) return
       try {
-        const snapshot = await getLatestGpsSnapshot(deviceId, requestController.signal)
+        const firestorePoint = firestoreLatestRef.current
+        const snapshot = firestorePoint
+          ? { latest: firestorePoint, lastReported: null }
+          : await getLatestGpsSnapshot(deviceId, requestController.signal)
         const latest = snapshot.latest
         const point = latest ? parsePoint(latest) : null
         route.latestApiFix = point
         route.currentFix = point && isFreshGpsTimestamp(point.timestamp) ? point : null
-        route.latestHistoryMismatch = Boolean(point && !route.historyPointKeys.has(point.key))
+        route.latestHistoryMismatch = includeHistory &&
+          Boolean(point && !route.historyPointKeys.has(point.key))
+        if (route.currentFix && !route.livePoints.has(route.currentFix.key)) {
+          route.livePoints.set(route.currentFix.key, route.currentFix)
+          if (route.livePoints.size > 500) {
+            const oldest = [...route.livePoints.values()].reduce((first, next) =>
+              next.timestamp < first.timestamp ? next : first
+            )
+            route.livePoints.delete(oldest.key)
+          }
+          rebuildRoute(map, route, visibleRef.current)
+          onRouteChangeRef.current?.(routeSegments(route))
+        }
         onLastReportedLocationRef.current?.(
           route.currentFix ? null : snapshot.lastReported,
           Boolean(route.currentFix)
@@ -258,9 +328,6 @@ export function useSelectedGpsRoute(
           else onLastKnownPointRef.current?.(latest)
         }
         onStatusChangeRef.current?.(getRouteStatus(route))
-        if (Date.now() - lastHistoryRefreshAt >= HISTORY_REFRESH_INTERVAL_MS) {
-          await refreshHistory()
-        }
       } catch (error) {
         if (!cancelled) {
           const configurationError = error instanceof ApiError && error.configurationError
@@ -274,9 +341,7 @@ export function useSelectedGpsRoute(
       }
     }
 
-    const refreshHistory = async () => {
-      lastHistoryRefreshAt = Date.now()
-      const history = await getGpsHistory(deviceId, 500, requestController.signal)
+    const refreshHistory = (history: GpsLocation[]) => {
       if (cancelled) return
       const points = history
         .map(parsePoint)
@@ -300,14 +365,19 @@ export function useSelectedGpsRoute(
             key: corroboratedLastFix.key,
           }
         : newestHistoryPoint
-      route.historyPointKeys = new Set(sortedPoints.map((point) => point.key))
-      route.historyLatestTimestamp = sortedPoints.length > 0
-        ? sortedPoints[sortedPoints.length - 1].timestamp
-        : null
-      route.historyLoaded = true
-      for (const point of sortedPoints) {
-        if (addPoint(route, point)) syncLayers(map, route, visibleRef.current)
+      for (const point of sortedPoints) route.historyPoints.set(point.key, point)
+      if (route.historyPoints.size > 500) {
+        const newestHistoryPoints = [...route.historyPoints.values()]
+          .sort((first, second) => second.timestamp - first.timestamp)
+          .slice(0, 500)
+        route.historyPoints = new Map(newestHistoryPoints.map((point) => [point.key, point]))
       }
+      route.historyPointKeys = new Set(route.historyPoints.keys())
+      route.historyLatestTimestamp = Math.max(
+        0,
+        ...[...route.historyPoints.values()].map((point) => point.timestamp)
+      ) || null
+      route.historyLoaded = true
       route.latestHistoryMismatch = Boolean(
         route.latestApiFix && !route.historyPointKeys.has(route.latestApiFix.key)
       )
@@ -319,7 +389,7 @@ export function useSelectedGpsRoute(
         !route.historyPointKeys.has(firestorePoint.key) &&
         (route.historyLatestTimestamp === null || firestorePoint.timestamp > route.historyLatestTimestamp)
       )
-      syncLayers(map, route, visibleRef.current)
+      rebuildRoute(map, route, visibleRef.current)
       onRouteChangeRef.current?.(routeSegments(route))
       onStatusChangeRef.current?.(getRouteStatus(route))
       if (lastKnownPoint) {
@@ -348,28 +418,60 @@ export function useSelectedGpsRoute(
       }
     }
 
-    const loadHistory = async () => {
+    const loadApiHistory = async () => {
+      if (apiHistoryRequested || cancelled) return
+      apiHistoryRequested = true
       try {
-        await refreshHistory()
+        const history = await getGpsHistory(deviceId, 500, requestController.signal)
+        refreshHistory(history)
       } catch (error) {
+        apiHistoryRequested = false
         if (!cancelled) {
-          if (error instanceof ApiError && error.configurationError) {
-            onStatusChangeRef.current?.('configuration-error')
-          }
-          console.warn(`Unable to load GPS history for device ${deviceId}.`, error)
+          console.warn(`Unable to load GPS history from the API for ${deviceId}.`, error)
         }
       }
-      if (!cancelled) void pollLatest()
     }
 
-    void loadHistory()
+    const subscribeToHistory = () => subscribeToFirestoreLocationHistory(
+      deviceId,
+      500,
+      (tripPoints) => {
+        const history = tripPoints.map((point) => ({
+          latitude: point.latitude,
+          longitude: point.longitude,
+          recorded_at: point.timestamp,
+          timestamp: point.timestamp,
+          gps_fix: true,
+          gps_valid: true,
+          gps_source: 'watch_tcp',
+          gps_status: 'GPS VALID',
+          accuracy_m: point.accuracy_m ?? null,
+        }))
+        refreshHistory(history)
+      },
+      async (error) => {
+        console.warn(`Firestore GPS log subscription failed for ${deviceId}; using API history.`, error)
+        void loadApiHistory()
+      }
+    )
+
+    let unsubscribeHistory = () => {}
+    if (includeHistory) {
+      unsubscribeHistory = subscribeToHistory()
+      void loadApiHistory()
+    }
+    void pollLatest()
+
     return () => {
       cancelled = true
       requestController.abort()
       if (timer !== undefined) window.clearTimeout(timer)
+      unsubscribeHistory()
       route.layers.forEach((layer) => layer.remove())
       route.dots.forEach((dot) => dot.remove())
+      route.startMarker?.remove()
+      route.endMarker?.remove()
       if (routeRef.current === route) routeRef.current = null
     }
-  }, [enabled, map, deviceId])
+  }, [enabled, map, deviceId, includeHistory])
 }

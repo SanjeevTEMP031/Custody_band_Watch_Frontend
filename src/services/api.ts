@@ -1,5 +1,5 @@
 // =============================================================================
-// Trackin360 / Custody Watch Platform — API Service
+// TrackGuard 360 / Custody Watch Platform — API Service
 // All paths are prefixed with /api/v1 (set via VITE_API_BASE_URL)
 // =============================================================================
 
@@ -9,7 +9,10 @@ import {
   getGpsFixRejectionReasons,
   logGpsValidationDiagnostics,
   mergeVerifiedGpsFixes,
+  normalizeLatestGpsReportMetadata,
+  normalizeVerifiedGpsFix,
   normalizeLastReportedGpsLocation,
+  withDefaultTcpGpsSource,
   selectNewestLastReportedGpsLocation,
   selectNewestVerifiedGpsCandidate,
   unwrapGpsHistoryResponse,
@@ -114,20 +117,54 @@ export interface Device {
   latitude?: number | null
   longitude?: number | null
   speed_kmh?: number | null
+  speed?: number | null
   // telemetry
   battery?: number | null
   battery_pct?: number | null
   battery_percent?: number | null
+  battery_status?: string | null
+  is_charging?: boolean | null
+  charging?: boolean | null
+  charge_status?: string | null
   heart_rate?: number | null
   heart_rate_bpm?: number | null
+  hrv?: number | null
   step_counter?: number | null
   steps?: number | null
   blood_pressure?: string | null
+  systolic?: number | null
+  diastolic?: number | null
   temperature?: number | null
   blood_oxygen?: number | null
+  blood_glucose?: number | null
+  glucose_mmol_l?: number | null
   sleep?: string | null
+  sleep_report?: unknown
+  sleep_allday?: unknown
+  altitude_m?: number | null
+  satellites?: number | null
+  signal_percent?: number | null
+  gsm_signal?: number | null
+  rolls?: number | null
+  alarms?: unknown
+  cell_mcc?: number | string | null
+  cell_mnc?: number | string | null
+  cells?: unknown
+  wifi?: unknown
+  nearby_wifi_count?: number | null
+  mileage_km?: number | null
+  direction_deg?: number | null
   // misc
   connection_status?: string | null
+  last_packet_received?: string | null
+  last_valid_gps_time?: string | null
+  gps_source?: string | null
+  gps_valid?: boolean
+  gps_locked?: boolean
+  gps_current?: boolean
+  tcp_connected?: boolean | null
+  maps_url?: string | null
+  latest?: Record<string, unknown>
   has_gps_fix?: boolean
   gps_fix?: boolean
   gps_status?: string | null
@@ -151,6 +188,9 @@ export interface GpsLocation {
   gps_valid?: boolean | number | string
   gps_source?: string | null
   source?: string | null
+  coordinate_source?: string | null
+  location_is_current?: boolean
+  is_current?: boolean
   status?: string | null
   gps_status?: string | null
   validity?: string | null
@@ -467,6 +507,34 @@ export const getDashboardSummary = getDashboardOverview
 
 /** Normalises a raw device object from the backend into a consistent Device shape */
 function normaliseDevice(d: any, idx: number): Device {
+  const latest = d.latest && typeof d.latest === 'object' ? d.latest : {}
+  const latestStatus = latest.status ?? {}
+  const latestLocation = latest.location ?? {}
+  const latestLocationOnDemand = latest.location_on_demand ?? {}
+  const latestHeartRate = latest.heart_rate ?? {}
+  const latestBloodPressure = latest.blood_pressure ?? {}
+  const firstValue = (...values: unknown[]) =>
+    values.find((value) => value !== undefined && value !== null && value !== '')
+  const serializeMetric = (value: unknown): string | null => {
+    if (value == null || value === '') return null
+    if (typeof value === 'string') return value
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+    if (Array.isArray(value)) return value.map(serializeMetric).filter(Boolean).join(', ')
+    if (typeof value === 'object') {
+      const entries = Object.entries(value as Record<string, unknown>)
+        .filter(([, item]) => item != null && item !== '')
+        .map(([key, item]) => `${key.replaceAll('_', ' ')}: ${serializeMetric(item)}`)
+      return entries.length ? entries.join(', ') : null
+    }
+    return null
+  }
+  const bloodPressureValue = firstValue(
+    d.blood_pressure,
+    latestBloodPressure.systolic != null && latestBloodPressure.diastolic != null
+      ? `${latestBloodPressure.systolic}/${latestBloodPressure.diastolic}`
+      : latestBloodPressure
+  )
+  const sleepValue = firstValue(d.sleep, latest.sleep)
   const isOnline =
     d.online === true ||
     d.is_online === true ||
@@ -476,26 +544,26 @@ function normaliseDevice(d: any, idx: number): Device {
     String(d.connection_status ?? '').toLowerCase() === 'online'
 
   const rawStatus = isOnline ? 'online' : (d.status ? String(d.status).toLowerCase() : 'offline')
-  const lat = d.last_latitude ?? d.latitude ?? null
-  const lng = d.last_longitude ?? d.longitude ?? null
-  const rawSpeed = d.speed_kmh ?? d.speed
-  const gpsStatus = String(
-    d.gps_status ?? d.validity ?? (typeof d.gps_fix === 'string' ? d.gps_fix : d.status) ?? ''
-  ).trim().toUpperCase()
-  const gpsFlagsValid = [d.gps_fix, d.gps_valid].every(
-    (flag) =>
-      flag !== false &&
-      flag !== 0 &&
-      String(flag).trim().toLowerCase() !== 'false' &&
-      String(flag).trim() !== '0' &&
-      String(flag).trim().toUpperCase() !== 'V'
+  const lat = d.last_latitude ?? d.latitude ?? latestLocation.latitude ?? latestLocation.lat ??
+    latestLocationOnDemand.latitude ?? latestLocationOnDemand.lat ?? null
+  const lng = d.last_longitude ?? d.longitude ?? latestLocation.longitude ?? latestLocation.lon ??
+    latestLocationOnDemand.longitude ?? latestLocationOnDemand.lon ?? null
+  const rawSpeed = firstValue(
+    d.speed_kmh, d.speed, latestLocation.speed_kmh, latestLocationOnDemand.speed_kmh
   )
-  const hasGpsFix = gpsFlagsValid && gpsStatus !== 'V'
+  const verifiedFix = normalizeVerifiedGpsFix(withDefaultTcpGpsSource(d))
+  const hasGpsFix = verifiedFix !== null
 
   let batteryVal: number | null = null
-  for (const c of [d.battery, d.battery_pct, d.battery_percent, d.battery_level, d.bat]) {
-    if (c !== null && c !== undefined && c !== '' && !Number.isNaN(Number(c))) {
-      batteryVal = Math.min(100, Math.max(0, Math.round(Number(c))))
+  for (const c of [
+    d.battery_percent, d.battery_pct, d.battery_level, d.battery, d.bat,
+    latestStatus.battery_percent, latestLocation.battery_percent,
+    latestLocationOnDemand.battery_percent,
+    latest.sos_alarm?.battery_percent,
+  ]) {
+    const percentage = Number(c)
+    if (c !== null && c !== undefined && c !== '' && Number.isFinite(percentage)) {
+      batteryVal = Math.min(100, Math.max(0, Math.round(percentage)))
       break
     }
   }
@@ -503,6 +571,19 @@ function normaliseDevice(d: any, idx: number): Device {
   const deviceId = d.device_id ?? d.imei ?? d.serial_number ?? String(d.id ?? idx + 1)
   const lastReportedLocation = selectNewestLastReportedGpsLocation(
     collectLastReportedGpsCandidates(d).map(({ record }) => record)
+  )
+  const heartRate = firstValue(
+    d.heart_rate, d.heart_rate_bpm, latestHeartRate.heart_rate_bpm
+  )
+  const steps = firstValue(
+    d.steps, d.step_counter, latestStatus.steps, latestLocation.steps, latestLocationOnDemand.steps
+  )
+  const temperature = firstValue(d.temperature, d.temperature_c, latest.temperature?.temperature_c)
+  const bloodOxygen = firstValue(
+    d.blood_oxygen, d.spo2, d.spo2_percent, latest.blood_oxygen?.spo2_percent
+  )
+  const bloodGlucose = firstValue(
+    d.blood_glucose, d.glucose_mmol_l, latest.blood_glucose?.glucose_mmol_l
   )
 
   return {
@@ -521,27 +602,73 @@ function normaliseDevice(d: any, idx: number): Device {
     battery: batteryVal,
     battery_pct: batteryVal,
     battery_percent: batteryVal,
+    battery_status: d.battery_status ?? (batteryVal == null ? null : batteryVal > 20 ? 'normal' : 'low'),
+    is_charging: Boolean(d.is_charging ?? d.charging ?? false),
+    charging: Boolean(d.charging ?? d.is_charging ?? false),
     last_seen: d.last_seen ?? d.device_timestamp ?? null,
+    last_packet_received: d.last_packet_received ?? d.last_seen ?? null,
     gps_last_fix: d.gps_last_fix ?? d.last_fix ?? null,
     gps_last_known_location:
       d.gps_last_known_location ??
       d.last_known_location ??
       lastReportedLocation,
     gps_update_time:
+      verifiedFix?.recordedAt ??
+      d.last_valid_gps_time ??
       d.gps_update_time ??
       d.gps_recorded_at ??
       d.gps_time ??
       d.last_gps_update ??
-      (hasGpsFix ? d.recorded_at ?? null : null),
+      null,
     last_latitude: lat != null ? Number(lat) : null,
     last_longitude: lng != null ? Number(lng) : null,
     latitude: lat != null ? Number(lat) : null,
     longitude: lng != null ? Number(lng) : null,
     speed_kmh: rawSpeed != null && Number.isFinite(Number(rawSpeed)) ? Number(rawSpeed) : null,
-    heading: d.heading != null && Number.isFinite(Number(d.heading)) ? Number(d.heading) : null,
+    heading: firstValue(d.heading, d.direction_deg, d.bearing, d.course) != null &&
+      Number.isFinite(Number(firstValue(d.heading, d.direction_deg, d.bearing, d.course)))
+      ? Number(firstValue(d.heading, d.direction_deg, d.bearing, d.course))
+      : null,
     has_gps_fix: hasGpsFix,
     gps_fix: hasGpsFix,
     gps_status: d.gps_status ?? d.validity ?? null,
+    gps_source: d.gps_source ?? d.gps_fix_source ?? null,
+    gps_valid: hasGpsFix,
+    gps_locked: hasGpsFix,
+    heart_rate: heartRate == null ? null : Number(heartRate),
+    heart_rate_bpm: heartRate == null ? null : Number(heartRate),
+    hrv: firstValue(d.hrv, latestHeartRate.hrv) == null
+      ? null
+      : Number(firstValue(d.hrv, latestHeartRate.hrv)),
+    blood_pressure: serializeMetric(bloodPressureValue),
+    systolic: firstValue(d.systolic, latestBloodPressure.systolic) == null
+      ? null
+      : Number(firstValue(d.systolic, latestBloodPressure.systolic)),
+    diastolic: firstValue(d.diastolic, latestBloodPressure.diastolic) == null
+      ? null
+      : Number(firstValue(d.diastolic, latestBloodPressure.diastolic)),
+    temperature: temperature == null ? null : Number(temperature),
+    blood_oxygen: bloodOxygen == null ? null : Number(bloodOxygen),
+    blood_glucose: bloodGlucose == null ? null : Number(bloodGlucose),
+    glucose_mmol_l: bloodGlucose == null ? null : Number(bloodGlucose),
+    step_counter: steps == null ? null : Number(steps),
+    steps: steps == null ? null : Number(steps),
+    sleep: serializeMetric(sleepValue),
+    sleep_report: d.sleep_report ?? latest.sleep_report ?? null,
+    sleep_allday: d.sleep_allday ?? latest.sleep_allday ?? null,
+    altitude_m: d.altitude_m ?? latestLocation.altitude_m ?? null,
+    satellites: d.satellites ?? latestLocation.satellites ?? null,
+    signal_percent: d.signal_percent ?? d.gsm_signal ?? latestLocation.signal_percent ?? null,
+    gsm_signal: d.gsm_signal ?? d.signal_percent ?? latestLocation.signal_percent ?? null,
+    rolls: d.rolls ?? latestLocation.rolls ?? null,
+    alarms: d.alarms ?? latestLocation.alarms ?? null,
+    cell_mcc: d.cell_mcc ?? latestLocation.cell_mcc ?? null,
+    cell_mnc: d.cell_mnc ?? latestLocation.cell_mnc ?? null,
+    cells: d.cells ?? latestLocation.cells ?? null,
+    wifi: d.wifi ?? latestLocation.wifi ?? null,
+    nearby_wifi_count: d.nearby_wifi_count ?? latestLocation.nearby_wifi_count ?? null,
+    mileage_km: d.mileage_km ?? latestStatus.mileage_km ?? null,
+    direction_deg: d.direction_deg ?? latestLocation.direction_deg ?? null,
     custody_person_id: d.custody_person_id ?? null,
     custody_person_name: d.custody_person_name ?? d.wearer_name ?? null,
   }
@@ -587,6 +714,8 @@ export const getLiveLocations = () => request<GpsLocation[]>('/gps/live')
 export interface LatestGpsSnapshot {
   latest: LatestGpsLocation | null
   lastReported: LastReportedGpsLocation | null
+  lastPacketReceivedAt: number | null
+  noFixReported: boolean | null
 }
 
 /** Latest verified fix and a separate display-only historical location. */
@@ -596,13 +725,41 @@ export const getLatestGpsSnapshot = async (
 ): Promise<LatestGpsSnapshot> => {
   try {
     const response = await request<unknown>(`/gps/${deviceId}/latest`, { signal })
+    const reportMetadata = normalizeLatestGpsReportMetadata(response)
     const candidates = collectGpsLatestCandidates(response)
     const selection = selectNewestVerifiedGpsCandidate(candidates)
-    const lastReportedCandidates = collectLastReportedGpsCandidates(response)
+    const reportedCandidates = collectLastReportedGpsCandidates(response)
+    const lastReportedCandidates = reportedCandidates
       .map(({ record }) => normalizeLastReportedGpsLocation(record))
       .filter((location): location is LastReportedGpsLocation => location !== null)
       .sort((first, second) => (first.timestamp ?? 0) - (second.timestamp ?? 0))
     const lastReported = lastReportedCandidates[lastReportedCandidates.length - 1] ?? null
+    const coordinateDiagnostics = [...candidates, ...reportedCandidates].map(
+      ({ name, record }) => {
+        const candidate = typeof record === 'object' && record !== null
+          ? record as Record<string, unknown>
+          : {}
+        return {
+          name,
+          coordinates: {
+            latitude: candidate.latitude ?? candidate.lat ?? candidate.last_latitude ?? null,
+            longitude: candidate.longitude ?? candidate.lon ??
+              candidate.lng ?? candidate.last_longitude ?? null,
+          },
+          gpsFix: candidate.gps_fix ?? candidate.has_gps_fix ?? null,
+          gpsValid: candidate.gps_valid ?? candidate.valid ?? null,
+          coordinateSource: candidate.coordinate_source ?? candidate.location_type ?? null,
+          gpsTimestamp: candidate.gps_time ?? candidate.at ??
+            candidate.last_valid_gps_time ?? candidate.timestamp ??
+            candidate.received_at ?? null,
+        }
+      }
+    )
+    console.info('[gps][api] latest response candidates', {
+      deviceId,
+      selectedVerifiedFix: selection.selected?.fix ?? null,
+      candidates: coordinateDiagnostics,
+    })
     if (!selection.selected) {
       logGpsValidationDiagnostics(
         'GPS latest response',
@@ -610,7 +767,12 @@ export const getLatestGpsSnapshot = async (
           ? selection.rejected
           : [{ name: 'response', reasons: ['unrecognized-response-shape'] }]
       )
-      return { latest: null, lastReported }
+      return {
+        latest: null,
+        lastReported,
+        lastPacketReceivedAt: reportMetadata.receivedAt,
+        noFixReported: reportMetadata.noFixReported,
+      }
     }
     const raw = selection.selected.record as Record<string, unknown>
     const fix = selection.selected.fix
@@ -642,14 +804,26 @@ export const getLatestGpsSnapshot = async (
         raw,
       },
       lastReported,
+      lastPacketReceivedAt: reportMetadata.receivedAt,
+      noFixReported: reportMetadata.noFixReported,
     }
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') {
-      return { latest: null, lastReported: null }
+      return {
+        latest: null,
+        lastReported: null,
+        lastPacketReceivedAt: null,
+        noFixReported: null,
+      }
     }
     if (error instanceof ApiError && error.configurationError) throw error
     console.warn('Unable to load latest GPS fix.', error)
-    return { latest: null, lastReported: null }
+    return {
+      latest: null,
+      lastReported: null,
+      lastPacketReceivedAt: null,
+      noFixReported: null,
+    }
   }
 }
 
@@ -677,18 +851,41 @@ export const getGpsHistory = async (
     return reasons.length > 0 ? [{ name: `record-${index + 1}`, reasons }] : []
   })
   logGpsValidationDiagnostics('GPS history response', rejected)
-  return mergeVerifiedGpsFixes(history, null).history.map((fix) => ({
-    latitude: fix.latitude,
-    longitude: fix.longitude,
-    timestamp: fix.recordedAt,
-    recorded_at: fix.recordedAt,
-    accuracy_m: fix.accuracy,
-    gps_fix: true,
-    gps_valid: true,
-    gps_status: fix.status,
-    status: fix.status,
-    gps_source: fix.source,
-  }))
+  const telemetryByFix = new Map<string, Record<string, unknown>>()
+  history.forEach((record) => {
+    const normalizedRecord = withDefaultTcpGpsSource(record)
+    const fix = normalizeVerifiedGpsFix(normalizedRecord)
+    if (!fix || !record || typeof record !== 'object') return
+    telemetryByFix.set(fix.key, record as Record<string, unknown>)
+  })
+  const optionalNumber = (value: unknown): number | null => {
+    if (value === null || value === undefined || value === '') return null
+    const number = Number(value)
+    return Number.isFinite(number) ? number : null
+  }
+  return mergeVerifiedGpsFixes(history, null).history.map((fix) => {
+    const telemetry = telemetryByFix.get(fix.key) ?? {}
+    return {
+      latitude: fix.latitude,
+      longitude: fix.longitude,
+      timestamp: fix.recordedAt,
+      recorded_at: fix.recordedAt,
+      accuracy_m: fix.accuracy,
+      speed_kmh: optionalNumber(telemetry.speed_kmh ?? telemetry.speed),
+      heading: optionalNumber(
+        telemetry.direction_deg ?? telemetry.heading ?? telemetry.bearing ?? telemetry.course
+      ),
+      battery_pct: optionalNumber(
+        telemetry.battery_percent ?? telemetry.battery_pct ??
+          telemetry.battery_level ?? telemetry.battery
+      ),
+      gps_fix: true,
+      gps_valid: true,
+      gps_status: fix.status,
+      status: fix.status,
+      gps_source: fix.source,
+    }
+  })
 }
 
 /** Force GPS poll (sends CR command to wake watch GPS chip) */
@@ -803,11 +1000,44 @@ export const getPlaybackRoute = (deviceId: string | number, params: PlaybackPara
 // HEALTH & BIOMETRICS  —  /api/v1/health-data/...
 // =============================================================================
 
+export interface HealthReading {
+  id?: number
+  device_id?: string
+  timestamp?: string
+  bpm?: number | null
+  heart_rate?: number | null
+  blood_pressure?: string | null
+  spo2?: number | null
+}
+
+export interface DeviceHealthSummary {
+  device_id?: string
+  current_pulse_bpm?: number | null
+  average_bpm?: number | null
+  max_bpm?: number | null
+  min_bpm?: number | null
+  today_steps?: number | null
+  battery_percent?: number | null
+  blood_pressure?: string | null
+  spo2?: number | null
+  temperature?: number | null
+  blood_oxygen?: number | null
+  blood_glucose?: number | null
+  glucose_mmol_l?: number | null
+  hrv?: number | null
+  sleep?: unknown
+  sleep_report?: unknown
+  sleep_allday?: unknown
+  recent_pulse_readings?: HealthReading[]
+  history?: HealthReading[]
+  [key: string]: unknown
+}
+
 export const getDeviceHealthSummary = (deviceId: string | number) =>
-  request<unknown>(`/health-data/device/${deviceId}/summary`)
+  request<DeviceHealthSummary>(`/health-data/device/${deviceId}/summary`)
 
 export const getHeartRateHistory = (deviceId: string | number, limit = 50) =>
-  request<unknown[]>(`/health-data/device/${deviceId}/heart-rate?limit=${limit}`)
+  request<HealthReading[]>(`/health-data/device/${deviceId}/heart-rate?limit=${limit}`)
 
 // =============================================================================
 // STATISTICS  —  /api/v1/statistics/...

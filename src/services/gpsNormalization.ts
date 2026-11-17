@@ -1,5 +1,5 @@
-export const VERIFIED_GPS_SOURCES = ['watch_frame', 'watch_tcp', 'gps_ingest_api'] as const
-export const GPS_FRESHNESS_MS = 5 * 60_000
+export const VERIFIED_GPS_SOURCES = ['watch_frame', 'watch_tcp', 'watch_udp', 'gps_ingest_api'] as const
+export const GPS_FRESHNESS_MS = 15 * 60_000
 
 export interface VerifiedGpsFix {
   latitude: number
@@ -18,10 +18,28 @@ export interface LastReportedGpsLocation {
   timestamp: number | null
   recordedAt: string | null
   source: string | null
+  coordinateSource: string | null
   gpsStatus: string | null
   isStale: boolean
   verified: false
   locationType: 'last_reported_unverified'
+}
+
+export interface LatestGpsReportMetadata {
+  receivedAt: number | null
+  noFixReported: boolean | null
+}
+
+export interface VerifiedHistoryGpsLocation {
+  latitude: number
+  longitude: number
+  timestamp: number
+  recordedAt: string
+  source: VerifiedGpsFix['source']
+  gpsStatus: string | null
+  isStale: boolean
+  verified: true
+  locationType: 'last_verified_history'
 }
 
 export interface GpsFixCandidate {
@@ -54,6 +72,7 @@ const VALID_STATUS_VALUES = new Set([
   'GPS FIX',
   'GPS LOCKED',
   'GPS VALID',
+  'LOCATION STALE',
   'OK',
   'VALID',
 ])
@@ -72,6 +91,8 @@ const HISTORY_WRAPPER_KEYS = [
   'gps',
   'value',
   'data',
+  'recent_positions',
+  'device',
 ] as const
 const LATEST_WRAPPER_KEYS = [
   'latest',
@@ -83,6 +104,7 @@ const LATEST_WRAPPER_KEYS = [
   'result',
   'value',
   'data',
+  'device',
 ] as const
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -101,12 +123,45 @@ function firstValue(...values: unknown[]): unknown {
   return values.find((value) => value !== undefined && value !== null && value !== '')
 }
 
+function hasGpsSource(record: Record<string, unknown>): boolean {
+  return [
+    record.gps_source,
+    record.source,
+    record.location_source,
+    record.provider,
+    record.gps_fix_source,
+  ].some((source) => typeof source === 'string'
+    ? source.trim() !== ''
+    : source !== undefined && source !== null)
+}
+
+function hasValidGpsFlag(record: Record<string, unknown>): boolean {
+  return [record.gps_fix, record.gps_valid].some((flag) =>
+    VALID_FLAG_VALUES.has(String(flag).trim().toUpperCase())
+  )
+}
+
+export function withDefaultTcpGpsSource(value: unknown): unknown {
+  const record = asRecord(value)
+  if (!record || hasGpsSource(record) || !hasValidGpsFlag(record)) return value
+  return { ...record, gps_source: 'watch_tcp' }
+}
+
 function normalizeStatus(value: unknown): string {
   return String(value ?? '')
     .trim()
     .toUpperCase()
     .replace(/[_-]+/g, ' ')
     .replace(/\s+/g, ' ')
+}
+
+export function isNewerGpsTimestamp(
+  candidateTimestamp: number | null,
+  currentTimestamp: number | null
+): boolean {
+  return candidateTimestamp !== null &&
+    Number.isFinite(candidateTimestamp) &&
+    (currentTimestamp === null || candidateTimestamp > currentTimestamp)
 }
 
 function validDateParts(
@@ -209,6 +264,16 @@ function inspectGpsFix(value: unknown, now: number): {
   if (!record) return { fix: null, reasons: ['missing-record'] }
 
   const reasons: string[] = []
+  const coordinateSource = normalizeStatus(firstValue(
+    record.coordinate_source,
+    record.coordinateSource,
+    record.location_type,
+    record.locationType
+  ))
+  if (coordinateSource === 'LAST KNOWN' || coordinateSource === 'LAST REPORTED') {
+    reasons.push('cached-location-not-a-live-fix')
+  }
+
   const sourceValue = firstValue(
     record.gps_source,
     record.source,
@@ -230,6 +295,9 @@ function inspectGpsFix(value: unknown, now: number): {
     record.verified,
   ].filter(
     (flag) => flag !== undefined && flag !== null && flag !== ''
+  )
+  const hasGpsFixFlag = [record.gps_fix, record.gps_valid].some((flag) =>
+    VALID_FLAG_VALUES.has(String(flag).trim().toUpperCase())
   )
   const explicitStatus = firstValue(
     record.gps_status,
@@ -254,11 +322,18 @@ function inspectGpsFix(value: unknown, now: number): {
   } else if (flags.some((flag) => !VALID_FLAG_VALUES.has(String(flag).trim().toUpperCase()))) {
     reasons.push('unrecognized-validity-flag')
   }
-  if (flags.length === 0 && !recognizedStatus) reasons.push('missing-validity-status')
+  if (!hasGpsFixFlag && record.verified !== true && rawStatus !== 'A') {
+    reasons.push('missing-gps-fix-flag')
+  }
 
   const latitudeValue = firstValue(record.latitude, record.lat, record.last_latitude)
   const longitudeValue = firstValue(record.longitude, record.lon, record.lng, record.last_longitude)
-  if (latitudeValue == null || longitudeValue == null) {
+  if (
+    latitudeValue == null ||
+    longitudeValue == null ||
+    (typeof latitudeValue === 'string' && latitudeValue.trim() === '') ||
+    (typeof longitudeValue === 'string' && longitudeValue.trim() === '')
+  ) {
     reasons.push('missing-coordinates')
   }
   const latitude = Number(latitudeValue)
@@ -277,13 +352,15 @@ function inspectGpsFix(value: unknown, now: number): {
 
   const rawTimestamp = firstValue(
     record.recorded_at,
-    record.timestamp,
     record.gps_time,
+    record.timestamp,
     record.gps_timestamp,
     record.gps_recorded_at,
     record.at,
     record.last_valid_gps_time,
-    record.gps_update_time
+    record.gps_update_time,
+    record.location_time,
+    record.received_at
   )
   const timestamp = parseGpsTimestamp(rawTimestamp)
   if (rawTimestamp == null) reasons.push('missing-gps-timestamp')
@@ -314,6 +391,25 @@ export function getGpsFixRejectionReasons(value: unknown, now = Date.now()): str
 
 export function normalizeVerifiedGpsFix(value: unknown, now = Date.now()): VerifiedGpsFix | null {
   return inspectGpsFix(value, now).fix
+}
+
+export function normalizeVerifiedHistoryGpsLocation(
+  value: unknown,
+  now = Date.now()
+): VerifiedHistoryGpsLocation | null {
+  const fix = normalizeVerifiedGpsFix(value, now)
+  if (!fix) return null
+  return {
+    latitude: fix.latitude,
+    longitude: fix.longitude,
+    timestamp: fix.timestamp,
+    recordedAt: fix.recordedAt,
+    source: fix.source,
+    gpsStatus: fix.status,
+    isStale: !isFreshGpsTimestamp(fix.timestamp, now),
+    verified: true,
+    locationType: 'last_verified_history',
+  }
 }
 
 export function normalizeLastReportedGpsLocation(
@@ -377,31 +473,78 @@ export function normalizeLastReportedGpsLocation(
   ) return null
 
   const rawTimestamp = firstValue(
+    record.last_valid_gps_time,
+    record.gps_time,
+    record.at,
     record.recorded_at,
     record.timestamp,
-    record.gps_time,
     record.gps_timestamp,
     record.gps_recorded_at,
-    record.at,
-    record.last_valid_gps_time,
-    record.gps_update_time
+    record.gps_update_time,
+    record.location_time,
+    record.received_at
   )
   const timestamp = parseGpsTimestamp(rawTimestamp)
   if (rawTimestamp != null && (timestamp === null || timestamp > now)) return null
 
   const sourceValue = firstValue(record.gps_source, record.source, record.location_source)
+  const coordinateSourceValue = firstValue(
+    record.coordinate_source,
+    record.coordinateSource,
+    record.location_type,
+    record.locationType
+  )
+  const coordinateSource = coordinateSourceValue == null
+    ? null
+    : String(coordinateSourceValue)
+  const isHistorical = ['LAST KNOWN', 'LAST REPORTED'].includes(
+    normalizeStatus(coordinateSource)
+  ) || record.location_is_current === false || record.is_current === false
   return {
     latitude,
     longitude,
     timestamp,
     recordedAt: timestamp === null ? null : new Date(timestamp).toISOString(),
     source: sourceValue == null ? null : String(sourceValue),
+    coordinateSource,
     gpsStatus: status || null,
-    isStale: record.is_stale === true || record.isStale === true ||
+    isStale: isHistorical || status === 'LOCATION STALE' ||
+      record.is_stale === true || record.isStale === true ||
       (timestamp !== null && !isFreshGpsTimestamp(timestamp, now)),
     verified: false,
     locationType: 'last_reported_unverified',
   }
+}
+
+export function normalizeLatestGpsReportMetadata(value: unknown): LatestGpsReportMetadata {
+  const record = asRecord(value)
+  const lastKnown = asRecord(record?.last_known_location)
+  const latest = asRecord(record?.latest)
+  const latestLocation = asRecord(latest?.location) ??
+    asRecord(latest?.location_on_demand) ??
+    asRecord(latest?.sos_alarm)
+  const receivedAt = parseGpsTimestamp(firstValue(
+    record?.last_packet_received,
+    record?.last_seen,
+    record?.last_seen_at,
+    record?.received_at,
+    lastKnown?.received_at,
+    latestLocation?.received_at
+  ))
+  const flags = [record?.gps_fix, record?.gps_valid]
+  const source = normalizeStatus(firstValue(
+    record?.coordinate_source,
+    lastKnown?.coordinate_source
+  ))
+  const noFixReported = flags.some((flag) => flag === false) ||
+    source === 'LAST KNOWN' ||
+    record?.location_is_current === false
+    ? true
+    : flags.some((flag) => flag === true) || record?.location_is_current === true
+      ? false
+      : null
+
+  return { receivedAt, noFixReported }
 }
 
 export function selectNewestLastReportedGpsLocation(
@@ -415,19 +558,56 @@ export function selectNewestLastReportedGpsLocation(
   return locations[locations.length - 1] ?? null
 }
 
+export function selectPreferredLastReportedGpsLocation(
+  preferred: unknown,
+  fallbackCandidates: readonly unknown[],
+  now = Date.now()
+): LastReportedGpsLocation | null {
+  return normalizeLastReportedGpsLocation(preferred, now) ??
+    selectNewestLastReportedGpsLocation(fallbackCandidates, now)
+}
+
 export function collectLastReportedGpsCandidates(value: unknown): GpsFixCandidate[] {
   const candidates: GpsFixCandidate[] = []
   const visited = new Set<object>()
-  const wrapperKeys = ['latest', 'data', 'result', 'payload', 'value'] as const
+  const wrapperKeys = ['latest', 'data', 'result', 'payload', 'value', 'device'] as const
   const locationKeys = ['last_known_location', 'last_fix', 'gps_last_fix'] as const
 
   const collect = (candidate: unknown, name: string, depth: number) => {
     const record = asRecord(candidate)
     if (!record || visited.has(record) || depth > 4) return
     visited.add(record)
+    const parentLastValidTime = record.last_valid_gps_time
+    const parentCoordinateSource = firstValue(
+      record.coordinate_source,
+      record.location_type
+    )
+    const parentCurrentFlag = record.location_is_current ?? record.is_current
     for (const key of locationKeys) {
       const location = asRecord(record[key])
-      if (location) candidates.push({ name: `${name}.${key}`, record: location })
+      if (location) {
+        const inheritedMetadata: Record<string, unknown> = {}
+        if (
+          parentLastValidTime != null &&
+          location.last_valid_gps_time == null
+        ) inheritedMetadata.last_valid_gps_time = parentLastValidTime
+        if (
+          parentCoordinateSource != null &&
+          location.coordinate_source == null &&
+          location.location_type == null
+        ) inheritedMetadata.coordinate_source = parentCoordinateSource
+        if (
+          parentCurrentFlag != null &&
+          location.location_is_current == null &&
+          location.is_current == null
+        ) inheritedMetadata.location_is_current = parentCurrentFlag
+        candidates.push({
+          name: `${name}.${key}`,
+          record: Object.keys(inheritedMetadata).length > 0
+            ? { ...location, ...inheritedMetadata }
+            : location,
+        })
+      }
     }
     const coordinateSource = normalizeStatus(record.coordinate_source ?? record.location_type)
     const explicitlyHistorical =
@@ -441,8 +621,10 @@ export function collectLastReportedGpsCandidates(value: unknown): GpsFixCandidat
       for (const key of [
         'latitude', 'longitude', 'lat', 'lon', 'lng', 'last_latitude', 'last_longitude',
         'recorded_at', 'timestamp', 'gps_time', 'gps_timestamp', 'gps_recorded_at',
-        'at', 'last_valid_gps_time', 'gps_update_time', 'accuracy', 'accuracy_m',
-        'gps_source', 'source', 'location_source', 'is_stale', 'isStale',
+        'at', 'last_valid_gps_time', 'gps_update_time', 'location_time', 'received_at',
+        'accuracy', 'accuracy_m',
+        'gps_source', 'source', 'location_source', 'coordinate_source', 'location_type',
+        'location_is_current', 'is_current', 'is_stale', 'isStale',
       ]) {
         if (key in record) historicalRecord[key] = record[key]
       }
@@ -484,11 +666,23 @@ export function collectFirestoreGpsCandidates(
   if (!data) return []
   const candidates: GpsFixCandidate[] = []
   const addCandidate = (name: string, candidate: unknown) => {
-    if (asRecord(candidate)) candidates.push({ name, record: candidate })
+    const record = asRecord(candidate)
+    if (!record) return
+    const candidateRecord = {
+      ...record,
+      ...(!hasValidGpsFlag(record) ? { gps_fix: false } : {}),
+    }
+    candidates.push({
+      name,
+      record: hasGpsSource(candidateRecord)
+        ? candidateRecord
+        : { ...candidateRecord, gps_source: 'watch_tcp' },
+    })
   }
   const latest = asRecord(data.latest)
   addCandidate('latest.location', latest?.location)
   addCandidate('latest.location_on_demand', latest?.location_on_demand)
+  addCandidate('latest.sos_alarm', latest?.sos_alarm)
   addCandidate('latest.other', latest?.other)
   addCandidate('last_known_location', data.last_known_location)
   addCandidate('last_location', data.last_location)
@@ -500,8 +694,8 @@ export function collectFirestoreGpsCandidates(
     'fix_status', 'status', 'gps_source', 'source', 'location_source', 'provider',
     'gps_fix_source', 'recorded_at', 'timestamp', 'gps_time', 'gps_timestamp',
     'device_timestamp', 'gps_recorded_at', 'at', 'last_valid_gps_time',
-    'gps_update_time', 'accuracy', 'accuracy_m', 'speed', 'speed_kmh', 'heading',
-    'bearing', 'course',
+    'gps_update_time', 'location_time', 'received_at', 'accuracy', 'accuracy_m',
+    'speed', 'speed_kmh', 'heading', 'bearing', 'course',
   ]
   const rootCandidate: Record<string, unknown> = {}
   for (const field of rootFields) {
@@ -529,6 +723,23 @@ export function collectFirestoreGpsCandidates(
   return candidates
 }
 
+const FIRESTORE_GPS_LOG_TYPES = new Set(['location', 'location_on_demand', 'sos_alarm'])
+
+export function normalizeFirestoreGpsLog(
+  value: unknown,
+  now = Date.now()
+): VerifiedGpsFix | null {
+  const record = asRecord(value)
+  if (!record || !FIRESTORE_GPS_LOG_TYPES.has(String(record.type ?? '').toLowerCase())) {
+    return null
+  }
+  if (!hasValidGpsFlag(record)) return null
+  return normalizeVerifiedGpsFix(
+    hasGpsSource(record) ? record : { ...record, gps_source: 'watch_tcp' },
+    now
+  )
+}
+
 export function collectGpsLatestCandidates(value: unknown): GpsFixCandidate[] {
   const candidates: GpsFixCandidate[] = []
   const visited = new Set<object>()
@@ -537,7 +748,9 @@ export function collectGpsLatestCandidates(value: unknown): GpsFixCandidate[] {
     const record = asRecord(candidate)
     if (!record || visited.has(record) || depth > 4) return
     visited.add(record)
-    if (hasCoordinatePair(record)) candidates.push({ name, record })
+    if (hasCoordinatePair(record)) {
+      candidates.push({ name, record: withDefaultTcpGpsSource(record) })
+    }
     for (const key of LATEST_WRAPPER_KEYS) {
       if (record[key] !== undefined && record[key] !== null) {
         collect(record[key], `${name}.${key}`, depth + 1)
@@ -585,8 +798,8 @@ export function matchLegacyGpsFixToVerifiedHistory(
   const longitudeValue = firstValue(record.longitude, record.lon, record.lng, record.last_longitude)
   const timestamp = parseGpsTimestamp(firstValue(
     record.recorded_at,
-    record.timestamp,
     record.gps_time,
+    record.timestamp,
     record.gps_timestamp,
     record.gps_recorded_at,
     record.at,
@@ -695,7 +908,7 @@ export function mergeVerifiedGpsFixes(
   const rawHistory = unwrapGpsHistoryResponse(historyValue) ?? []
   const uniqueHistory = new Map<string, VerifiedGpsFix>()
   for (const value of rawHistory) {
-    const fix = normalizeVerifiedGpsFix(value, now)
+    const fix = normalizeVerifiedGpsFix(withDefaultTcpGpsSource(value), now)
     if (fix) uniqueHistory.set(fix.key, fix)
   }
   const history = [...uniqueHistory.values()].sort((first, second) => first.timestamp - second.timestamp)

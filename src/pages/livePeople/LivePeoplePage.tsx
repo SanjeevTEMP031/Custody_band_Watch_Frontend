@@ -13,7 +13,6 @@ import {
   DialogTitle,
   FormControl,
   InputLabel,
-  Menu,
   MenuItem,
   Select,
   Stack,
@@ -22,21 +21,31 @@ import {
   Typography,
 } from '@mui/material'
 import {
-  ExpandMore,
-    SendOutlined,
+  SendOutlined,
   BatteryChargingFullOutlined,
   AccessTimeOutlined,
   LocationOnOutlined,
 } from '@mui/icons-material'
+import { HeartPulse, History, Info, Map, MapPin, Send } from 'lucide-react'
 import { useApiData } from '../../hooks/useApiData'
 import { useRealtimeDevices } from '../../hooks/useRealtimeDevices'
+import { mergeDevicesWithFirestore } from '../../lib/firebase'
 import { listDevices, type Device } from '../../services/api'
 import MonitoringMap from './MonitoringMap'
 import type { OpenStreetMapStyle } from './OpenStreetMapView'
 
+type MonitoringFeature =
+  | 'tracking'
+  | 'history'
+  | 'geofence'
+  | 'device-info'
+  | 'instruction'
+  | 'health'
+
 export default function LivePeoplePage() {
   const [params] = useSearchParams()
   const [selectedId, setSelectedId] = useState<number | string | null>(() => (params.get('device') ?? null))
+  const [activeFeature, setActiveFeature] = useState<MonitoringFeature>('tracking')
   const [provider, setProvider] = useState(import.meta.env.VITE_GOOGLE_MAPS_API_KEY ? 'google' : 'osm')
   const [mapStyle, setMapStyle] = useState<OpenStreetMapStyle>('standard')
   const [company, setCompany] = useState('')
@@ -45,9 +54,8 @@ export default function LivePeoplePage() {
   const [status, setStatus] = useState('All')
   const [showNames, setShowNames] = useState(false)
   const [aggregate, setAggregate] = useState(true)
-  const [refresh, setRefresh] = useState(false)
+  const [refresh, setRefresh] = useState(true)
   const [page, setPage] = useState(0)
-  const [operation, setOperation] = useState<{ id: number | string; anchor: HTMLElement } | null>(null)
 
   // Section 3.2.7: Device Instruction state
   const [instructionOpen, setInstructionOpen] = useState(false)
@@ -64,15 +72,15 @@ export default function LivePeoplePage() {
   const { data: apiData, loading: apiLoading, error, reload } = useApiData(load)
 
   const data = useMemo(() => {
-    if (realtimeDevices.length > 0) return realtimeDevices
-    return apiData ?? []
+    return mergeDevicesWithFirestore(apiData ?? [], realtimeDevices)
   }, [realtimeDevices, apiData])
 
   const loading = realtimeLoading && apiLoading && data.length === 0
 
   useEffect(() => {
     if (!refresh) return
-    const timer = window.setInterval(reload, 30000)
+    reload()
+    const timer = window.setInterval(reload, 5000)
     return () => window.clearInterval(timer)
   }, [refresh, reload])
 
@@ -131,7 +139,27 @@ export default function LivePeoplePage() {
     }, 600)
   }
 
-  const activeOpDevice = operation ? devices.find(d => d.id === operation.id) : null
+  const featureTabSx = {
+    flex: { xs: '0 0 156px', md: '1 1 0' },
+    minWidth: { md: 0 },
+    height: 48,
+    px: 1.5,
+    borderRadius: 1,
+    borderBottom: '3px solid transparent',
+    color: '#475569',
+    fontSize: 12,
+    fontWeight: 600,
+    textTransform: 'none' as const,
+    whiteSpace: 'nowrap' as const,
+    '&:hover': { bgcolor: '#f1f7fc' },
+    '& .MuiButton-startIcon': { mr: 0.75 },
+  }
+  const activeFeatureTabSx = {
+    bgcolor: '#eff6ff',
+    color: '#0369a1',
+    borderBottom: '3px solid #0284c7',
+    '&:hover': { bgcolor: '#e0f2fe' },
+  }
 
   return (
     <Stack spacing={0} sx={{ bgcolor: '#fff', minHeight: 'calc(100vh - 180px)', font: '14px Arial, sans-serif' }}>
@@ -263,6 +291,116 @@ export default function LivePeoplePage() {
 
       {error && <Alert severity="error">{error}</Alert>}
 
+      <Box
+        component="nav"
+        aria-label="Monitoring Center features"
+        sx={{
+          mx: 0.5,
+          mt: 0.75,
+          mb: 0.75,
+          p: 0.5,
+          overflowX: 'auto',
+          border: '1px solid #e2e8f0',
+          borderRadius: 1.5,
+          bgcolor: '#fff',
+          scrollbarWidth: 'thin',
+        }}
+      >
+        <Box sx={{ display: 'flex', gap: 0.5, minWidth: { xs: 'max-content', md: '100%' } }}>
+          <Button
+            aria-pressed={activeFeature === 'tracking'}
+            disabled={!selected}
+            onClick={() => {
+              setActiveFeature('tracking')
+              if (!selected) return
+              setSelectedId(selected.id)
+              setAggregate(false)
+            }}
+            startIcon={<MapPin size={17} />}
+            sx={{
+              ...featureTabSx,
+              ...(activeFeature === 'tracking' ? activeFeatureTabSx : {}),
+            }}
+          >
+            Real-time Tracking
+          </Button>
+          <Button
+            component={Link}
+            to={`/admin/location-history?device=${selected?.id ?? ''}`}
+            aria-pressed={activeFeature === 'history'}
+            disabled={!selected}
+            onClick={() => setActiveFeature('history')}
+            startIcon={<History size={17} />}
+            sx={{
+              ...featureTabSx,
+              ...(activeFeature === 'history' ? activeFeatureTabSx : {}),
+            }}
+          >
+            Historical Playback
+          </Button>
+          <Button
+            component={Link}
+            to={`/admin/geofences?device=${selected?.id ?? ''}`}
+            aria-pressed={activeFeature === 'geofence'}
+            disabled={!selected}
+            onClick={() => setActiveFeature('geofence')}
+            startIcon={<Map size={17} />}
+            sx={{
+              ...featureTabSx,
+              ...(activeFeature === 'geofence' ? activeFeatureTabSx : {}),
+            }}
+          >
+            Geo Fence
+          </Button>
+          <Button
+            component={Link}
+            to={`/admin/device-management?search=${selected?.imei ?? selected?.serial_number ?? selected?.id ?? ''}`}
+            aria-pressed={activeFeature === 'device-info'}
+            disabled={!selected}
+            onClick={() => setActiveFeature('device-info')}
+            startIcon={<Info size={17} />}
+            sx={{
+              ...featureTabSx,
+              ...(activeFeature === 'device-info' ? activeFeatureTabSx : {}),
+            }}
+          >
+            Device Info
+          </Button>
+          <Button
+            aria-pressed={activeFeature === 'instruction'}
+            disabled={!selected}
+            onClick={() => {
+              setActiveFeature('instruction')
+              if (!selected) return
+              setInstructionDevice(selected)
+              setInstructionNotice('')
+              setInstructionOpen(true)
+            }}
+            startIcon={<Send size={17} />}
+            sx={{
+              ...featureTabSx,
+              ...(activeFeature === 'instruction' ? activeFeatureTabSx : {}),
+            }}
+          >
+            Device Instruction
+          </Button>
+          <Button
+            component={Link}
+            to={`/admin/health-data?device=${selected?.id ?? ''}`}
+            aria-pressed={activeFeature === 'health'}
+            disabled={!selected}
+            onClick={() => setActiveFeature('health')}
+            startIcon={<HeartPulse size={17} />}
+            sx={{
+              ...featureTabSx,
+              ...(activeFeature === 'health' ? activeFeatureTabSx : {}),
+            }}
+          >
+            Health Data
+          </Button>
+        </Box>
+      </Box>
+
       {/* Main Monitoring Center Content */}
       <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '230px minmax(0, 1fr)' }, minHeight: 'max(520px, calc(100dvh - 310px))' }}>
         {/* Device List Sidebar */}
@@ -326,24 +464,6 @@ export default function LivePeoplePage() {
                     </Box>
                   </Button>
 
-                  <Button
-                    aria-haspopup="menu"
-                    aria-expanded={operation?.id === device.id}
-                    onClick={event => setOperation({ id: device.id, anchor: event.currentTarget })}
-                    endIcon={<ExpandMore sx={{ fontSize: 16 }} />}
-                    sx={{
-                      bgcolor: '#0284c7',
-                      color: '#fff',
-                      fontSize: 11,
-                      py: 0.3,
-                      px: 0.8,
-                      borderRadius: 0.5,
-                      textTransform: 'none',
-                      '&:hover': { bgcolor: '#0369a1' },
-                    }}
-                  >
-                    Operation
-                  </Button>
                 </Box>
               )
             })}
@@ -414,7 +534,7 @@ export default function LivePeoplePage() {
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
                       <Typography component="span" sx={{ color: '#64748b', fontSize: 12 }}>Belongs:</Typography>
                       <Typography component="span" sx={{ fontWeight: 600, fontSize: 12 }}>
-                        {selected.company || 'Trackin360 Global'}
+                        {selected.company || 'TrackGuard 360'}
                       </Typography>
                     </Box>
 
@@ -447,83 +567,6 @@ export default function LivePeoplePage() {
           )}
         </Box>
       </Box>
-
-      {/* 3.2.2 Operation Menu */}
-      <Menu
-        anchorEl={operation?.anchor}
-        open={Boolean(operation)}
-        onClose={() => setOperation(null)}
-        slotProps={{
-          paper: {
-            sx: {
-              boxShadow: '0 4px 16px rgba(0,0,0,0.15)',
-              borderRadius: 1,
-              '& .MuiMenuItem-root': { fontSize: 13, py: 0.8 },
-            },
-          },
-        }}
-      >
-        {/* 3.2.3 Tracking */}
-        <MenuItem
-          onClick={() => {
-            setSelectedId(operation?.id ?? null)
-            setAggregate(false)
-            setOperation(null)
-          }}
-        >
-          Real-time Tracking
-        </MenuItem>
-
-        {/* 3.2.4 Playback */}
-        <MenuItem
-          component={Link}
-          to={`/admin/location-history?device=${operation?.id ?? ''}`}
-          onClick={() => setOperation(null)}
-        >
-          Historical Playback
-        </MenuItem>
-
-        {/* 3.2.5 Geo-fence */}
-        <MenuItem
-          component={Link}
-          to={`/admin/geofences?device=${operation?.id ?? ''}`}
-          onClick={() => setOperation(null)}
-        >
-          Geo-fence
-        </MenuItem>
-
-        {/* 3.2.6 Device Info */}
-        <MenuItem
-          component={Link}
-          to={`/admin/device-management?search=${activeOpDevice?.imei ?? activeOpDevice?.serial_number ?? operation?.id ?? ''}`}
-          onClick={() => setOperation(null)}
-        >
-          Device Info
-        </MenuItem>
-
-        {/* 3.2.7 Device Instruction */}
-        <MenuItem
-          onClick={() => {
-            if (activeOpDevice) {
-              setInstructionDevice(activeOpDevice)
-              setInstructionNotice('')
-              setInstructionOpen(true)
-            }
-            setOperation(null)
-          }}
-        >
-          Device Instruction
-        </MenuItem>
-
-        {/* 3.1.13 Health Data */}
-        <MenuItem
-          component={Link}
-          to={`/admin/health-data?device=${operation?.id ?? ''}`}
-          onClick={() => setOperation(null)}
-        >
-          Health Data
-        </MenuItem>
-      </Menu>
 
       {/* 3.2.7 Device Instruction Modal Dialog */}
       <Dialog open={instructionOpen} onClose={() => setInstructionOpen(false)} maxWidth="sm" fullWidth>

@@ -23,6 +23,7 @@ import {
 } from '../../services/api'
 import { useApiData } from '../../hooks/useApiData'
 import { useRealtimeDevices } from '../../hooks/useRealtimeDevices'
+import { mergeDevicesWithFirestore } from '../../lib/firebase'
 import AlertLocationDialog from './AlertLocationDialog'
 import DashboardLiveMap from './DashboardLiveMap'
 import './dashboard.css'
@@ -65,10 +66,8 @@ export default function DashboardPage() {
 
   const { data, loading: apiLoading, error, reload } = useApiData(loadDashboard)
 
-  // Prioritize real-time Firestore devices when available; otherwise use API devices
   const devices = useMemo(() => {
-    if (realtimeDevices.length > 0) return realtimeDevices
-    return data?.devices ?? []
+    return mergeDevicesWithFirestore(data?.devices ?? [], realtimeDevices)
   }, [realtimeDevices, data])
 
   const loading = (realtimeLoading && apiLoading) && devices.length === 0

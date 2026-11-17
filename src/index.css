@@ -28,3 +28,16 @@ select {
 #root {
   min-height: 100vh;
 }
+
+.powered-by-purview {
+  width: 100%;
+  padding: 14px 16px;
+  color: #64748b;
+  font-size: 0.75rem;
+  text-align: center;
+}
+
+.powered-by-purview strong {
+  color: #334155;
+  font-weight: 700;
+}

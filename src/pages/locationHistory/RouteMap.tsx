@@ -119,6 +119,14 @@ export default function RouteMap({
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string>("");
 
+  useEffect(() => {
+    setFrom(initialFrom)
+  }, [initialFrom])
+
+  useEffect(() => {
+    setTo(initialTo)
+  }, [initialTo])
+
   const calculateRoute = async (startQuery: string, endQuery: string) => {
     setLoading(true);
     setError("");

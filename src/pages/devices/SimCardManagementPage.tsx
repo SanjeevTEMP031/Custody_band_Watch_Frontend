@@ -115,7 +115,7 @@ export default function SimCardManagementPage() {
       phone_number: newPhone || '+91 98000 00000',
       imei: newImei,
       device_name: newImei ? ('Band #' + newImei) : 'Unassigned SIM',
-      company: 'Trackin360 Global',
+      company: 'TrackGuard 360',
       carrier: newCarrier,
       plan_data_gb: Number(newPlan) || 10,
       used_data_gb: 0,
@@ -173,7 +173,7 @@ export default function SimCardManagementPage() {
       const ws = utils.json_to_sheet(rows)
       const wb = utils.book_new()
       utils.book_append_sheet(wb, ws, 'SIM Cards')
-      writeFile(wb, 'Trackin360_SIM_Cards_Inventory.xlsx')
+      writeFile(wb, 'TrackGuard_360_SIM_Cards_Inventory.xlsx')
       setNotice('SIM card inventory exported to Excel.')
     } catch {
       setNotice('Unable to export Excel spreadsheet.')

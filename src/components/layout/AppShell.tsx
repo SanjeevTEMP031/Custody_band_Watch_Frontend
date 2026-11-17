@@ -12,6 +12,7 @@ import type { RootState } from '../../store/store'
 import { logout } from '../../store/authSlice'
 import { clearAccessToken, listAlerts } from '../../services/api'
 import Sidebar from './Sidebar'
+import PoweredByFooter from '../common/PoweredByFooter'
 import './appshell.css'
 
 export default function AppShell() {
@@ -75,10 +76,10 @@ export default function AppShell() {
     if (p.includes('/admin/settings')) return 'System Settings'
     if (p.includes('/admin/health-data')) return 'Biometric Health Data'
     if (p.includes('/admin/add-device')) return 'Register New Device'
-    return 'Trackin360'
+    return 'TrackGuard 360'
   }
 
-  const userDisplayName = auth.user?.name || 'Trackin360 Admin'
+  const userDisplayName = auth.user?.name || 'TrackGuard 360 Admin'
   const userRole = (auth.user as any)?.role || 'Super Admin'
 
   return (
@@ -161,7 +162,7 @@ export default function AppShell() {
                   <div className="user-dropdown-card">
                     <div className="dropdown-user-header">
                       <strong>{userDisplayName}</strong>
-                      <span>{auth.user?.email || 'admin@trackin360.com'}</span>
+                      <span>{auth.user?.email || 'admin@example.com'}</span>
                     </div>
                     <div className="dropdown-divider" />
                     <Link
@@ -194,6 +195,7 @@ export default function AppShell() {
         <main className="app-page-content">
           <Outlet />
         </main>
+        <PoweredByFooter />
       </div>
     </div>
   )

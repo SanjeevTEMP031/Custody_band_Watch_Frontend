@@ -25,6 +25,27 @@ export const DEFAULT_GPS_TRAIL_FILTERS: GpsTrailFilters = {
   maxPlausibleSpeedKmh: 180,
 }
 
+export function buildGpsTrailSegments<T extends GpsTrailPoint>(
+  points: T[],
+  filters: GpsTrailFilters = DEFAULT_GPS_TRAIL_FILTERS
+): T[][] {
+  const route: GpsTrailState<T> = {
+    segments: [],
+    keys: new Set(),
+    latest: null,
+    lastMovementPoint: null,
+  }
+  const sortedPoints = [...points].sort((first, second) => first.timestamp - second.timestamp)
+  sortedPoints.forEach((point) => appendGpsTrailPoint(route, point, filters))
+
+  const segments = route.segments.map((segment) => [...segment])
+  const lastSegment = segments[segments.length - 1]
+  if (lastSegment?.length === 1 && route.latest) {
+    segments[segments.length - 1] = [route.latest]
+  }
+  return segments
+}
+
 function distanceMeters(first: GpsTrailPoint, second: GpsTrailPoint): number {
   const radians = (degrees: number) => degrees * Math.PI / 180
   const latDelta = radians(second.latitude - first.latitude)
@@ -81,11 +102,7 @@ export function appendGpsTrailPoint<T extends GpsTrailPoint>(
 
   route.latest = point
   const movementDistance = distanceMeters(movementAnchor, point)
-  const reportedAccuracy = Math.max(movementAnchor.accuracy ?? 0, point.accuracy ?? 0)
-  const jitterThreshold = Math.max(
-    filters.minMovementMeters,
-    Math.min(30, reportedAccuracy || filters.minMovementMeters)
-  )
+  const jitterThreshold = filters.minMovementMeters
   if (movementDistance < jitterThreshold) return false
 
   const currentSegment = route.segments[route.segments.length - 1]
