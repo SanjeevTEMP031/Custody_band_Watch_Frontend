@@ -52,6 +52,15 @@
       "queryScope": "COLLECTION",
       "fields": [
         { "fieldPath": "device_id", "order": "ASCENDING" },
+        { "fieldPath": "type", "order": "ASCENDING" },
+        { "fieldPath": "received_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "logs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "device_id", "order": "ASCENDING" },
         { "fieldPath": "received_at", "order": "ASCENDING" }
       ]
     },

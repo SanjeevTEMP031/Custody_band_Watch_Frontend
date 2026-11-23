@@ -29,7 +29,7 @@ function AlertsPage() {
   const loadAlerts = useCallback(() => listAlerts(0, 500), [])
   const { data: alerts, loading, error, reload } = useApiData(loadAlerts)
 
-  const runAction = async (id: number, action: 'acknowledge' | 'resolve') => {
+  const runAction = async (id: number | string, action: 'acknowledge' | 'resolve') => {
     setActionError('')
     try {
       if (action === 'acknowledge') await acknowledgeAlert(id)
@@ -104,16 +104,34 @@ function AlertsPage() {
                     <TableCell sx={{ fontSize: 13, color: '#334155' }}>
                       {msgText}
                     </TableCell>
-                    <TableCell sx={{ fontSize: 12, fontFamily: 'monospace', color: '#475569' }}>
-                      {alert.latitude != null && alert.longitude != null && Number.isFinite(alert.latitude) && Number.isFinite(alert.longitude)
-                        ? `${alert.latitude.toFixed(4)}, ${alert.longitude.toFixed(4)}`
-                        : '—'}
+                    <TableCell sx={{ fontSize: 12, fontFamily: 'monospace' }}>
+                      {alert.latitude != null && alert.longitude != null && Number.isFinite(alert.latitude) && Number.isFinite(alert.longitude) ? (
+                        <Box>
+                          <Typography variant="body2" sx={{ fontFamily: 'monospace', fontSize: 12, color: '#334155' }}>
+                            {alert.latitude.toFixed(4)}, {alert.longitude.toFixed(4)}
+                          </Typography>
+                          {alert.location_is_stale || alert.location_source === 'HISTORICAL' ? (
+                            <Typography variant="caption" sx={{ color: '#d97706', fontSize: 10, display: 'block' }}>
+                              Historical snapshot
+                            </Typography>
+                          ) : (
+                            <Typography variant="caption" sx={{ color: '#059669', fontSize: 10, display: 'block' }}>
+                              Live GPS fix
+                            </Typography>
+                          )}
+                        </Box>
+                      ) : (
+                        <Typography variant="caption" sx={{ color: '#94a3b8', fontStyle: 'italic' }}>
+                          Location Unavailable
+                        </Typography>
+                      )}
                     </TableCell>
                     <TableCell>
                       <Chip
-                        label={alert?.severity || (sev === 'critical' ? 'critical' : 'warning')}
+                        label={alert?.severity || sev}
                         size="small"
-                        color={sev === 'critical' ? 'error' : sev === 'high' ? 'warning' : 'default'}
+                        color={sev === 'critical' ? 'error' : sev === 'high' ? 'warning' : sev === 'medium' ? 'secondary' : 'default'}
+                        sx={{ fontWeight: 600, textTransform: 'uppercase', fontSize: 10 }}
                       />
                     </TableCell>
                     <TableCell sx={{ fontSize: 12, fontWeight: 600, textTransform: 'uppercase' }}>
@@ -122,12 +140,12 @@ function AlertsPage() {
                     <TableCell>
                       <Stack direction="row" spacing={1}>
                         {status !== 'acknowledged' && status !== 'resolved' && (
-                          <Button size="small" variant="outlined" onClick={() => void runAction(alert.id, 'acknowledge')}>
+                          <Button size="small" variant="outlined" onClick={() => void runAction(alert.id ?? (alert as any).alert_id, 'acknowledge')}>
                             Acknowledge
                           </Button>
                         )}
                         {status !== 'resolved' && (
-                          <Button size="small" color="success" variant="contained" onClick={() => void runAction(alert.id, 'resolve')}>
+                          <Button size="small" color="success" variant="contained" onClick={() => void runAction(alert.id ?? (alert as any).alert_id, 'resolve')}>
                             Resolve
                           </Button>
                         )}

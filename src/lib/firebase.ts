@@ -9,6 +9,7 @@ import {
   getDocs,
   query,
   where,
+  orderBy,
   limit as firestoreLimit,
   type Unsubscribe,
 } from 'firebase/firestore'
@@ -454,6 +455,9 @@ export function subscribeToDevices(
       const deviceList: Device[] = []
       snapshot.forEach((docSnapshot) => {
         const id = docSnapshot.id
+        if (id.startsWith('TEST_') || id.startsWith('test_') || id === '863758061830999') {
+          return
+        }
         const rawData = docSnapshot.data()
         const prev = deviceLocationCache.get(id)
         const device = mapFirestoreDocToDevice(id, rawData, prev)
@@ -671,6 +675,13 @@ export interface TripPoint {
   latitude: number
   longitude: number
   timestamp: string
+  journey_id?: string | number | null
+  gps_time?: string | null
+  received_at?: string | null
+  gps_fix?: boolean
+  gps_source?: string | null
+  coordinate_source?: string | null
+  location_is_current?: boolean
   speed_kmh?: number | null
   heading?: number | null
   accuracy_m?: number | null
@@ -689,6 +700,15 @@ function mapFirestoreGpsLogToTripPoint(data: Record<string, unknown>): TripPoint
     latitude: fix.latitude,
     longitude: fix.longitude,
     timestamp: fix.recordedAt,
+    journey_id: typeof data.journey_id === 'string' || typeof data.journey_id === 'number'
+      ? data.journey_id
+      : null,
+    gps_time: typeof data.gps_time === 'string' ? data.gps_time : fix.recordedAt,
+    received_at: typeof data.received_at === 'string' ? data.received_at : null,
+    gps_fix: true,
+    gps_source: fix.source,
+    coordinate_source: typeof data.coordinate_source === 'string' ? data.coordinate_source : null,
+    location_is_current: data.location_is_current !== false,
     speed_kmh: numberOrNull(data.speed_kmh ?? data.speed),
     heading: numberOrNull(data.direction_deg ?? data.heading ?? data.bearing ?? data.course),
     accuracy_m: numberOrNull(data.accuracy_meters ?? data.accuracy_m),
@@ -709,6 +729,7 @@ export function subscribeToFirestoreLocationHistory(
     collection(db, 'logs'),
     where('device_id', '==', deviceId),
     where('type', 'in', ['location', 'location_on_demand', 'sos_alarm']),
+    orderBy('received_at', 'desc'),
     firestoreLimit(maxPoints)
   )
 
@@ -759,6 +780,14 @@ export interface TripRecord {
   total_distance_km: number
   point_count: number
   route_points: TripPoint[]
+  route_diagnostics?: {
+    acceptedFixes: number
+    rejectedOutliers: number
+    gpsGaps: number
+    duplicateFixes: number
+    filteredJitter: number
+    distanceEstimated: boolean
+  }
   created_at?: string
   updated_at?: string
 }
@@ -909,6 +938,22 @@ export async function startTrip(
   startLat?: number | null,
   startLon?: number | null
 ): Promise<TripRecord> {
+  const deviceRef = doc(db, 'devices', deviceId)
+  const deviceSnap = await getDoc(deviceRef)
+  const activeTripId = deviceSnap.exists()
+    ? deviceSnap.data().active_trip_id
+    : null
+  if (typeof activeTripId === 'string' && activeTripId.length > 0) {
+    const activeTripSnap = await getDoc(doc(db, 'trips', activeTripId))
+    if (activeTripSnap.exists()) {
+      const activeTrip = { id: activeTripSnap.id, ...activeTripSnap.data() } as TripRecord
+      if (activeTrip.status === 'in_progress') {
+        console.info(`[journey] JOURNEY_CONTINUED — reusing persisted active trip ${activeTrip.id}`)
+        return activeTrip
+      }
+    }
+  }
+
   const tripId = `trip_${deviceId}_${Date.now()}`
   const nowIso = new Date().toISOString()
 
@@ -956,7 +1001,6 @@ export async function startTrip(
 
   // 2. Mark active trip on the device document
   try {
-    const deviceRef = doc(db, 'devices', deviceId)
     await updateDoc(deviceRef, {
       active_trip_id: tripId,
       updated_at: nowIso,
@@ -1196,6 +1240,7 @@ export async function fetchFirestoreLocationHistory(
       collection(db, 'logs'),
       where('device_id', '==', deviceId),
       where('type', 'in', ['location', 'location_on_demand', 'sos_alarm']),
+      orderBy('received_at', 'desc'),
       firestoreLimit(maxPoints)
     )
     const logsSnapshot = await getDocs(logsQuery)

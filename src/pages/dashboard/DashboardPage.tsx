@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Alert as MuiAlert, CircularProgress } from '@mui/material'
 import {
@@ -24,6 +24,7 @@ import {
 import { useApiData } from '../../hooks/useApiData'
 import { useRealtimeDevices } from '../../hooks/useRealtimeDevices'
 import { mergeDevicesWithFirestore } from '../../lib/firebase'
+import { playAlertSound } from '../../utils/alertSounds'
 import AlertLocationDialog from './AlertLocationDialog'
 import DashboardLiveMap from './DashboardLiveMap'
 import './dashboard.css'
@@ -39,15 +40,18 @@ export default function DashboardPage() {
   const [selectedAlert, setSelectedAlert] = useState<ApiAlert | null>(null)
   const [selectedMapDeviceId, setSelectedMapDeviceId] = useState<number | string | null>(null)
   const [actionError, setActionError] = useState('')
-  const [busyAlerts, setBusyAlerts] = useState<number[]>([])
+  const [busyAlerts, setBusyAlerts] = useState<(number | string)[]>([])
   const [sound, setSound] = useState(() => {
     try {
-      return localStorage.getItem('purview-alarm-sound') === 'true'
+      return localStorage.getItem('purview-alarm-sound') !== 'false'
     } catch {
       return true
     }
   })
   const [saved, setSaved] = useState(false)
+
+  const seenAlertIdsRef = useRef<Set<string | number>>(new Set())
+  const isInitialLoadDoneRef = useRef<boolean>(false)
 
   // Subscribe to real-time Firestore device updates
   const { devices: realtimeDevices, loading: realtimeLoading } = useRealtimeDevices()
@@ -77,6 +81,78 @@ export default function DashboardPage() {
     ),
     [data]
   )
+
+  // 1. Play audible sound when new unresolved alerts arrive via API polling
+  useEffect(() => {
+    if (!alerts || alerts.length === 0) return
+
+    if (!isInitialLoadDoneRef.current) {
+      alerts.forEach(a => {
+        const k = a.id ?? a.alert_id
+        if (k != null) seenAlertIdsRef.current.add(k)
+      })
+      isInitialLoadDoneRef.current = true
+      return
+    }
+
+    // Inspect newly arrived alerts
+    for (const a of alerts) {
+      const k = a.id ?? a.alert_id
+      if (k != null && !seenAlertIdsRef.current.has(k)) {
+        seenAlertIdsRef.current.add(k)
+        if ((a.status || '').toLowerCase() !== 'resolved') {
+          playAlertSound(a.severity || 'HIGH')
+          break
+        }
+      }
+    }
+  }, [alerts])
+
+  // 2. Real-time WebSocket connection to /api/v1/alerts/live for zero-delay push sound
+  useEffect(() => {
+    let ws: WebSocket | null = null
+    let reconnectTimer: any = null
+
+    function initLiveAlertsWs() {
+      try {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+        const host = window.location.port === '5173' || window.location.port === '3000'
+          ? `${window.location.hostname}:8000`
+          : window.location.host
+        const wsUrl = `${protocol}//${host}/api/v1/alerts/live`
+
+        ws = new WebSocket(wsUrl)
+
+        ws.onmessage = (event) => {
+          try {
+            const payload = JSON.parse(event.data)
+            if (payload.type === 'ALERT_NEW' && payload.alert) {
+              const newAlert = payload.alert
+              const k = newAlert.id ?? newAlert.alert_id
+              if (k != null && !seenAlertIdsRef.current.has(k)) {
+                seenAlertIdsRef.current.add(k)
+                playAlertSound(newAlert.severity || 'HIGH')
+              }
+              reload()
+            } else if (payload.type === 'ALERT_UPDATE') {
+              reload()
+            }
+          } catch {}
+        }
+
+        ws.onclose = () => {
+          reconnectTimer = setTimeout(initLiveAlertsWs, 6000)
+        }
+      } catch {}
+    }
+
+    initLiveAlertsWs()
+
+    return () => {
+      if (reconnectTimer) clearTimeout(reconnectTimer)
+      if (ws) ws.close()
+    }
+  }, [reload])
 
   const onlineCount = useMemo(
     () => devices.filter(d => {

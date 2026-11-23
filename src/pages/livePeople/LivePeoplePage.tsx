@@ -42,10 +42,19 @@ type MonitoringFeature =
   | 'instruction'
   | 'health'
 
+type MonitoringMapLocation = {
+  deviceKey: string
+  latitude: number
+  longitude: number
+  timestamp: number | null
+  verified: boolean
+} | null
+
 export default function LivePeoplePage() {
   const [params] = useSearchParams()
   const [selectedId, setSelectedId] = useState<number | string | null>(() => (params.get('device') ?? null))
   const [activeFeature, setActiveFeature] = useState<MonitoringFeature>('tracking')
+  const [mapLocation, setMapLocation] = useState<MonitoringMapLocation>(null)
   const [provider, setProvider] = useState(import.meta.env.VITE_GOOGLE_MAPS_API_KEY ? 'google' : 'osm')
   const [mapStyle, setMapStyle] = useState<OpenStreetMapStyle>('standard')
   const [company, setCompany] = useState('')
@@ -105,7 +114,33 @@ export default function LivePeoplePage() {
 
   const pages = Math.max(1, Math.ceil(devices.length / 20))
   const currentPage = Math.min(page, pages - 1)
-  const selected = devices.find(device => device.id === selectedId) ?? devices[0]
+  const selected = devices.find(device =>
+    String(device.id) === String(selectedId) ||
+    String(device.device_id) === String(selectedId) ||
+    String(device.imei) === String(selectedId),
+  ) ?? (params.has('device') ? undefined : devices[0])
+  const handleSelectedLocationChange = useCallback((location: MonitoringMapLocation) => {
+    if (!location) return
+    setMapLocation(current => {
+      if (current?.deviceKey !== location.deviceKey) return location
+      if (current.verified && (
+        !location.verified ||
+        (current.timestamp !== null &&
+          location.timestamp !== null &&
+          current.timestamp >= location.timestamp)
+      )) return current
+      if (
+        current.latitude === location.latitude &&
+        current.longitude === location.longitude &&
+        current.timestamp === location.timestamp &&
+        current.verified === location.verified
+      ) return current
+      return location
+    })
+  }, [])
+  const selectedMapLocation = mapLocation?.deviceKey === String(selected?.id)
+    ? mapLocation
+    : null
 
   const control = {
     '& .MuiOutlinedInput-root': { borderRadius: 0, font: '14px Arial, sans-serif', bgcolor: 'white' },
@@ -481,6 +516,7 @@ export default function LivePeoplePage() {
           <MonitoringMap
             devices={devices}
             selectedId={selected?.id ?? null}
+            onSelectedLocationChange={handleSelectedLocationChange}
             showNames={showNames}
             aggregate={aggregate}
             provider={provider}
@@ -548,8 +584,10 @@ export default function LivePeoplePage() {
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
                       <LocationOnOutlined sx={{ fontSize: 16, color: '#0284c7' }} />
                       <Typography component="span" sx={{ fontSize: 12, fontFamily: 'monospace' }}>
-                        {selected.last_latitude != null && selected.last_longitude != null
-                          ? `${selected.last_latitude.toFixed(4)}, ${selected.last_longitude.toFixed(4)}`
+                        {selectedMapLocation
+                          ? `${selectedMapLocation.latitude.toFixed(4)}, ${selectedMapLocation.longitude.toFixed(4)}`
+                          : selected.last_latitude != null && selected.last_longitude != null
+                            ? `${selected.last_latitude.toFixed(4)}, ${selected.last_longitude.toFixed(4)}`
                           : 'No GPS Fix'}
                       </Typography>
                     </Box>

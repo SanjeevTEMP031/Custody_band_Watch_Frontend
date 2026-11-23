@@ -177,6 +177,7 @@ export interface Device {
 /** GPS live/history location point */
 export interface GpsLocation {
   device_id?: string
+  journey_id?: string | number | null
   latitude: number
   longitude: number
   speed_kmh?: number | null
@@ -195,6 +196,7 @@ export interface GpsLocation {
   gps_status?: string | null
   validity?: string | null
   recorded_at?: string | null
+  gps_time?: string | null
   received_at?: string | null
   timestamp?: string | null
   raw?: unknown
@@ -219,6 +221,12 @@ export interface JourneyPoint {
   latitude: number
   longitude: number
   timestamp: string
+  journey_id?: string | number | null
+  gps_time?: string | null
+  received_at?: string | null
+  gps_fix?: boolean
+  coordinate_source?: string | null
+  location_is_current?: boolean
   speed_kmh?: number | null
   heading?: number | null
   accuracy_m?: number | null
@@ -307,12 +315,15 @@ export interface GeofenceValidateRequest {
 }
 
 export interface ApiAlert {
-  id: number
+  id: number | string
+  alert_id?: string | null
   type: string
   alert_type?: string
+  title?: string
   severity?: string
   status: string
   message: string
+  source?: string
   device_id?: string | number | null
   device_name?: string | null
   device_model?: string | null
@@ -320,11 +331,22 @@ export interface ApiAlert {
   is_subcompany?: boolean
   latitude?: number | null
   longitude?: number | null
+  location_source?: string | null
+  location_timestamp?: string | null
   location_time?: string | null
+  location_age_seconds?: number | null
+  location_accuracy_m?: number | null
+  location_is_stale?: boolean | null
+  raw_event_code?: string | null
+  event_time?: string | null
+  received_at?: string | null
   created_at: string
   acknowledged_by?: number | string | null
   acknowledged_at?: string | null
+  resolved_by?: string | null
+  resolved_at?: string | null
   resolution_notes?: string | null
+  notes?: string | null
 }
 
 export interface DashboardStats {
@@ -676,7 +698,12 @@ function normaliseDevice(d: any, idx: number): Device {
 
 export const listDevices = async (skip = 0, limit = 100): Promise<Device[]> => {
   const raw = await request<any[]>(`/devices?skip=${skip}&limit=${limit}`)
-  return (Array.isArray(raw) ? raw : []).map(normaliseDevice)
+  return (Array.isArray(raw) ? raw : [])
+    .filter((d: any) => {
+      const id = String(d?.device_id || d?.imei || d?.id || '')
+      return !id.startsWith('TEST_') && !id.startsWith('test_') && id !== '863758061830999'
+    })
+    .map(normaliseDevice)
 }
 
 export const getDevice = async (deviceId: string | number): Promise<Device> => {
@@ -834,13 +861,40 @@ export const getLatestGpsLocation = async (
 ): Promise<LatestGpsLocation | null> =>
   (await getLatestGpsSnapshot(deviceId, signal)).latest
 
+export interface GpsHistoryQueryOptions {
+  limit?: number
+  before_timestamp?: string
+  after_timestamp?: string
+  start_time?: string
+  end_time?: string
+  journey_id?: string
+  signal?: AbortSignal
+}
+
 /** Location history / breadcrumbs for route replay */
 export const getGpsHistory = async (
   deviceId: string | number,
-  limit = 100,
+  limitOrOptions: number | GpsHistoryQueryOptions = 500,
   signal?: AbortSignal
 ): Promise<GpsLocation[]> => {
-  const response = await request<unknown>(`/gps/${deviceId}/history?limit=${limit}`, { signal })
+  let url = `/gps/${deviceId}/history?`
+  let effectiveSignal = signal
+
+  if (typeof limitOrOptions === 'number') {
+    url += `limit=${limitOrOptions}`
+  } else {
+    const params = new URLSearchParams()
+    params.set('limit', String(limitOrOptions.limit ?? 500))
+    if (limitOrOptions.before_timestamp) params.set('before_timestamp', limitOrOptions.before_timestamp)
+    if (limitOrOptions.after_timestamp) params.set('after_timestamp', limitOrOptions.after_timestamp)
+    if (limitOrOptions.start_time) params.set('start_time', limitOrOptions.start_time)
+    if (limitOrOptions.end_time) params.set('end_time', limitOrOptions.end_time)
+    if (limitOrOptions.journey_id) params.set('journey_id', limitOrOptions.journey_id)
+    url += params.toString()
+    if (limitOrOptions.signal) effectiveSignal = limitOrOptions.signal
+  }
+
+  const response = await request<unknown>(url, { signal: effectiveSignal })
   const history = unwrapGpsHistoryResponse(response)
   if (!history) {
     console.warn('GPS history response did not contain a recognized record list.')
@@ -870,6 +924,15 @@ export const getGpsHistory = async (
       longitude: fix.longitude,
       timestamp: fix.recordedAt,
       recorded_at: fix.recordedAt,
+      gps_time: typeof telemetry.gps_time === 'string' ? telemetry.gps_time : fix.recordedAt,
+      received_at: typeof telemetry.received_at === 'string' ? telemetry.received_at : null,
+      journey_id: typeof telemetry.journey_id === 'string' || typeof telemetry.journey_id === 'number'
+        ? telemetry.journey_id
+        : null,
+      coordinate_source: typeof telemetry.coordinate_source === 'string'
+        ? telemetry.coordinate_source
+        : null,
+      location_is_current: telemetry.location_is_current !== false,
       accuracy_m: fix.accuracy,
       speed_kmh: optionalNumber(telemetry.speed_kmh ?? telemetry.speed),
       heading: optionalNumber(
@@ -898,7 +961,11 @@ export const checkGeofence = (payload: GeofenceCheckRequest) =>
 
 // Legacy aliases
 export const getLatestLocation = (deviceId: number | string) => getLatestGpsLocation(deviceId)
-export const listLocationHistory = (deviceId: number | string, limit = 500) => getGpsHistory(deviceId, limit)
+export const listLocationHistory = (
+  deviceId: number | string,
+  limitOrOptions: number | GpsHistoryQueryOptions = 500,
+  signal?: AbortSignal
+) => getGpsHistory(deviceId, limitOrOptions, signal)
 
 // =============================================================================
 // GEOFENCES  —  /api/v1/geofences
@@ -951,13 +1018,13 @@ export const listAlerts = (skipOrParams: number | ListAlertsParams = 0, limit = 
 
 export const getAlert = (id: number) => request<ApiAlert>(`/alerts/${id}`)
 
-export const acknowledgeAlert = (id: number, notes = 'Officer acknowledged alert') =>
+export const acknowledgeAlert = (id: number | string, notes = 'Officer acknowledged alert') =>
   request<ApiAlert>(`/alerts/${id}/acknowledge`, {
     method: 'POST',
     body: JSON.stringify({ notes }),
   })
 
-export const resolveAlert = (id: number, resolution_notes = 'Incident cleared and verified by officer') =>
+export const resolveAlert = (id: number | string, resolution_notes = 'Incident cleared and verified by officer') =>
   request<ApiAlert>(`/alerts/${id}/resolve`, {
     method: 'POST',
     body: JSON.stringify({ resolution_notes }),

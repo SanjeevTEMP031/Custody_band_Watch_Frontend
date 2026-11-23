@@ -275,7 +275,16 @@ export default function RouteTrackingMap({
   // Determine start, end, and current locations
   const startCoord = validRoute.length > 0 ? validRoute[0] : null
   const isTripCompleted = trip?.status === 'completed'
-  const endCoord = isTripCompleted && validRoute.length > 1 ? validRoute[validRoute.length - 1] : null
+  const recordedEndCoord = trip?.end_location &&
+    isValidGpsCoord(trip.end_location.latitude, trip.end_location.longitude)
+    ? {
+        ...trip.end_location,
+        timestamp: trip.end_location.timestamp ?? '',
+      }
+    : null
+  const endCoord = isTripCompleted
+    ? recordedEndCoord ?? validRoute[validRoute.length - 1] ?? null
+    : null
 
   const liveCoord =
     currentLocation && isValidGpsCoord(currentLocation.latitude, currentLocation.longitude)
@@ -388,7 +397,7 @@ export default function RouteTrackingMap({
       <div style="font-family: inherit; font-size: 13px; line-height: 1.4;">
         <strong>Playback position</strong>
         <div>${playbackPoint.latitude.toFixed(5)}, ${playbackPoint.longitude.toFixed(5)}</div>
-        <div>${new Date(playbackPoint.timestamp).toLocaleString()}</div>
+        <div>${new Date(playbackPoint.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}</div>
       </div>
     `)
     marker.addTo(markerGroup)
@@ -421,8 +430,9 @@ export default function RouteTrackingMap({
       setOsrmLoading(false)
       return
     }
-    if (!startCoord || validRoute.length < 2) {
+    if (!startCoord || validRoute.length < 2 || gpsRouteSegments.length !== 1) {
       setOsrmRoute(null)
+      setOsrmLoading(false)
       return
     }
 
@@ -487,6 +497,7 @@ export default function RouteTrackingMap({
     liveCoord?.latitude,
     liveCoord?.longitude,
     routeSignature,
+    gpsRouteSegments.length,
     isTripCompleted,
     routes,
   ])
@@ -607,9 +618,9 @@ export default function RouteTrackingMap({
             Journey Start Location
           </div>
           <div><strong>Coordinates:</strong> ${startCoord.latitude.toFixed(5)}, ${startCoord.longitude.toFixed(5)}</div>
-          <div><strong>Start Time:</strong> ${startCoord.timestamp ? new Date(startCoord.timestamp).toLocaleString() : 'N/A'}</div>
+          <div><strong>Start Time:</strong> ${startCoord.timestamp ? new Date(startCoord.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : 'N/A'}</div>
           ${trip?.wearer_name ? `<div><strong>Wearer:</strong> ${trip.wearer_name}</div>` : ''}
-          ${osrmRoute ? `<div style="color: #4f1fd1; font-weight: 600; margin-top: 4px;">OSRM Driving: ${osrmRoute.distanceKm.toFixed(1)} km · ${Math.round(osrmRoute.durationMin)} min</div>` : ''}
+          ${osrmRoute ? `<div style="color: #4f1fd1; font-weight: 600; margin-top: 4px;">OSRM road estimate (not recorded travel): ${osrmRoute.distanceKm.toFixed(1)} km · ${Math.round(osrmRoute.durationMin)} min</div>` : ''}
         </div>
       `
       startMarker.bindPopup(popupContent)
@@ -630,9 +641,9 @@ export default function RouteTrackingMap({
             Journey Completed (End Location)
           </div>
           <div><strong>Coordinates:</strong> ${endCoord.latitude.toFixed(5)}, ${endCoord.longitude.toFixed(5)}</div>
-          <div><strong>End Time:</strong> ${endCoord.timestamp ? new Date(endCoord.timestamp).toLocaleString() : 'N/A'}</div>
+          <div><strong>End Time:</strong> ${endCoord.timestamp ? new Date(endCoord.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : 'N/A'}</div>
           <div><strong>Total Travelled:</strong> ${trip?.total_distance_km?.toFixed(2) ?? '—'} km</div>
-          ${osrmRoute ? `<div style="color: #4f1fd1; font-weight: 600; margin-top: 4px;">Road Route: ${osrmRoute.distanceKm.toFixed(1)} km · ${Math.round(osrmRoute.durationMin)} min</div>` : ''}
+          ${osrmRoute ? `<div style="color: #4f1fd1; font-weight: 600; margin-top: 4px;">OSRM road estimate (not recorded travel): ${osrmRoute.distanceKm.toFixed(1)} km · ${Math.round(osrmRoute.durationMin)} min</div>` : ''}
         </div>
       `
       endMarker.bindPopup(popupContent)
@@ -655,7 +666,7 @@ export default function RouteTrackingMap({
           <div><strong>Coordinates:</strong> ${liveCoord.latitude.toFixed(5)}, ${liveCoord.longitude.toFixed(5)}</div>
           ${liveCoord.speed_kmh != null ? `<div><strong>Speed:</strong> ${liveCoord.speed_kmh} km/h</div>` : ''}
           ${liveCoord.heading != null ? `<div><strong>Direction:</strong> ${liveCoord.heading}°</div>` : ''}
-          <div><strong>Last Updated:</strong> ${liveCoord.timestamp ? new Date(liveCoord.timestamp).toLocaleTimeString() : 'Live'}</div>
+          <div><strong>Last Updated:</strong> ${liveCoord.timestamp ? new Date(liveCoord.timestamp).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }) : 'Live'}</div>
           ${osrmRoute ? `<div style="color: #4f1fd1; font-weight: 600; margin-top: 4px;">Route from Start: ${osrmRoute.distanceKm.toFixed(1)} km · ${Math.round(osrmRoute.durationMin)} min</div>` : ''}
         </div>
       `
@@ -685,9 +696,9 @@ export default function RouteTrackingMap({
       const bounds = L.latLngBounds(allTripBounds)
       if (allTripBounds.length === 1) map.setView(allTripBounds[0], 15)
       else map.fitBounds(bounds, { padding: [50, 50], maxZoom: 16 })
-    } else if (autoFitOnUpdate && (osrmRoute?.path?.length || latLngs.length > 0) && isNewJourney) {
+    } else if (autoFitOnUpdate && latLngs.length > 0 && isNewJourney) {
       lastFittedTripIdRef.current = tripId
-      const boundsTarget = osrmRoute?.path && osrmRoute.path.length > 0 ? osrmRoute.path : latLngs
+      const boundsTarget = latLngs
       if (boundsTarget.length === 1) {
         map.setView(boundsTarget[0], 15)
       } else {
@@ -1025,7 +1036,7 @@ export default function RouteTrackingMap({
             }}
           >
             <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: '#4f1fd1' }} />
-            Dotted Purple
+            Road Estimate
           </button>
           <button
             type="button"
@@ -1248,7 +1259,7 @@ export default function RouteTrackingMap({
             >
               <span>🛣️ OSRM Road Distance: {searchRoute.distanceKm.toFixed(1)} km</span>
               <span>⏱️ Driving Time: {Math.round(searchRoute.durationMin)} min</span>
-              <span style={{ fontSize: 11, fontWeight: 500, color: '#6d28d9' }}>(Dotted Purple Path)</span>
+              <span style={{ fontSize: 11, fontWeight: 500, color: '#6d28d9' }}>(OSRM estimate, not recorded travel)</span>
             </Box>
           )}
 
@@ -1360,7 +1371,7 @@ export default function RouteTrackingMap({
               }}
             />
             <Typography variant="caption" sx={{ fontWeight: 700, color: '#4f1fd1' }}>
-              Dotted Purple Path (OSRM)
+              OSRM road estimate (not recorded travel)
             </Typography>
           </Box>
 

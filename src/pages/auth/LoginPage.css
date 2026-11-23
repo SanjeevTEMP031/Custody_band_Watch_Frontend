@@ -21,7 +21,7 @@
   backdrop-filter: blur(12px);
 }
 .atlas-heading { text-align: center; margin-bottom: 26px; }
-.atlas-login .atlas-brand { font-size: 16px; font-weight: 800; letter-spacing: 3px; margin: 8px 0 20px; }
+.atlas-login .atlas-logo { display: block; width: 250px; height: 60px; max-width: 100%; margin: 0 auto 20px; object-fit: contain; }
 .atlas-login .powered-by-purview { color: #a9bfdc; }
 .atlas-login .powered-by-purview strong { color: #edf4ff; }
 .atlas-login .atlas-title { font-size: 26px; font-weight: 750; line-height: 1.25; margin-bottom: 9px; }
@@ -53,8 +53,7 @@
 @media (min-width: 481px) and (max-height: 700px) {
   .atlas-login { padding-top: 20px; padding-bottom: 20px; }
   .atlas-login .atlas-card { padding-top: 24px; padding-bottom: 28px; }
-  .atlas-login .atlas-heading > svg { width: 48px; height: 48px; }
-  .atlas-login .atlas-brand { margin-bottom: 12px; }
+  .atlas-login .atlas-logo { width: 220px; height: 53px; margin-bottom: 12px; }
   .atlas-heading { margin-bottom: 18px; }
   .atlas-login form .MuiStack-root { gap: 12px; }
   .atlas-login form .MuiStack-root > :not(style) ~ :not(style) { margin-top: 12px; }

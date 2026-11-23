@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Box, Typography } from '@mui/material'
 import { importLibrary, setOptions } from '@googlemaps/js-api-loader'
 import type { Device, GpsLocation } from '../../services/api'
+import { getGpsHistory } from '../../services/api'
 import {
   isFreshGpsTimestamp,
   normalizeVerifiedGpsFix,
@@ -23,7 +24,21 @@ type MovementPoint = { lat: number; lng: number }
 type VerifiedMovementPoint = MovementPoint & { recordedAt: string; source: string }
 type MovementSegment = MovementPoint[]
 
-export default function MonitoringMap({ devices, selectedId, showNames, aggregate, provider, mapStyle }: { devices: Device[]; selectedId: number | string | null; showNames: boolean; aggregate: boolean; provider: string; mapStyle: OpenStreetMapStyle }) {
+export default function MonitoringMap({ devices, selectedId, showNames, aggregate, provider, mapStyle, onSelectedLocationChange }: {
+  devices: Device[]
+  selectedId: number | string | null
+  showNames: boolean
+  aggregate: boolean
+  provider: string
+  mapStyle: OpenStreetMapStyle
+  onSelectedLocationChange?: (location: {
+    deviceKey: string
+    latitude: number
+    longitude: number
+    timestamp: number | null
+    verified: boolean
+  } | null) => void
+}) {
   const container = useRef<HTMLDivElement>(null)
   const googleMap = useRef<google.maps.Map | null>(null)
   const googleMarkers = useRef<google.maps.Marker[]>([])
@@ -48,6 +63,12 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
   )
   const trackingDeviceId = selectedDevice
     ? String(selectedDevice.device_id || selectedDevice.imei || selectedDevice.serial_number || selectedDevice.id)
+    : null
+  const selectedFirestoreFix = selectedDevice
+    ? normalizeVerifiedGpsFix(selectedDevice)
+    : null
+  const selectedVerifiedPosition = selectedGpsPosition.deviceKey === selectedKey
+    ? selectedGpsPosition.position
     : null
   const firestoreLatest = useMemo<GpsLocation | null>(() => {
     if (!selectedDevice) return null
@@ -114,13 +135,64 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
     selectedDevice?.gps_last_fix,
     handleVerifiedGpsPoint,
     handleLastReportedLocation,
+    false,
     false
   )
+  useEffect(() => {
+    if (!trackingDeviceId || selectedKey == null) return
+    const controller = new AbortController()
+    let cancelled = false
+    let timer: number | undefined
+
+    const refreshLastVerifiedLocation = async () => {
+      try {
+        const history = await getGpsHistory(trackingDeviceId, 500, controller.signal)
+        if (cancelled) return
+        let newest: ReturnType<typeof normalizeVerifiedGpsFix> = null
+        for (const point of history) {
+          const fix = normalizeVerifiedGpsFix(point)
+          if (fix && (!newest || fix.timestamp > newest.timestamp)) newest = fix
+        }
+        if (newest) {
+          const previous = selectedGpsTimestampRef.current
+          if (previous?.deviceKey !== selectedKey || newest.timestamp > previous.timestamp) {
+            selectedGpsTimestampRef.current = { deviceKey: selectedKey, timestamp: newest.timestamp }
+            setSelectedGpsPosition({
+              deviceKey: selectedKey,
+              position: {
+                lat: newest.latitude,
+                lng: newest.longitude,
+                recordedAt: newest.recordedAt,
+                source: newest.source,
+              },
+            })
+          }
+        }
+      } catch (error) {
+        if (!cancelled && !(error instanceof DOMException && error.name === 'AbortError')) {
+          console.warn(`Unable to load verified GPS history for device ${trackingDeviceId}.`, error)
+        }
+      } finally {
+        if (!cancelled) {
+          timer = window.setTimeout(refreshLastVerifiedLocation, 60_000)
+        }
+      }
+    }
+
+    void refreshLastVerifiedLocation()
+    return () => {
+      cancelled = true
+      controller.abort()
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [trackingDeviceId, selectedKey])
   const selectedReportedLocation = selectedLastReported.deviceKey === selectedKey
-    ? selectedLastReported.currentGpsAvailable
+    ? selectedLastReported.currentGpsAvailable || selectedVerifiedPosition || selectedFirestoreFix
       ? null
       : selectedLastReported.location
-    : selectedDevice
+    : selectedVerifiedPosition || selectedFirestoreFix
+      ? null
+      : selectedDevice
       ? selectNewestLastReportedGpsLocation([
           selectedDevice.gps_last_fix,
           selectedDevice.gps_last_known_location,
@@ -131,11 +203,18 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
       ? selectedGpsPosition.position
       : null
     const isSelectedDevice = String(device.id) === selectedKey || String(device.device_id) === selectedKey
-    const reportedLocation = isSelectedDevice && selectedLastReported.deviceKey === selectedKey
+    const hasVerifiedPosition = isSelectedDevice &&
+      (position !== null || normalizeVerifiedGpsFix(device) !== null)
+    const reportedLocation = isSelectedDevice && !hasVerifiedPosition && selectedLastReported.deviceKey === selectedKey
       ? selectedLastReported.currentGpsAvailable
         ? null
         : selectedLastReported.location
-      : null
+      : !hasVerifiedPosition && isSelectedDevice
+        ? selectNewestLastReportedGpsLocation([
+            device.gps_last_fix,
+            device.gps_last_known_location,
+          ])
+        : null
     const withReportedLocation = reportedLocation
       ? {
           ...device,
@@ -150,18 +229,27 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
           },
           gps_last_known_location: null,
         }
+      : hasVerifiedPosition
+        ? { ...device, gps_last_fix: null, gps_last_known_location: null }
       : selectedLastReported.deviceKey === selectedKey && selectedLastReported.currentGpsAvailable
         ? { ...device, gps_last_fix: null, gps_last_known_location: null }
         : device
     if (!position || !isSelectedDevice) return withReportedLocation
     return {
       ...withReportedLocation,
+      latitude: position.lat,
+      longitude: position.lng,
+      lat: position.lat,
+      lon: position.lng,
       last_latitude: position.lat,
       last_longitude: position.lng,
       gps_update_time: position.recordedAt,
       gps_fix_source: position.source,
       has_gps_fix: true,
       gps_fix: true,
+      gps_valid: true,
+      gps_status: 'GPS VALID',
+      coordinate_source: 'verified_history',
     }
   }), [devices, selectedGpsPosition, selectedKey, selectedLastReported])
   const located = useMemo(() => displayDevices.filter(device => {
@@ -174,6 +262,26 @@ export default function MonitoringMap({ devices, selectedId, showNames, aggregat
   const selectedFix = selectedLocatedDevice
     ? normalizeVerifiedGpsFix(selectedLocatedDevice)
     : null
+  const selectedDisplayLocation = selectedFix
+    ? {
+        deviceKey: selectedKey ?? '',
+        latitude: selectedFix.latitude,
+        longitude: selectedFix.longitude,
+        timestamp: selectedFix.timestamp,
+        verified: true,
+      }
+    : selectedReportedLocation
+      ? {
+          deviceKey: selectedKey ?? '',
+          latitude: selectedReportedLocation.latitude,
+          longitude: selectedReportedLocation.longitude,
+        timestamp: selectedReportedLocation.timestamp,
+        verified: false,
+        }
+      : null
+  useEffect(() => {
+    onSelectedLocationChange?.(selectedDisplayLocation)
+  }, [onSelectedLocationChange, selectedDisplayLocation])
   const selectedIsLastKnown = Boolean(
     (selectedFix && !isFreshGpsTimestamp(selectedFix.timestamp)) ||
     selectedReportedLocation

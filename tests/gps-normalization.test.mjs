@@ -20,9 +20,11 @@ import {
   unwrapGpsLatestResponse,
 } from '../src/services/gpsNormalization.ts'
 import {
+  analyzeGpsTrail,
   appendGpsTrailPoint,
   buildGpsTrailSegments,
   DEFAULT_GPS_TRAIL_FILTERS,
+  groupGpsPointsByInactivity,
 } from '../src/services/gpsTrail.ts'
 
 const now = Date.parse('2026-11-12T07:10:00.000Z')
@@ -40,6 +42,21 @@ test('accepts a source-tagged valid latest fix and timezone-aware GPS timestamp'
 
   assert.equal(fix?.source, 'watch_tcp')
   assert.equal(fix?.timestamp, Date.parse('2026-11-12T07:09:00.000Z'))
+})
+
+test('uses gps_time for route chronology and interprets naive device timestamps as UTC', () => {
+  const fix = normalizeVerifiedGpsFix({
+    latitude: 17.446317,
+    longitude: 78.368395,
+    gps_fix: true,
+    gps_valid: true,
+    gps_source: 'watch_tcp',
+    gps_time: '2026-11-12 07:09:00',
+    recorded_at: '2026-11-12T07:15:00Z',
+    received_at: '2026-11-12T07:15:01Z',
+  }, now)
+  assert.equal(fix?.timestamp, Date.parse('2026-11-12T07:09:00Z'))
+  assert.equal(parseGpsTimestamp('2026-11-12 12:39:00'), Date.parse('2026-11-12T12:39:00Z'))
 })
 
 test('accepts watch_frame as a trusted source for a strictly verified fix', () => {
@@ -962,4 +979,101 @@ test('keeps moving GPS fixes as a line and breaks the line after a long gap', ()
     ['start', 'move'],
     ['after-idle'],
   ])
+})
+
+test('does not split continuous GPS history into journeys based on the 5-minute route gap', () => {
+  const start = Date.parse('2026-11-20T03:30:00Z')
+  const durations = [15, 45, 60, 120, 240]
+  for (const durationMinutes of durations) {
+    const points = []
+    for (let minute = 0; minute <= durationMinutes; minute += 10) {
+      points.push(makePoint(17.4 + minute / 100_000, start + minute * 60_000, `${durationMinutes}-${minute}`))
+    }
+    if (durationMinutes % 10 !== 0) {
+      points.push(makePoint(
+        17.4 + durationMinutes / 100_000,
+        start + durationMinutes * 60_000,
+        `${durationMinutes}-end`
+      ))
+    }
+    assert.equal(groupGpsPointsByInactivity(points).length, 1, `${durationMinutes}-minute journey`)
+  }
+})
+
+test('keeps the November 20 09:01–09:44 history marks in one inferred journey', () => {
+  const times = ['09:01', '09:14', '09:26', '09:37', '09:44']
+  const points = times.map((time, index) => {
+    return makePoint(
+      17.4 + index / 1000,
+      Date.parse(`2026-11-20T${time}:00+05:30`),
+      `nov20-${time}`
+    )
+  })
+  assert.equal(groupGpsPointsByInactivity(points).length, 1)
+})
+
+test('uses the Nov 22 21:22 GPS fix as the journey endpoint', () => {
+  const previousTimestamp = Date.parse('2026-11-22T15:51:43Z')
+  const latestTimestamp = Date.parse('2026-11-22T15:52:55Z')
+  const points = [
+    {
+      ...makePoint(17.54324, previousTimestamp, 'previous'),
+      longitude: 78.36355,
+    },
+    {
+      ...makePoint(17.545124, latestTimestamp, 'latest'),
+      longitude: 78.364688,
+    },
+  ]
+
+  const groups = groupGpsPointsByInactivity(points)
+  const route = analyzeGpsTrail(groups[0])
+
+  assert.equal(groups.length, 1)
+  assert.equal(route.rejectedOutlierCount, 0)
+  assert.equal(route.acceptedPoints.at(-1)?.key, 'latest')
+})
+
+test('keeps a short GPS/network interruption in the same inferred history group', () => {
+  const start = Date.parse('2026-11-20T03:30:00Z')
+  const groups = groupGpsPointsByInactivity([
+    makePoint(17.4, start, 'before-outage'),
+    makePoint(17.401, start + 20 * 60_000, 'after-outage'),
+  ])
+  assert.equal(groups.length, 1)
+
+  const route = analyzeGpsTrail(groups[0])
+  assert.equal(route.gapCount, 1)
+  assert.equal(route.segments.length, 2)
+})
+
+test('keeps separate inferred journeys apart after the configured inactivity boundary', () => {
+  const start = Date.parse('2026-11-20T03:30:00Z')
+  const groups = groupGpsPointsByInactivity([
+    makePoint(17.4, start, 'trip-one'),
+    makePoint(17.401, start + 35 * 60_000, 'trip-two'),
+  ])
+  assert.equal(groups.length, 2)
+})
+
+test('route analysis excludes duplicates, stationary jitter, implausible jumps, and gap distance', () => {
+  const start = Date.parse('2026-11-20T03:30:00Z')
+  const points = [
+    makePoint(17.4, start, 'start'),
+    makePoint(17.40001, start + 30_000, 'jitter'),
+    makePoint(17.401, start + 60_000, 'move'),
+    makePoint(17.401, start + 60_000, 'duplicate'),
+    makePoint(18.4, start + 120_000, 'outlier'),
+    makePoint(17.402, start + 180_000, 'move-after-outlier'),
+    makePoint(17.403, start + 10 * 60_000, 'after-gap'),
+  ]
+  const route = analyzeGpsTrail(points)
+
+  assert.equal(route.duplicateCount, 1)
+  assert.equal(route.filteredJitterCount, 1)
+  assert.equal(route.rejectedOutlierCount, 1)
+  assert.equal(route.gapCount, 1)
+  assert.equal(route.segments.length, 2)
+  assert.equal(route.acceptedPoints.some((point) => point.key === 'outlier'), false)
+  assert.ok(route.distanceMeters > 200 && route.distanceMeters < 240)
 })

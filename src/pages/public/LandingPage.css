@@ -28,13 +28,8 @@
 
 .landing-page .site-header { height: 76px; position: sticky; top: 0; z-index: 30; background: rgba(255,255,255,.97); border-bottom: 1px solid rgba(225,232,239,.8); box-shadow: 0 4px 18px rgba(10,35,58,.035); backdrop-filter: blur(14px); }
 .landing-page .nav-wrap { width: min(1280px, calc(100% - 48px)); height: 100%; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; }
-.landing-page .brand { display: inline-flex; align-items: center; gap: 10px; color: #102438; font: 800 21px "Manrope", sans-serif; letter-spacing: -1px; white-space: nowrap; }
-.landing-page .brand-blue { color: var(--blue); }
-.landing-page .brand-mark { width: 27px; height: 27px; display: inline-flex; align-items: center; justify-content: center; gap: 2px; border-radius: 8px; background: #eaf7ff; transform: skew(-9deg); }
-.landing-page .brand-mark span { width: 3px; border-radius: 4px; background: #148ed0; }
-.landing-page .brand-mark span:nth-child(1) { height: 10px; }
-.landing-page .brand-mark span:nth-child(2) { height: 16px; }
-.landing-page .brand-mark span:nth-child(3) { height: 12px; }
+.landing-page .brand { display: inline-flex; align-items: center; white-space: nowrap; }
+.landing-page .brand-logo { display: block; width: 225px; height: 54px; object-fit: contain; }
 .landing-page .main-nav { display: flex; align-items: center; gap: 27px; }
 .landing-page .main-nav > a:not(.nav-cta) { color: #46586a; font-size: 12px; font-weight: 600; transition: color .2s ease; }
 .landing-page .main-nav > a:hover { color: var(--blue); }
@@ -324,6 +319,7 @@
 }
 @media (max-width: 600px) {
   .landing-page .container, .landing-page .nav-wrap { width: min(100% - 36px, 500px); }
+  .landing-page .brand-logo { width: 190px; height: 48px; }
   .landing-page .hero-layout { display: flex; flex-direction: column; align-items: stretch; gap: 3px; padding-top: 58px; padding-bottom: 5px; }
   .landing-page .hero { min-height: 0; }
   .landing-page .hero-copy { padding: 0; }
@@ -403,20 +399,6 @@
 /* ==========================================================================
    Enhanced Enterprise Additions: Map, Services, Hardware, Contact HUD
    ========================================================================== */
-
-/* Brand C05 Badge */
-.landing-page .brand-badge-c05 {
-  font-family: monospace;
-  font-size: 9px;
-  font-weight: 700;
-  padding: 2px 7px;
-  border-radius: 4px;
-  background: rgba(20, 142, 208, 0.12);
-  color: #148ed0;
-  border: 1px solid rgba(20, 142, 208, 0.25);
-  margin-left: 6px;
-  letter-spacing: 0.08em;
-}
 
 .landing-page .api-doc-link {
   display: inline-flex;

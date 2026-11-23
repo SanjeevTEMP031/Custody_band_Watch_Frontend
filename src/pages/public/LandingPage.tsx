@@ -118,9 +118,11 @@ function Icon({ name, size = 20, className = '' }: {
 function Brand({ light = false }) {
   return (
     <a className={`brand${light ? ' brand-light' : ''}`} href="#home" aria-label="TrackGuard 360 home">
-      <span className="brand-mark"><span /><span /><span /></span>
-      <span>TrackGuard <span className="brand-blue">360</span></span>
-      <span className="brand-badge-c05">C05 ECOSYSTEM</span>
+      <img
+        className="brand-logo"
+        src={light ? '/trackguard360-logo-light.svg' : '/trackguard360-logo.svg'}
+        alt="TrackGuard 360 GPS & Monitoring"
+      />
     </a>
   );
 }

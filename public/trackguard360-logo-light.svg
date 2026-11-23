@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="96" viewBox="0 0 400 96" fill="none">
+  <rect x="4" y="4" width="88" height="88" rx="20" fill="#071A2E"/>
+  <path d="M48 13 78 24v21c0 20-12 31-30 39C30 76 18 65 18 45V24l30-11Z" fill="#0B2944" stroke="#27C7F5" stroke-width="3.5" stroke-linejoin="round"/>
+  <path d="M48 22 69 30v15c0 14-8 22-21 29-13-7-21-15-21-29V30l21-8Z" stroke="#F5FBFF" stroke-width="2.5" stroke-linejoin="round"/>
+  <circle cx="48" cy="45" r="13" fill="#071A2E" stroke="#27C7F5" stroke-width="2.5"/>
+  <path d="m48 35 2.8 6.1 6.7.7-5 4.5 1.4 6.6-5.9-3.4-5.9 3.4 1.4-6.6-5-4.5 6.7-.7L48 35Z" fill="#F5FBFF"/>
+  <path d="M48 58v7" stroke="#27C7F5" stroke-width="2.5" stroke-linecap="round"/>
+  <text x="108" y="53" fill="#F5FBFF" font-family="Arial, Helvetica, sans-serif" font-size="35" font-style="italic" font-weight="700" letter-spacing="-1.7">TrackGuard<tspan font-size="29" font-weight="800">360</tspan></text>
+  <text x="111" y="75" fill="#B7C9D9" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="700" letter-spacing="3.1">GPS &amp; MONITORING</text>
+</svg>

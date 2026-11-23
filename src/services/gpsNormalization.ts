@@ -351,10 +351,10 @@ function inspectGpsFix(value: unknown, now: number): {
   ) reasons.push('invalid-coordinates')
 
   const rawTimestamp = firstValue(
-    record.recorded_at,
     record.gps_time,
-    record.timestamp,
     record.gps_timestamp,
+    record.timestamp,
+    record.recorded_at,
     record.gps_recorded_at,
     record.at,
     record.last_valid_gps_time,

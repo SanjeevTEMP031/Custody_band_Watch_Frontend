@@ -14,7 +14,6 @@ import {
   LogOut,
   ChevronLeft,
   ChevronRight,
-  Activity,
   X
 } from 'lucide-react'
 import { logout } from '../../store/authSlice'
@@ -166,18 +165,11 @@ export default function Sidebar({
         {/* Sidebar Header & Branding */}
         <div className="sidebar-header">
           <Link to="/admin/dashboard" className="sidebar-brand" onClick={onCloseMobile}>
-            <div className="brand-icon-box">
-              <Activity size={20} className="brand-pulse-icon" />
-              <div className="brand-glow" />
-            </div>
-            {!collapsed && (
-              <div className="brand-text-wrapper">
-                <span className="brand-title">
-                  TrackGuard <span className="brand-accent">360</span>
-                </span>
-                <span className="brand-badge">GPS &amp; MONITORING</span>
-              </div>
-            )}
+            <img
+              className="sidebar-brand-logo"
+              src={collapsed ? '/trackguard360-mark.svg' : '/trackguard360-logo-light.svg'}
+              alt="TrackGuard 360 GPS & Monitoring"
+            />
           </Link>
 
           {/* Close button for mobile */}

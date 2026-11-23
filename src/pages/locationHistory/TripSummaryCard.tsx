@@ -32,6 +32,8 @@ interface TripSummaryCardProps {
   latestGpsTime?: Date | string | null
   isGpsStale?: boolean
   hasGpsFix?: boolean
+  // NEW PROP: Explicitly freeze duration when device is offline/stale
+  frozenEndTime?: Date
 }
 
 function getCompassDirection(deg?: number | null): string {
@@ -69,13 +71,14 @@ function formatDateTime(isoString?: string | null): string {
   try {
     const d = new Date(isoString)
     if (isNaN(d.getTime())) return isoString
-    return d.toLocaleString(undefined, {
+    return d.toLocaleString('en-IN', {
       month: 'short',
       day: 'numeric',
       year: 'numeric',
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
+      timeZone: 'Asia/Kolkata',
     })
   } catch {
     return isoString
@@ -111,20 +114,23 @@ export default function TripSummaryCard({
   latestGpsTime,
   isGpsStale,
   hasGpsFix = true,
+  frozenEndTime,
 }: TripSummaryCardProps) {
   const theme = useTheme()
   const [nowMs, setNowMs] = useState<number>(Date.now())
 
   const isInProgress = trip?.status === 'in_progress'
 
-  // Update timer every second for active in-progress trips
+  // FIX 1: Only tick the timer if journey is in progress AND GPS is NOT stale
   useEffect(() => {
-    if (!isInProgress) return
+    // Stop ticking if completed, OR if we are currently stale/offline
+    if (!isInProgress || isGpsStale) return
+    
     const interval = window.setInterval(() => {
       setNowMs(Date.now())
     }, 1000)
     return () => window.clearInterval(interval)
-  }, [isInProgress])
+  }, [isInProgress, isGpsStale])
 
   if (!trip) {
     return (
@@ -138,20 +144,33 @@ export default function TripSummaryCard({
     )
   }
 
-  const durationStr = formatDuration(trip.start_time, trip.end_time, nowMs)
+  // Determine which "end time" to use for duration calculation
+  let effectiveEndTime: string | undefined = trip.end_time ?? undefined
+  if (isInProgress && frozenEndTime) {
+    effectiveEndTime = frozenEndTime.toISOString()
+  }
+
+  const durationStr = formatDuration(trip.start_time, effectiveEndTime, nowMs)
   const distanceKm = trip.total_distance_km ?? 0
   const distanceDisplay = distanceKm >= 1
     ? `${distanceKm.toFixed(2)} km`
     : `${Math.round(distanceKm * 1000)} m`
+  const routeDiagnostics = trip.route_diagnostics
 
   const effectiveSpeed = currentSpeed ?? currentLocation?.speed_kmh ?? trip.current_location?.speed_kmh
   const effectiveHeading = currentHeading ?? currentLocation?.heading ?? trip.current_location?.heading
   const effectiveBattery = batteryPct ?? currentLocation?.battery_pct
+  const activePosition = currentLocation ?? trip.current_location
+  const activePositionLabel = hasGpsFix && !isGpsStale
+    ? 'Current Live Position'
+    : activePosition
+      ? 'Last Known Position'
+      : 'Waiting for GPS Fix'
 
   const latestTimeStr = latestGpsTime
     ? typeof latestGpsTime === 'string'
       ? formatDateTime(latestGpsTime)
-      : latestGpsTime.toLocaleTimeString()
+      : latestGpsTime.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })
     : trip.current_location?.timestamp
     ? formatDateTime(trip.current_location.timestamp)
     : 'Waiting for fix'
@@ -189,10 +208,15 @@ export default function TripSummaryCard({
       >
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
           <Activity size={18} color={isInProgress ? theme.palette.primary.main : '#64748b'} />
-          <Typography variant="subtitle2" sx={{ fontWeight: 700, color: '#1e293b' }}>
-            Journey Summary
-            {trip.wearer_name ? ` — ${trip.wearer_name}` : ` — Device ${trip.device_id}`}
-          </Typography>
+          <Box>
+            <Typography variant="subtitle2" sx={{ fontWeight: 700, color: '#1e293b' }}>
+              Journey Summary
+              {trip.wearer_name ? ` — ${trip.wearer_name}` : ` — Device ${trip.device_id}`}
+            </Typography>
+            <Typography variant="caption" sx={{ display: 'block', color: '#64748b' }}>
+              Journey ID: {trip.id}
+            </Typography>
+          </Box>
         </Box>
 
         <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1 }}>
@@ -200,10 +224,17 @@ export default function TripSummaryCard({
           {isInProgress ? (
             <Chip
               icon={<Radio size={14} className="animate-pulse" />}
-              label="Journey In Progress"
+              label="Active"
               color="primary"
               size="small"
               sx={{ fontWeight: 600, px: 0.5 }}
+            />
+          ) : String(trip.status || '').toLowerCase() === 'interrupted' ? (
+            <Chip
+              icon={<AlertTriangle size={14} />}
+              label="Interrupted"
+              size="small"
+              sx={{ fontWeight: 600, px: 0.5, bgcolor: '#fef3c7', color: '#92400e' }}
             />
           ) : (
             <Chip
@@ -213,8 +244,8 @@ export default function TripSummaryCard({
               sx={{
                 fontWeight: 600,
                 px: 0.5,
-                bgcolor: '#e2e8f0',
-                color: '#334155',
+                bgcolor: '#dcfce7',
+                color: '#166534',
               }}
             />
           )}
@@ -282,7 +313,7 @@ export default function TripSummaryCard({
 
           {/* Point Count Chip */}
           <Chip
-            label={`${trip.point_count || trip.route_points?.length || 0} GPS Fixes`}
+            label={`${routeDiagnostics?.acceptedFixes ?? trip.point_count ?? trip.route_points?.length ?? 0} Accepted Fixes`}
             size="small"
             variant="outlined"
             sx={{ fontWeight: 500, fontSize: 12 }}
@@ -311,10 +342,12 @@ export default function TripSummaryCard({
               </Typography>
             </Box>
             <Typography variant="h4" sx={{ fontWeight: 800, color: '#1d4ed8', mt: 1 }}>
-              {distanceDisplay}
+              {routeDiagnostics?.distanceEstimated ? `~${distanceDisplay}` : distanceDisplay}
             </Typography>
             <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
-              Consecutive Haversine calculation
+              {routeDiagnostics?.distanceEstimated
+                ? 'Estimated from accepted GPS segments; gaps excluded'
+                : 'Consecutive accepted GPS fixes'}
             </Typography>
           </Box>
 
@@ -330,7 +363,9 @@ export default function TripSummaryCard({
               {durationStr}
             </Typography>
             <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
-              {isInProgress ? 'Live journey elapsed time' : 'Total journey duration'}
+              {isInProgress 
+                ? (isGpsStale ? 'Paused (device offline/stale)' : 'Live journey elapsed time')
+                : 'Total journey duration'}
             </Typography>
           </Box>
 
@@ -372,7 +407,7 @@ export default function TripSummaryCard({
                   letterSpacing: 0.5,
                 }}
               >
-                {isInProgress ? 'Current Live Position' : 'End Location'}
+                {isInProgress ? activePositionLabel : 'End Location'}
               </Typography>
             </Box>
             <Typography
@@ -385,8 +420,8 @@ export default function TripSummaryCard({
             >
               {isInProgress
                 ? formatCoords(
-                    currentLocation?.latitude ?? trip.current_location?.latitude,
-                    currentLocation?.longitude ?? trip.current_location?.longitude
+                    activePosition?.latitude,
+                    activePosition?.longitude
                   )
                 : formatCoords(trip.end_location?.latitude, trip.end_location?.longitude)}
             </Typography>
@@ -399,11 +434,18 @@ export default function TripSummaryCard({
               }}
             >
               {isInProgress
-                ? `Last update: ${latestTimeStr} (${relativeTimeStr})`
+                ? `${isGpsStale || !hasGpsFix ? 'Last update' : 'Updated'}: ${latestTimeStr} (${relativeTimeStr})`
                 : formatDateTime(trip.end_time)}
             </Typography>
           </Box>
         </Box>
+        {routeDiagnostics && (
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mt: 2 }}>
+            <Chip size="small" variant="outlined" label={`${routeDiagnostics.rejectedOutliers} rejected outliers`} />
+            <Chip size="small" variant="outlined" label={`${routeDiagnostics.gpsGaps} GPS gaps`} />
+            <Chip size="small" variant="outlined" label={`${routeDiagnostics.duplicateFixes} duplicate fixes`} />
+          </Box>
+        )}
       </CardContent>
     </Card>
   )

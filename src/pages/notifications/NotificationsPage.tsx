@@ -12,7 +12,7 @@ function NotificationsPage() {
   }, [])
   const { data, loading, error, reload } = useApiData(loadMessages)
 
-  const handleAction = async (alertId: number, action: 'acknowledge' | 'resolve') => {
+  const handleAction = async (alertId: number | string, action: 'acknowledge' | 'resolve') => {
     setActionError('')
     try {
       if (action === 'acknowledge') await acknowledgeAlert(alertId)

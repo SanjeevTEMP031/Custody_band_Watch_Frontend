@@ -62,8 +62,16 @@ import {
   isValidGpsCoord,
   type TripRecord,
 } from '../../lib/firebase'
-import { GPS_FRESHNESS_MS, normalizeVerifiedGpsFix } from '../../services/gpsNormalization'
-import { DEFAULT_GPS_TRAIL_FILTERS } from '../../services/gpsTrail'
+import {
+  GPS_FRESHNESS_MS,
+  normalizeVerifiedGpsFix,
+  parseGpsTimestamp,
+} from '../../services/gpsNormalization'
+import {
+  analyzeGpsTrail,
+  DEFAULT_GPS_JOURNEY_INACTIVITY_MS,
+  groupGpsPointsByInactivity,
+} from '../../services/gpsTrail'
 import RouteTrackingMap from './RouteTrackingMap'
 import RouteMap from './RouteMap'
 import TripSummaryCard from './TripSummaryCard'
@@ -98,8 +106,8 @@ function normalizeToTripRecord(raw: any, deviceId: string, fallbackWearer?: stri
       latitude: Number(p.latitude ?? p.lat),
       longitude: Number(p.longitude ?? p.lng ?? p.lon),
       timestamp: normalizePointTimestamp(
-        p.timestamp ?? p.device_timestamp ?? p.gps_time ?? p.location_time ??
-          p.recorded_at ?? p.received_at
+        p.gps_time ?? p.timestamp ?? p.device_timestamp ?? p.location_time ??
+        p.recorded_at ?? p.received_at
       ) ?? fallbackPointTimestamp ?? '',
       speed_kmh: p.speed_kmh ?? p.speed ?? null,
       heading: p.direction_deg ?? p.heading ?? p.bearing ?? p.course ?? null,
@@ -214,23 +222,8 @@ function normalizeToTripRecord(raw: any, deviceId: string, fallbackWearer?: stri
 }
 
 function normalizePointTimestamp(value: unknown): string | null {
-  if (value instanceof Date && Number.isFinite(value.getTime())) return value.toISOString()
-  if (typeof value === 'string' || typeof value === 'number') {
-    const date = new Date(value)
-    return Number.isFinite(date.getTime()) ? date.toISOString() : null
-  }
-  if (value && typeof value === 'object') {
-    const timestamp = value as { toDate?: () => Date; seconds?: number; _seconds?: number }
-    if (typeof timestamp.toDate === 'function') {
-      const date = timestamp.toDate()
-      return Number.isFinite(date.getTime()) ? date.toISOString() : null
-    }
-    const seconds = timestamp.seconds ?? timestamp._seconds
-    if (typeof seconds === 'number' && Number.isFinite(seconds)) {
-      return new Date(seconds * 1000).toISOString()
-    }
-  }
-  return null
+  const timestamp = parseGpsTimestamp(value)
+  return timestamp === null ? null : new Date(timestamp).toISOString()
 }
 
 function hasExplicitGpsNoFix(point: any): boolean {
@@ -259,11 +252,13 @@ function mergeJourneyPoints(
   const points = new Map<string, JourneyPoint>()
   for (const point of [...trip.route_points, ...telemetryPoints]) {
     const timestamp = Date.parse(point.timestamp)
+    const hasJourneyId = point.journey_id != null
     if (
       !Number.isFinite(timestamp) ||
       !isValidGpsCoord(point.latitude, point.longitude) ||
-      (Number.isFinite(startTime) && timestamp < startTime) ||
-      (Number.isFinite(endTime) && timestamp > endTime)
+      (hasJourneyId && String(point.journey_id) !== trip.id) ||
+      (!hasJourneyId && Number.isFinite(startTime) && timestamp < startTime) ||
+      (!hasJourneyId && Number.isFinite(endTime) && timestamp > endTime)
     ) continue
     const key = `${timestamp}|${point.latitude}|${point.longitude}`
     points.set(key, point)
@@ -296,16 +291,53 @@ function filterPointsByDateRange(
 }
 
 function calculateJourneyDistance(points: JourneyPoint[]): number {
-  let distance = 0
-  for (let index = 1; index < points.length; index += 1) {
-    distance += haversineDistanceKm(
-      points[index - 1].latitude,
-      points[index - 1].longitude,
-      points[index].latitude,
-      points[index].longitude
-    )
+  return analyzeGpsTrail(toGpsTrailPoints(points)).distanceMeters / 1000
+}
+
+function toGpsTrailPoints(points: JourneyPoint[]) {
+  return points.map((point) => ({
+    ...point,
+    timestamp: Date.parse(point.timestamp),
+    accuracy: point.accuracy_m ?? null,
+    key: `${Date.parse(point.timestamp)}|${point.latitude}|${point.longitude}`,
+  }))
+}
+
+function fromGpsTrailPoint(point: ReturnType<typeof toGpsTrailPoints>[number]): JourneyPoint {
+  return {
+    latitude: point.latitude,
+    longitude: point.longitude,
+    timestamp: new Date(point.timestamp).toISOString(),
+    journey_id: point.journey_id,
+    gps_time: point.gps_time,
+    received_at: point.received_at,
+    gps_fix: point.gps_fix,
+    coordinate_source: point.coordinate_source,
+    location_is_current: point.location_is_current,
+    speed_kmh: point.speed_kmh,
+    heading: point.heading,
+    accuracy_m: point.accuracy_m ?? point.accuracy,
+    battery_pct: point.battery_pct,
   }
-  return distance
+}
+
+function analyzeJourneyPoints(points: JourneyPoint[]) {
+  const analysis = analyzeGpsTrail(toGpsTrailPoints(points))
+  const acceptedPoints = analysis.acceptedPoints.map(fromGpsTrailPoint)
+  return {
+    acceptedPoints,
+    distanceKm: Number((analysis.distanceMeters / 1000).toFixed(3)),
+    diagnostics: {
+      acceptedFixes: acceptedPoints.length,
+      rejectedOutliers: analysis.rejectedOutlierCount,
+      gpsGaps: analysis.gapCount,
+      duplicateFixes: analysis.duplicateCount,
+      filteredJitter: analysis.filteredJitterCount,
+      distanceEstimated: analysis.gapCount > 0 ||
+        analysis.rejectedOutlierCount > 0 ||
+        analysis.invalidPointCount > 0,
+    },
+  }
 }
 
 export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHistoryPageProps = {}) {
@@ -363,11 +395,19 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
   const [playbackIndex, setPlaybackIndex] = useState<number | null>(null)
   const [isPlaybackPlaying, setIsPlaybackPlaying] = useState(false)
   const [specificSelectedJourney, setSpecificSelectedJourney] = useState<TripRecord | null>(null)
+  const [hasMoreHistory, setHasMoreHistory] = useState(false)
+  const [isLoadingOlderHistory, setIsLoadingOlderHistory] = useState(false)
+  const [historyRefreshToken, setHistoryRefreshToken] = useState(0)
   const journeyRequestIdRef = useRef(0)
+  const activeJourneySourceRef = useRef<{
+    id: string
+    source: 'backend' | 'firestore'
+  } | null>(null)
   const apiHistoryPointsRef = useRef<JourneyPoint[]>([])
   const firestoreHistoryPointsRef = useRef<JourneyPoint[]>([])
   useEffect(() => {
     journeyRequestIdRef.current += 1
+    activeJourneySourceRef.current = null
     setLoadingJourneys(false)
     setBackendJourneys([])
     setActiveBackendJourney(null)
@@ -401,6 +441,9 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
           ? normalizeToTripRecord(activeResult.value, selectedDeviceId, wearer)
           : null
         setActiveBackendJourney(normalized)
+        if (normalized) {
+          activeJourneySourceRef.current = { id: normalized.id, source: 'backend' }
+        }
       } else {
         console.warn(`Unable to load active journey for ${selectedDeviceId}.`, activeResult.reason)
         setActiveBackendJourney(null)
@@ -489,7 +532,7 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
 
     const loadApiHistory = async () => {
       try {
-        const apiPoints = await listLocationHistory(historyDeviceId, 500)
+        const apiPoints = await listLocationHistory(historyDeviceId, 2000)
         if (!active) return
         apiHistoryPointsRef.current = apiPoints
           .map((point) => ({
@@ -509,6 +552,7 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
           .filter((point) =>
             point.gps_fix !== false &&
             point.gps_valid !== false &&
+            String((point as any).gps_status ?? (point as any).gps_fix_status ?? '').toUpperCase() !== 'V' &&
             isValidGpsCoord(point.latitude, point.longitude) &&
             Number.isFinite(Date.parse(point.timestamp))
           )
@@ -518,6 +562,7 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
             apiHistoryPointsRef.current
           )
         )
+        setHasMoreHistory(apiPoints.length >= 2000)
         apiFinished = true
         updateLoadingState()
       } catch (error) {
@@ -532,7 +577,7 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
 
     const unsubscribe = subscribeToFirestoreLocationHistory(
       historyDeviceId,
-      500,
+      2000,
       (points) => {
         if (!active) return
         firestoreReceived = true
@@ -560,7 +605,81 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
       active = false
       unsubscribe()
     }
-  }, [selectedDeviceId, historyDeviceId])
+  }, [selectedDeviceId, historyDeviceId, historyRefreshToken])
+
+  const loadOlderHistory = useCallback(async () => {
+    if (isLoadingOlderHistory || !historyDeviceId) return
+    setIsLoadingOlderHistory(true)
+    try {
+      const oldestPoint = apiHistoryPointsRef.current[0]
+      if (!oldestPoint?.timestamp) {
+        setHasMoreHistory(false)
+        setIsLoadingOlderHistory(false)
+        return
+      }
+      const olderBatch = await listLocationHistory(historyDeviceId, {
+        limit: 1000,
+        before_timestamp: oldestPoint.timestamp,
+      })
+      if (!olderBatch || olderBatch.length === 0) {
+        setHasMoreHistory(false)
+      } else {
+        const mapped: JourneyPoint[] = olderBatch
+          .map((point) => ({
+            ...point,
+            latitude: Number(point.latitude ?? (point as any).lat),
+            longitude: Number(point.longitude ?? (point as any).lng ?? (point as any).lon),
+            timestamp: normalizePointTimestamp(
+              point.timestamp ?? (point as any).gps_time ??
+                (point as any).location_time ?? point.recorded_at ?? point.received_at
+            ) ?? '',
+            speed_kmh: point.speed_kmh ?? (point as any).speed ?? null,
+            heading: point.heading ?? (point as any).direction_deg ??
+              (point as any).bearing ?? (point as any).course ?? null,
+            battery_pct: point.battery_pct ?? (point as any).battery_percent ??
+              (point as any).battery_level ?? (point as any).battery ?? null,
+          }))
+          .filter((point) =>
+            point.gps_fix !== false &&
+            point.gps_valid !== false &&
+            String((point as any).gps_status ?? (point as any).gps_fix_status ?? '').toUpperCase() !== 'V' &&
+            isValidGpsCoord(point.latitude, point.longitude) &&
+            Number.isFinite(Date.parse(point.timestamp))
+          )
+
+        const mergedMap = new Map<string, JourneyPoint>()
+        for (const pt of [...mapped, ...apiHistoryPointsRef.current]) {
+          const ts = Date.parse(pt.timestamp)
+          if (!Number.isFinite(ts) || !isValidGpsCoord(pt.latitude, pt.longitude)) continue
+          mergedMap.set(`${ts}|${pt.latitude}|${pt.longitude}`, pt)
+        }
+        const updatedApiPoints = [...mergedMap.values()].sort(
+          (a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp)
+        )
+        apiHistoryPointsRef.current = updatedApiPoints
+
+        setRawHistoryPoints((current) => {
+          const currentMap = new Map<string, JourneyPoint>()
+          for (const pt of [...current, ...mapped]) {
+            const ts = Date.parse(pt.timestamp)
+            if (!Number.isFinite(ts) || !isValidGpsCoord(pt.latitude, pt.longitude)) continue
+            currentMap.set(`${ts}|${pt.latitude}|${pt.longitude}`, pt)
+          }
+          return [...currentMap.values()].sort(
+            (a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp)
+          )
+        })
+
+        if (olderBatch.length < 1000) {
+          setHasMoreHistory(false)
+        }
+      }
+    } catch (error) {
+      console.warn('Unable to load older GPS history pages:', error)
+    } finally {
+      setIsLoadingOlderHistory(false)
+    }
+  }, [historyDeviceId, isLoadingOlderHistory])
 
   // Combine backend journeys with Firestore journeys (deduplicated by id)
   const combinedJourneys: TripRecord[] = useMemo(() => {
@@ -598,30 +717,41 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
         isValidGpsCoord(point.latitude, point.longitude) &&
         Number.isFinite(Date.parse(point.timestamp))
       )
-      .sort((first, second) => Date.parse(first.timestamp) - Date.parse(second.timestamp))
-    const sessions: JourneyPoint[][] = []
-    for (const point of sortedPoints) {
-      const currentSession = sessions[sessions.length - 1]
-      const previousPoint = currentSession?.[currentSession.length - 1]
-      if (
-        !currentSession ||
-        !previousPoint ||
-        Date.parse(point.timestamp) - Date.parse(previousPoint.timestamp) >
-          DEFAULT_GPS_TRAIL_FILTERS.maxGapMs
-      ) {
-        sessions.push([point])
-      } else {
-        currentSession.push(point)
-      }
-    }
-
-    return sessions
-      .map((points) => buildTripFromPoints(
+    const groups = groupGpsPointsByInactivity(
+      toGpsTrailPoints(sortedPoints),
+      DEFAULT_GPS_JOURNEY_INACTIVITY_MS
+    )
+    return groups.flatMap((group) => {
+      const points = group.map(fromGpsTrailPoint)
+      const journey = buildTripFromPoints(
         selectedDeviceId,
         points,
         selectedDevice?.device_name ?? (selectedDevice as any)?.wearer_name
-      ))
-      .filter((journey): journey is TripRecord => journey !== null)
+      )
+      if (!journey) return []
+      const route = analyzeJourneyPoints(points)
+      const firstPoint = route.acceptedPoints[0]
+      const lastPoint = route.acceptedPoints[route.acceptedPoints.length - 1]
+      return [{
+        ...journey,
+        route_points: route.acceptedPoints,
+        point_count: route.diagnostics.acceptedFixes,
+        total_distance_km: route.distanceKm,
+        route_diagnostics: route.diagnostics,
+        start_time: firstPoint?.timestamp ?? journey.start_time,
+        start_location: firstPoint ? {
+          latitude: firstPoint.latitude,
+          longitude: firstPoint.longitude,
+          timestamp: firstPoint.timestamp,
+        } : journey.start_location,
+        end_time: lastPoint?.timestamp ?? journey.end_time,
+        end_location: lastPoint ? {
+          latitude: lastPoint.latitude,
+          longitude: lastPoint.longitude,
+          timestamp: lastPoint.timestamp,
+        } : journey.end_location,
+      }]
+    })
   }, [selectedDeviceId, rawHistoryPoints, selectedDevice])
   const rawTelemetryJourney = rawTelemetryJourneys[rawTelemetryJourneys.length - 1] ?? null
 
@@ -632,15 +762,31 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
 
     return [...sources.values()]
       .map((journey) => {
-        const route_points = mergeJourneyPoints(journey, rawHistoryPoints)
-        const telemetryAdded = route_points.length > journey.route_points.length
+        const mergedPoints = mergeJourneyPoints(journey, rawHistoryPoints)
+        const route = analyzeJourneyPoints(mergedPoints)
+        const route_points = route.acceptedPoints
+        const firstPoint = route_points[0]
+        const lastPoint = route_points[route_points.length - 1]
         return {
           ...journey,
           route_points,
-          point_count: route_points.length,
-          total_distance_km: telemetryAdded
-            ? calculateJourneyDistance(route_points)
-            : journey.total_distance_km,
+          point_count: route.diagnostics.acceptedFixes,
+          total_distance_km: route.distanceKm,
+          route_diagnostics: route.diagnostics,
+          start_time: firstPoint?.timestamp ?? journey.start_time,
+          start_location: firstPoint ? {
+            latitude: firstPoint.latitude,
+            longitude: firstPoint.longitude,
+            timestamp: firstPoint.timestamp,
+          } : journey.start_location,
+          end_time: journey.status === 'completed'
+            ? lastPoint?.timestamp ?? journey.end_time
+            : null,
+          end_location: journey.status === 'completed' && lastPoint ? {
+            latitude: lastPoint.latitude,
+            longitude: lastPoint.longitude,
+            timestamp: lastPoint.timestamp,
+          } : journey.status === 'completed' ? journey.end_location : null,
         }
       })
       .sort((first, second) => timestampOrder(second.start_time) - timestampOrder(first.start_time))
@@ -757,8 +903,8 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
     return journeys.map((journey, index) => ({
       id: journey.id,
       label: journey.wearer_name
-        ? `${journey.wearer_name} · ${new Date(journey.start_time).toLocaleString()}`
-        : `Trip ${new Date(journey.start_time).toLocaleString()}`,
+        ? `${journey.wearer_name} · ${new Date(journey.start_time).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+        : `Trip ${new Date(journey.start_time).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`,
       color: getJourneyRouteColor(index),
       status: journey.status,
       points: journey.route_points,
@@ -768,7 +914,7 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
   const rawTelemetryRoutes = useMemo(
     () => rawTelemetryJourneys.map((journey, index) => ({
       id: journey.id,
-      label: `GPS session ${index + 1} · ${new Date(journey.start_time).toLocaleString()}`,
+      label: `Inferred journey ${index + 1} · ${new Date(journey.start_time).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`,
       color: getJourneyRouteColor(index),
       status: journey.status,
       points: journey.route_points,
@@ -811,9 +957,10 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
     const points = currentDisplayJourney
       ? mergeJourneyPoints(currentDisplayJourney, rawHistoryPoints)
       : rawHistoryPoints
+    const acceptedPoints = analyzeJourneyPoints(points).acceptedPoints
     return dateRangeInvalid
       ? []
-      : filterPointsByDateRange(points, fromTimeMs, toTimeMs)
+      : filterPointsByDateRange(acceptedPoints, fromTimeMs, toTimeMs)
   }, [
     selectedJourneyId,
     currentDisplayJourney,
@@ -838,7 +985,10 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
     () => [...plannerPoints]
       .filter((point) =>
         isValidGpsCoord(point.latitude, point.longitude) &&
-        Number.isFinite(Date.parse(point.timestamp))
+        Number.isFinite(Date.parse(point.timestamp)) &&
+        String((point as any).gps_status ?? (point as any).gps_fix_status ?? '').toUpperCase() !== 'V' &&
+        (point as any).gps_fix !== false &&
+        (point as any).gps_valid !== false
       )
       .sort((first, second) => Date.parse(first.timestamp) - Date.parse(second.timestamp)),
     [plannerPoints]
@@ -968,10 +1118,51 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
   }, [lastGpsUpdateTime, liveLocation])
 
   // GPS Fix status
+    // GPS Fix status
   const hasGpsFix = useMemo(() => {
     if (!liveLocation) return false
     return isValidGpsCoord(liveLocation.latitude, liveLocation.longitude) && liveLocation.gps_fix !== false
   }, [liveLocation])
+
+  // --- FALLBACK: Show last known position instead of "No GPS Fix" when device is stale ---
+  const lastKnownFix = useMemo(() => {
+    if (filteredLiveLocation) return filteredLiveLocation
+    
+    // 1. Try current_location or end_location from the journey record
+    const candidates = [
+      currentDisplayJourney?.current_location,
+      currentDisplayJourney?.end_location,
+    ]
+    for (const c of candidates) {
+      if (c && isValidGpsCoord(c.latitude, c.longitude)) {
+        return {
+          latitude: c.latitude,
+          longitude: c.longitude,
+          timestamp: c.timestamp ?? '',
+          speed_kmh: (c as any).speed_kmh ?? null,
+          heading: (c as any).heading ?? null,
+          battery_pct: (c as any).battery_pct ?? null,
+        }
+      }
+    }
+    
+    // 2. Fallback to the very last point in the filtered journey points
+    const last = selectedJourneyPoints[selectedJourneyPoints.length - 1]
+    if (last && isValidGpsCoord(last.latitude, last.longitude)) {
+      return {
+        latitude: last.latitude,
+        longitude: last.longitude,
+        timestamp: last.timestamp,
+        speed_kmh: last.speed_kmh ?? null,
+        heading: last.heading ?? null,
+        battery_pct: last.battery_pct ?? null,
+      }
+    }
+    
+    return null
+  }, [filteredLiveLocation, currentDisplayJourney, selectedJourneyPoints])
+
+  // --- 1. START JOURNEY (POST /api/v1/journeys/start) ---
 
   // --- 1. START JOURNEY (POST /api/v1/journeys/start) ---
   const handleStartJourney = async () => {
@@ -996,23 +1187,27 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
           timestamp: new Date().toISOString(),
         })
       } catch (apiErr) {
-        console.warn('Backend POST /journeys/start failed, persisting through Firestore:', apiErr)
+        console.warn('Backend POST /journeys/start failed; using the Firestore journey fallback.', apiErr)
       }
 
-      // 2. Real-time Firestore persistence
-      const fsTrip = await startTrip(
-        String(selectedDevice.id),
-        wearer,
-        hasCoords ? Number(lat) : null,
-        hasCoords ? Number(lon) : null
-      )
-
+      // Persist through one source only; writing both stores creates duplicate journeys.
       const activeRecord = startedFromBackend
-        ? normalizeToTripRecord(startedFromBackend, String(selectedDevice.id), wearer) ?? fsTrip
-        : fsTrip
+        ? normalizeToTripRecord(startedFromBackend, String(selectedDevice.id), wearer)
+        : await startTrip(
+            String(selectedDevice.id),
+            wearer,
+            hasCoords ? Number(lat) : null,
+            hasCoords ? Number(lon) : null
+          )
+      if (!activeRecord) throw new Error('The journey API returned an invalid journey record.')
+      activeJourneySourceRef.current = {
+        id: activeRecord.id,
+        source: startedFromBackend ? 'backend' : 'firestore',
+      }
 
       setActiveBackendJourney(activeRecord)
       setSelectedJourneyId(activeRecord.id)
+      console.info(`[journey] JOURNEY_CREATED — ${startedFromBackend ? 'backend start request' : 'Firestore fallback after backend error'}; id=${activeRecord.id}`)
 
       setJourneyNotice({
         message: hasCoords
@@ -1044,8 +1239,13 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
     const lon = selectedDevice?.last_longitude ?? (selectedDevice as any)?.longitude
 
     try {
-      // 1. Call backend API: POST /api/v1/journeys/end
-      try {
+      const persistence = activeJourneySourceRef.current?.id === activeJourney.id
+        ? activeJourneySourceRef.current.source
+        : firestoreTrips.some((trip) => trip.id === activeJourney.id)
+          ? 'firestore'
+          : 'backend'
+
+      if (persistence === 'backend') {
         await endJourney({
           journey_id: activeJourney.id,
           device_id: selectedDevice?.id,
@@ -1053,19 +1253,18 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
           end_longitude: isValidGpsCoord(lat, lon) ? Number(lon) : null,
           timestamp: new Date().toISOString(),
         })
-      } catch (apiErr) {
-        console.warn('Backend POST /journeys/end failed, closing in Firestore:', apiErr)
+      } else {
+        await endTrip(
+          activeJourney.id,
+          String(activeJourney.device_id),
+          isValidGpsCoord(lat, lon) ? Number(lat) : null,
+          isValidGpsCoord(lat, lon) ? Number(lon) : null
+        )
       }
 
-      // 2. Close in Firestore
-      await endTrip(
-        activeJourney.id,
-        String(activeJourney.device_id),
-        isValidGpsCoord(lat, lon) ? Number(lat) : null,
-        isValidGpsCoord(lat, lon) ? Number(lon) : null
-      )
-
       setActiveBackendJourney(null)
+      activeJourneySourceRef.current = null
+      console.info(`[journey] JOURNEY_COMPLETED — explicit end request; id=${activeJourney.id}`)
       setJourneyNotice({
         message: 'Journey completed! Red END marker recorded. Total travelled distance saved.',
         severity: 'success',
@@ -1088,7 +1287,7 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
     : [{
         id: currentDisplayJourney?.id ?? 'raw_telemetry',
         label: currentDisplayJourney?.wearer_name
-          ? `${currentDisplayJourney.wearer_name} · ${new Date(currentDisplayJourney.start_time).toLocaleString()}`
+          ? `${currentDisplayJourney.wearer_name} · ${new Date(currentDisplayJourney.start_time).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
           : 'Selected route',
         color: selectedRouteColor,
         status: currentDisplayJourney?.status ?? 'completed' as const,
@@ -1096,29 +1295,32 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
       }]
   const tableDataWithDistance = useMemo(() => {
     return tableRoutes.flatMap((journey) => {
-      let accumulatedDistanceKm = 0
-      return journey.points.map((point, index) => {
-        const previousPoint = index > 0 ? journey.points[index - 1] : null
-        const legDistanceKm = previousPoint
-          ? haversineDistanceKm(
-              previousPoint.latitude,
-              previousPoint.longitude,
-              point.latitude,
-              point.longitude
-            )
-          : 0
-        accumulatedDistanceKm += legDistanceKm
-        return {
-          ...point,
-          tripId: journey.id,
-          tripLabel: journey.label,
-          tripColor: journey.color,
-          tripStatus: journey.status,
-          isTripStart: index === 0,
-          isTripEnd: index === journey.points.length - 1,
-          legDistanceKm,
-          accumulatedDistanceKm,
-        }
+      const analysis = analyzeGpsTrail(toGpsTrailPoints(journey.points))
+      return analysis.segments.flatMap((segment) => {
+        let accumulatedDistanceKm = 0
+        return segment.map((point, index) => {
+          const previousPoint = index > 0 ? segment[index - 1] : null
+          const legDistanceKm = previousPoint
+            ? haversineDistanceKm(
+                previousPoint.latitude,
+                previousPoint.longitude,
+                point.latitude,
+                point.longitude
+              )
+            : 0
+          accumulatedDistanceKm += legDistanceKm
+          return {
+            ...fromGpsTrailPoint(point),
+            tripId: journey.id,
+            tripLabel: journey.label,
+            tripColor: journey.color,
+            tripStatus: journey.status,
+            isTripStart: index === 0,
+            isTripEnd: index === segment.length - 1,
+            legDistanceKm,
+            accumulatedDistanceKm,
+          }
+        })
       })
     })
   }, [tableRoutes])
@@ -1208,7 +1410,8 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
                 const journey = journeysWithHistory.find((item) => item.id === route.id)
                 const dateValue = journey?.start_time ?? route.points[0]?.timestamp
                 const dateStr = dateValue
-                  ? new Date(dateValue).toLocaleDateString(undefined, {
+                  ? new Date(dateValue).toLocaleDateString('en-IN', {
+                  timeZone: 'Asia/Kolkata',
                   month: 'short',
                   day: 'numeric',
                   hour: '2-digit',
@@ -1234,7 +1437,7 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
                         }}
                       />
                       {telemetryRoute
-                        ? `GPS session ${telemetryIndex + 1} · ${dateStr}`
+                        ? `Inferred GPS group ${telemetryIndex + 1} · ${dateStr}`
                         : `Journey · ${dateStr} (${distanceKm.toFixed(1)} km`}
                     </Box>
                   </MenuItem>
@@ -1274,7 +1477,10 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
             variant="outlined"
             size="medium"
             startIcon={<RotateCw size={16} />}
-            onClick={refreshBackendJourneys}
+            onClick={() => {
+              void refreshBackendJourneys()
+              setHistoryRefreshToken((current) => current + 1)
+            }}
             disabled={loadingJourneys}
             sx={{ textTransform: 'none' }}
           >
@@ -1383,6 +1589,16 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
           No verified historical GPS points were returned for this device. A valid current position may still appear on the map.
         </Alert>
       )}
+      {hasMoreHistory && (
+        <Alert severity="info" sx={{ mt: -2 }}>
+          Showing latest {rawHistoryPoints.length} verified GPS fixes. Click &quot;Load Older Fixes&quot; in the map controls or table below to retrieve earlier route points.
+        </Alert>
+      )}
+      {(selectedJourneyId === 'raw_telemetry' || selectedJourneyId.startsWith('telemetry:')) && (
+        <Alert severity="info" sx={{ mt: -2 }}>
+          These are inferred history groups, not persistent journey IDs. Without a backend journey ID, groups use a configurable 10-minute inactivity boundary; displayed routes still break at GPS gaps.
+        </Alert>
+      )}
       {!dateRangeInvalid &&
         rawHistoryPoints.length > 0 &&
         tableDataWithDistance.length === 0 &&
@@ -1414,27 +1630,42 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
         />
       )}
 
-      {isMultiRouteView ? (
+                  {isMultiRouteView ? (
         <Card variant="outlined" sx={{ borderRadius: 2, bgcolor: '#f8fafc' }}>
           <CardContent>
             <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
-              Comparing {displayedRoutes.length} {selectedJourneyId === 'raw_telemetry' ? 'GPS sessions' : 'trips'}
+              Comparing {displayedRoutes.length} {selectedJourneyId === 'raw_telemetry' ? 'inferred GPS groups' : 'trips'}
             </Typography>
             <Typography variant="body2" color="text.secondary">
               Each trip has its own color. The date range and GPS points log use the same selected period.
             </Typography>
           </CardContent>
         </Card>
-      ) : (
+           ) : (
         <TripSummaryCard
           trip={currentDisplayJourney}
-          currentLocation={filteredLiveLocation}
-          currentSpeed={filteredLiveLocation?.speed_kmh}
-          currentHeading={filteredLiveLocation?.heading}
-          batteryPct={filteredLiveLocation?.battery_pct ?? selectedDevice?.battery_pct}
-          latestGpsTime={filteredLiveLocation ? lastGpsUpdateTime : null}
-          isGpsStale={filteredLiveLocation !== null && isGpsStale}
-          hasGpsFix={hasGpsFix && filteredLiveLocation !== null}
+          currentLocation={lastKnownFix}
+          currentSpeed={lastKnownFix?.speed_kmh}
+          currentHeading={lastKnownFix?.heading}
+          batteryPct={lastKnownFix?.battery_pct ?? selectedDevice?.battery_pct}
+          
+          // FIX 1: Freeze duration when GPS is stale
+          // If live, use real-time Date. If stale, freeze at lastKnownFix.timestamp
+          latestGpsTime={lastKnownFix
+            ? (filteredLiveLocation ? lastGpsUpdateTime : new Date(lastKnownFix.timestamp))
+            : null}
+          
+          isGpsStale={lastKnownFix !== null && (!filteredLiveLocation || isGpsStale)}
+          hasGpsFix={hasGpsFix}
+          
+          // NEW PROP: Explicitly tell the card to stop ticking and use this frozen time
+          // when the device is offline/stale. 
+          // Note: You may need to add 'frozenEndTime' to TripSummaryCard props interface
+          frozenEndTime={
+            lastKnownFix !== null && (!filteredLiveLocation || isGpsStale)
+              ? new Date(lastKnownFix.timestamp)
+              : undefined
+          }
         />
       )}
 
@@ -1476,7 +1707,7 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 0.5 }}>
             <Typography variant="caption" color="text.secondary">
               {playbackIndex !== null && playbackPoint
-                ? `Point ${playbackIndex + 1}/${playbackPoints.length} · ${new Date(playbackPoint.timestamp).toLocaleString()}`
+                ? `Point ${playbackIndex + 1}/${playbackPoints.length} · ${new Date(playbackPoint.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
                 : `${playbackPoints.length} GPS fixes`}
             </Typography>
             <Button
@@ -1513,6 +1744,18 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
             >
               Restart
             </Button>
+            {hasMoreHistory && (
+              <Button
+                size="small"
+                variant="outlined"
+                color="secondary"
+                disabled={isLoadingOlderHistory}
+                onClick={loadOlderHistory}
+                sx={{ textTransform: 'none' }}
+              >
+                {isLoadingOlderHistory ? 'Loading…' : 'Load Older Fixes'}
+              </Button>
+            )}
           </Box>
         )}
 
@@ -1593,6 +1836,7 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
           </Card>
         </>
       )}
+      
 
       {/* TAB 2: OSRM ROUTE FINDER & ROAD PATH PLANNER */}
       {viewTab === 'planner' && (
@@ -1674,7 +1918,7 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
                           <Typography variant="caption" noWrap title={pt.tripLabel}>{pt.tripLabel}</Typography>
                         </Box>
                       </TableCell>
-                      <TableCell>{pt.timestamp ? new Date(pt.timestamp).toLocaleString() : '—'}</TableCell>
+                      <TableCell>{pt.timestamp ? new Date(pt.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : '—'}</TableCell>
                       <TableCell sx={{ fontFamily: 'monospace' }}>{pt.latitude.toFixed(6)}</TableCell>
                       <TableCell sx={{ fontFamily: 'monospace' }}>{pt.longitude.toFixed(6)}</TableCell>
                       <TableCell>{pt.speed_kmh != null ? `${pt.speed_kmh} km/h` : '—'}</TableCell>
@@ -1703,6 +1947,19 @@ export default function LocationHistoryPage({ defaultTab = 'map' }: LocationHist
                 )}
               </TableBody>
             </Table>
+            {hasMoreHistory && (
+              <Box sx={{ p: 2, display: 'flex', justifyContent: 'center' }}>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  disabled={isLoadingOlderHistory}
+                  onClick={loadOlderHistory}
+                  sx={{ textTransform: 'none' }}
+                >
+                  {isLoadingOlderHistory ? 'Loading Older History…' : 'Load Older GPS Telemetry Fixes'}
+                </Button>
+              </Box>
+            )}
           </CardContent>
         </Card>
       )}

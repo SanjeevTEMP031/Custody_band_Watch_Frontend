@@ -38,10 +38,16 @@ import {
   type VerifiedGpsFix,
   type VerifiedHistoryGpsLocation,
 } from '../../services/gpsNormalization'
-import { isValidGpsCoord } from '../../lib/firebase'
 import {
+  isValidGpsCoord,
+  subscribeToFirestoreLocationHistory,
+  type TripPoint,
+} from '../../lib/firebase'
+import {
+  DEFAULT_GPS_JOURNEY_INACTIVITY_MS,
   appendGpsTrailPoint,
   DEFAULT_GPS_TRAIL_FILTERS,
+  groupGpsPointsByInactivity,
   type GpsTrailPoint,
   type GpsTrailState,
 } from '../../services/gpsTrail'
@@ -91,6 +97,7 @@ const markerAnimationFrames = new WeakMap<L.Marker | L.CircleMarker, number>()
 /** Poll the backend for the latest GPS fix every five seconds. */
 const POLL_INTERVAL_MS = 5_000
 const MAX_LIVE_TRAIL_POINTS = 500
+const LIVE_TRAIL_HISTORY_LIMIT = 500
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -108,6 +115,21 @@ function trimTrailState(route: GpsTrailState<DashboardTrailPoint>) {
   const trimmed = createTrailState()
   recentPoints.forEach((point) => appendGpsTrailPoint(trimmed, point, DEFAULT_GPS_TRAIL_FILTERS))
   return trimmed
+}
+
+function toDashboardTrailPoint(location: GpsLocation | TripPoint): DashboardTrailPoint | null {
+  const fix = normalizeVerifiedHistoryGpsLocation(location)
+  if (!fix) return null
+  const accuracy = Number(location.accuracy_m)
+  return {
+    latitude: fix.latitude,
+    longitude: fix.longitude,
+    timestamp: fix.timestamp,
+    accuracy: Number.isFinite(accuracy) && accuracy > 0 ? accuracy : null,
+    key: `${fix.timestamp}|${fix.latitude}|${fix.longitude}`,
+    gps_fix: true,
+    gps_valid: true,
+  }
 }
 
 /**
@@ -300,6 +322,25 @@ function createDeviceIcon(options: {
   })
 }
 
+function createTrailEndpointIcon(label: string, color: string): L.DivIcon {
+  return L.divIcon({
+    className: 'live-trail-endpoint',
+    html: `<span style="
+      display:inline-block;
+      padding:3px 8px;
+      border:2px solid #ffffff;
+      border-radius:12px;
+      background:${color};
+      color:#ffffff;
+      font:700 10px/1.2 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+      white-space:nowrap;
+      box-shadow:0 2px 6px rgba(0,0,0,.35);
+    ">${label}</span>`,
+    iconSize: [78, 24],
+    iconAnchor: [39, 26],
+  })
+}
+
 // ─── Popup factory ────────────────────────────────────────────────────────────
 
 /**
@@ -449,6 +490,7 @@ export default function DashboardLiveMap({
   const mapInstanceRef = useRef<L.Map | null>(null)
   const markerGroupRef = useRef<L.LayerGroup | null>(null)
   const liveTrailDotsRef = useRef<L.LayerGroup | null>(null)
+  const liveTrailEndpointsRef = useRef<L.LayerGroup | null>(null)
   const liveTrailLineRef = useRef<L.Polyline | null>(null)
   const tileLayerRef = useRef<L.TileLayer | null>(null)
   const markersMapRef = useRef<Map<string, MarkerEntry>>(new Map())
@@ -488,7 +530,10 @@ export default function DashboardLiveMap({
     () => new Set()
   )
   const historyFallbackFetchedAtRef = useRef<Map<string, number>>(new Map())
-  const [liveTrailPointCount, setLiveTrailPointCount] = useState(0)
+  const [liveTrailPointCountState, setLiveTrailPointCount] = useState<{
+    deviceKey: string | null
+    count: number
+  }>({ deviceKey: null, count: 0 })
   // Map tile providers
   const mapTileProviders = {
     standard: {
@@ -575,6 +620,11 @@ export default function DashboardLiveMap({
       String(device.device_id) === String(selectedDeviceId)
   )
   const selectedMarkerKey = String(selectedDevice?.id ?? selectedDeviceId ?? '')
+  const selectedHistoryDeviceId = selectedDevice?.imei || selectedDevice?.device_id || ''
+  const selectedApiHistoryId = selectedDevice?.device_id ?? selectedDevice?.id
+  const liveTrailPointCount = liveTrailPointCountState.deviceKey === selectedMarkerKey
+    ? liveTrailPointCountState.count
+    : 0
   const previousSelectedMarkerKeyRef = useRef<string | null>(null)
   const selectedLastReported = lastReportedLocations.find(({ device }) =>
     String(device.id) === selectedMarkerKey || String(device.device_id) === selectedMarkerKey
@@ -621,6 +671,62 @@ export default function DashboardLiveMap({
     setLastVerifiedGpsLocations(next)
   }, [])
 
+  const syncLiveTrailLayers = useCallback((
+    trail: DashboardTrailState,
+    rebuildDots: boolean,
+    appendedPoint?: DashboardTrailPoint
+  ) => {
+    const points = trail.route.segments.flat()
+    const dots = liveTrailDotsRef.current
+    if (rebuildDots && dots) {
+      dots.clearLayers()
+      points.forEach((point) => {
+        L.circleMarker([point.latitude, point.longitude], {
+          radius: 3.5,
+          color: '#ffffff',
+          weight: 1.5,
+          fillColor: '#1d4ed8',
+          fillOpacity: 1,
+        }).addTo(dots)
+      })
+    } else if (appendedPoint && dots) {
+      L.circleMarker([appendedPoint.latitude, appendedPoint.longitude], {
+        radius: 3.5,
+        color: '#ffffff',
+        weight: 1.5,
+        fillColor: '#1d4ed8',
+        fillOpacity: 1,
+      }).addTo(dots)
+    }
+
+    liveTrailLineRef.current?.setLatLngs(
+      trail.route.segments.map((segment) =>
+        segment.map((point): [number, number] => [point.latitude, point.longitude])
+      )
+    )
+
+    const endpoints = liveTrailEndpointsRef.current
+    endpoints?.clearLayers()
+    const first = points[0]
+    const last = trail.route.latest ?? points[points.length - 1]
+    if (first && endpoints) {
+      L.marker([first.latitude, first.longitude], {
+        icon: createTrailEndpointIcon('START', '#16a34a'),
+        zIndexOffset: 1300,
+      }).addTo(endpoints)
+    }
+    if (last && last.key !== first?.key && endpoints) {
+      L.marker([last.latitude, last.longitude], {
+        icon: createTrailEndpointIcon(
+          isFreshGpsTimestamp(last.timestamp) ? 'END · LIVE' : 'END · LAST FIX',
+          isFreshGpsTimestamp(last.timestamp) ? '#dc2626' : '#d97706'
+        ),
+        zIndexOffset: 1300,
+      }).addTo(endpoints)
+    }
+    setLiveTrailPointCount({ deviceKey: trail.deviceKey, count: points.length })
+  }, [])
+
   const recordSelectedTrailPoint = useCallback((
     device: Device,
     latitude: number,
@@ -641,11 +747,21 @@ export default function DashboardLiveMap({
         route: createTrailState(),
       }
       liveTrailRef.current = trail
-      liveTrailLineRef.current?.setLatLngs([])
       liveTrailDotsRef.current?.clearLayers()
-      setLiveTrailPointCount(0)
+      liveTrailEndpointsRef.current?.clearLayers()
+      liveTrailLineRef.current?.setLatLngs([])
+      setLiveTrailPointCount({ deviceKey, count: 0 })
     }
     if (trail.lastObservedAt !== null && timestamp <= trail.lastObservedAt) return
+    if (
+      trail.lastObservedAt !== null &&
+      timestamp - trail.lastObservedAt > DEFAULT_GPS_JOURNEY_INACTIVITY_MS
+    ) {
+      trail.route = createTrailState()
+      liveTrailDotsRef.current?.clearLayers()
+      liveTrailEndpointsRef.current?.clearLayers()
+      liveTrailLineRef.current?.setLatLngs([])
+    }
     trail.lastObservedAt = timestamp
 
     const point: DashboardTrailPoint = {
@@ -656,49 +772,142 @@ export default function DashboardLiveMap({
       key: `${timestamp}|${latitude}|${longitude}`,
     }
     const accepted = appendGpsTrailPoint(trail.route, point, DEFAULT_GPS_TRAIL_FILTERS)
-    if (accepted) {
-      let pointCount = trail.route.segments.reduce((count, segment) => count + segment.length, 0)
+    const isLatestVerifiedFix = trail.route.latest?.key === point.key
+    if (accepted || isLatestVerifiedFix) {
+      const pointCount = trail.route.segments.reduce((count, segment) => count + segment.length, 0)
+      let rebuildDots = false
       if (pointCount > MAX_LIVE_TRAIL_POINTS) {
         trail.route = trimTrailState(trail.route)
-        pointCount = trail.route.segments.reduce((count, segment) => count + segment.length, 0)
-        const trailDots = liveTrailDotsRef.current
-        trailDots?.clearLayers()
-        if (trailDots) {
-          trail.route.segments.flat().forEach((trailPoint) => {
-            L.circleMarker([trailPoint.latitude, trailPoint.longitude], {
-              radius: 3.5,
-              color: '#ffffff',
-              weight: 1.5,
-              fillColor: '#1d4ed8',
-              fillOpacity: 1,
-            }).addTo(trailDots)
-          })
-        }
-      } else {
-        liveTrailDotsRef.current && L.circleMarker([latitude, longitude], {
-          radius: 3.5,
-          color: '#ffffff',
-          weight: 1.5,
-          fillColor: '#1d4ed8',
-          fillOpacity: 1,
-        }).addTo(liveTrailDotsRef.current)
+        rebuildDots = true
       }
-      liveTrailLineRef.current?.setLatLngs(
-        trail.route.segments.map((segment) =>
-          segment.map((trailPoint): [number, number] => [
-            trailPoint.latitude,
-            trailPoint.longitude,
-          ])
-        )
+      syncLiveTrailLayers(
+        trail,
+        rebuildDots,
+        accepted && !rebuildDots ? point : undefined
       )
-      setLiveTrailPointCount(pointCount)
     }
 
     mapInstanceRef.current?.panTo([latitude, longitude], {
       animate: true,
       duration: 0.6,
     })
-  }, [selectedDeviceId])
+  }, [selectedDeviceId, syncLiveTrailLayers])
+
+  const applyGpsFix = useCallback((device: Device, fix: GpsLocation) => {
+    const verifiedFix = normalizeVerifiedGpsFix(fix)
+    if (!verifiedFix) return
+    const { latitude, longitude, timestamp } = verifiedFix
+    if (!isAcceptableFix(latitude, longitude)) return
+
+    const markerKey = String(device.id)
+    let entry = markersMapRef.current.get(markerKey)
+    const cachedFix = lastVerifiedGpsLocationsRef.current.get(markerKey)
+    if (
+      (cachedFix && timestamp < cachedFix.timestamp) ||
+      (
+        cachedFix &&
+        timestamp === cachedFix.timestamp &&
+        (latitude !== cachedFix.latitude || longitude !== cachedFix.longitude)
+      ) ||
+      (entry?.latestFixAt !== null &&
+        entry?.latestFixAt !== undefined &&
+        timestamp <= entry.latestFixAt)
+    ) return
+    if (!entry) {
+      const markerGroup = markerGroupRef.current
+      if (!markerGroup) return
+      const markerDevice: Device = {
+        ...device,
+        last_latitude: latitude,
+        last_longitude: longitude,
+        gps_update_time: verifiedFix.recordedAt,
+        gps_fix_source: verifiedFix.source,
+        has_gps_fix: true,
+        gps_fix: true,
+      }
+      const rawName = markerDevice.device_name || markerDevice.wearer_name || `Watch #${markerDevice.id}`
+      const deviceName = String(rawName).toLowerCase().includes('demo')
+        ? `Watch #${markerDevice.id}`
+        : rawName
+      const marker = L.marker([latitude, longitude], {
+        icon: createDeviceIcon({
+          isOnline: markerDevice.online === true || markerDevice.is_online === true,
+          isSelected: false,
+          isStale: isStaleGps(timestamp),
+          heading: fix.heading ?? markerDevice.heading,
+          deviceName,
+        }),
+        zIndexOffset: 1000,
+      })
+      marker.bindPopup(createPopupHtml(markerDevice, latitude, longitude, fix), { maxWidth: 280 })
+      marker.on('click', () => onSelectDeviceRef.current?.(device))
+      marker.addTo(markerGroup)
+      entry = {
+        device: markerDevice,
+        marker,
+        currentLat: latitude,
+        currentLng: longitude,
+        latestFixAt: null,
+      }
+      markersMapRef.current.set(markerKey, entry)
+    }
+    const speed = fix.speed_kmh == null ? null : Number(fix.speed_kmh)
+
+    entry.latestFixAt = timestamp
+    entry.currentLat = latitude
+    entry.currentLng = longitude
+    animateMarkerTo(entry.marker, [latitude, longitude])
+    entry.device = {
+      ...entry.device,
+      last_latitude: latitude,
+      last_longitude: longitude,
+      gps_update_time: new Date(timestamp).toISOString(),
+      has_gps_fix: true,
+      gps_fix: true,
+      gps_fix_source: verifiedFix.source,
+      ...(fix.speed_kmh != null ? { speed_kmh: speed } : {}),
+      ...(fix.heading != null ? { heading: Number(fix.heading) } : {}),
+      ...(fix.battery_pct != null ? { battery_pct: Number(fix.battery_pct) } : {}),
+    }
+
+    const rawName = entry.device.device_name || entry.device.wearer_name || `Watch #${entry.device.id}`
+    const deviceName = String(rawName).toLowerCase().includes('demo')
+      ? `Watch #${entry.device.id}`
+      : rawName
+    entry.marker.setIcon(
+      createDeviceIcon({
+        isOnline: entry.device.online === true || entry.device.is_online === true,
+        isSelected: String(selectedDeviceId) === String(entry.device.id) ||
+          String(selectedDeviceId) === String(entry.device.device_id),
+        isStale: isStaleGps(entry.latestFixAt),
+        heading: fix.heading ?? entry.device.heading,
+        deviceName,
+      })
+    )
+    entry.marker.setPopupContent(createPopupHtml(entry.device, latitude, longitude, fix))
+    rememberVerifiedGpsLocation(markerKey, toVerifiedHistoryLocation(verifiedFix))
+    setApiVerifiedMarkerIds((current) => new Set(current).add(markerKey))
+    const actualPosition = entry.marker.getLatLng()
+    console.info('[gps][dashboard] verified marker update', {
+      deviceId: device.device_id || device.id,
+      apiCoordinates: { latitude, longitude },
+      gpsFix: fix.gps_fix ?? false,
+      gpsValid: fix.gps_valid ?? false,
+      coordinateSource: fix.coordinate_source ?? fix.gps_source ?? fix.source ?? null,
+      gpsTimestamp: verifiedFix.recordedAt,
+      actualMarkerPosition: {
+        latitude: actualPosition.lat,
+        longitude: actualPosition.lng,
+      },
+    })
+    if (
+      timestamp !== null &&
+      (String(selectedDeviceId) === String(device.id) ||
+        String(selectedDeviceId) === String(device.device_id))
+    ) {
+      recordSelectedTrailPoint(device, latitude, longitude, timestamp)
+    }
+  }, [recordSelectedTrailPoint, rememberVerifiedGpsLocation, selectedDeviceId])
 
   useEffect(() => {
     const previousKey = previousSelectedMarkerKeyRef.current
@@ -720,8 +929,218 @@ export default function DashboardLiveMap({
     }
     liveTrailLineRef.current?.setLatLngs([])
     liveTrailDotsRef.current?.clearLayers()
-    setLiveTrailPointCount(0)
+    liveTrailEndpointsRef.current?.clearLayers()
   }, [selectedMarkerKey])
+
+  useEffect(() => {
+    if (!selectedApiHistoryId || !selectedMarkerKey) return
+
+    const controller = new AbortController()
+    const historyFetchTimes = historyFallbackFetchedAtRef.current
+    let isCancelled = false
+    let fetchStartedAt: number | null = null
+    const loadLatestJourneyTrail = async () => {
+      fetchStartedAt = Date.now()
+      historyFetchTimes.set(selectedMarkerKey, fetchStartedAt)
+      try {
+        const history = await getGpsHistory(
+          selectedApiHistoryId,
+          LIVE_TRAIL_HISTORY_LIMIT,
+          controller.signal
+        )
+        if (isCancelled) return
+
+        const latestVerifiedHistory = history
+          .map((point) => normalizeVerifiedHistoryGpsLocation(point))
+          .filter(
+            (location): location is VerifiedHistoryGpsLocation => location !== null
+          )
+          .sort((first, second) => first.timestamp - second.timestamp)
+          .at(-1)
+        if (latestVerifiedHistory) {
+          rememberVerifiedGpsLocation(selectedMarkerKey, latestVerifiedHistory)
+          setApiVerifiedHistoryLocations((current) => {
+            const previous = current.get(selectedMarkerKey)
+            if (previous && previous.timestamp >= latestVerifiedHistory.timestamp) return current
+            const next = new Map(current)
+            next.set(selectedMarkerKey, latestVerifiedHistory)
+            return next
+          })
+        }
+        setGpsHistoryLoadedDeviceIds((current) => new Set(current).add(selectedMarkerKey))
+
+        const historyPoints = history
+          .map(toDashboardTrailPoint)
+          .filter((point): point is DashboardTrailPoint => point !== null)
+        const currentTrail = liveTrailRef.current
+        const pointsByKey = new Map<string, DashboardTrailPoint>()
+        historyPoints.forEach((point) => pointsByKey.set(point.key, point))
+        if (currentTrail.deviceKey === selectedMarkerKey) {
+          currentTrail.route.segments.flat().forEach((point) => pointsByKey.set(point.key, point))
+        }
+
+        const latestGroup = groupGpsPointsByInactivity(
+          [...pointsByKey.values()],
+          DEFAULT_GPS_JOURNEY_INACTIVITY_MS
+        ).at(-1)
+        if (!latestGroup?.length) return
+
+        const route = createTrailState()
+        latestGroup.forEach((point) => appendGpsTrailPoint(route, point, DEFAULT_GPS_TRAIL_FILTERS))
+        const lastObservedAt = Math.max(
+          currentTrail.deviceKey === selectedMarkerKey
+            ? currentTrail.lastObservedAt ?? 0
+            : 0,
+          latestGroup[latestGroup.length - 1].timestamp
+        )
+        const seededTrail: DashboardTrailState = {
+          deviceKey: selectedMarkerKey,
+          lastObservedAt,
+          route,
+        }
+        liveTrailRef.current = seededTrail
+        syncLiveTrailLayers(seededTrail, true)
+
+        const bounds = route.segments.flat().map(
+          (point): [number, number] => [point.latitude, point.longitude]
+        )
+        if (bounds.length === 1) mapInstanceRef.current?.setView(bounds[0], 15)
+        else if (bounds.length > 1) {
+          mapInstanceRef.current?.fitBounds(bounds, { padding: [40, 40], maxZoom: 16 })
+        }
+      } catch (error) {
+        if (!isCancelled) {
+          if (historyFetchTimes.get(selectedMarkerKey) === fetchStartedAt) {
+            historyFetchTimes.delete(selectedMarkerKey)
+          }
+          console.warn('Unable to load the latest verified GPS trail for the selected watch.', error)
+        }
+      }
+    }
+
+    void loadLatestJourneyTrail()
+    return () => {
+      isCancelled = true
+      controller.abort()
+      if (
+        fetchStartedAt !== null &&
+        historyFetchTimes.get(selectedMarkerKey) === fetchStartedAt
+      ) {
+        historyFetchTimes.delete(selectedMarkerKey)
+      }
+    }
+  }, [
+    selectedMarkerKey,
+    selectedApiHistoryId,
+    rememberVerifiedGpsLocation,
+    syncLiveTrailLayers,
+  ])
+
+  useEffect(() => {
+    if (!selectedHistoryDeviceId || !selectedMarkerKey) return
+    const historyDeviceId = String(selectedHistoryDeviceId)
+    if (!historyDeviceId) return
+
+    let hasFitToFirestoreHistory = false
+    return subscribeToFirestoreLocationHistory(
+      historyDeviceId,
+      2000,
+      (points) => {
+        setGpsHistoryLoadedDeviceIds((current) =>
+          current.has(selectedMarkerKey)
+            ? current
+            : new Set(current).add(selectedMarkerKey)
+        )
+        const historyPoints = points
+          .map(toDashboardTrailPoint)
+          .filter((point): point is DashboardTrailPoint => point !== null)
+        const currentTrail = liveTrailRef.current
+        const pointsByKey = new Map<string, DashboardTrailPoint>()
+        historyPoints.forEach((point) => pointsByKey.set(point.key, point))
+        if (currentTrail.deviceKey === selectedMarkerKey) {
+          currentTrail.route.segments.flat().forEach((point) => pointsByKey.set(point.key, point))
+        }
+
+        const latestGroup = groupGpsPointsByInactivity(
+          [...pointsByKey.values()],
+          DEFAULT_GPS_JOURNEY_INACTIVITY_MS
+        ).at(-1)
+        if (latestGroup?.length) {
+          const route = createTrailState()
+          latestGroup.forEach((point) => appendGpsTrailPoint(route, point, DEFAULT_GPS_TRAIL_FILTERS))
+          const seededTrail: DashboardTrailState = {
+            deviceKey: selectedMarkerKey,
+            lastObservedAt: Math.max(
+              currentTrail.deviceKey === selectedMarkerKey
+                ? currentTrail.lastObservedAt ?? 0
+                : 0,
+              latestGroup[latestGroup.length - 1].timestamp
+            ),
+            route,
+          }
+          liveTrailRef.current = seededTrail
+          syncLiveTrailLayers(seededTrail, true)
+
+          if (!hasFitToFirestoreHistory) {
+            hasFitToFirestoreHistory = true
+            const bounds = route.segments.flat().map(
+              (point): [number, number] => [point.latitude, point.longitude]
+            )
+            if (bounds.length === 1) mapInstanceRef.current?.setView(bounds[0], 15)
+            else if (bounds.length > 1) {
+              mapInstanceRef.current?.fitBounds(bounds, { padding: [40, 40], maxZoom: 16 })
+            }
+          }
+        }
+
+        const latest = points
+          .map((point) => ({ point, fix: normalizeVerifiedGpsFix(point) }))
+          .filter(
+            (entry): entry is { point: TripPoint; fix: VerifiedGpsFix } => entry.fix !== null
+          )
+          .sort((first, second) => first.fix.timestamp - second.fix.timestamp)
+          .at(-1)
+        if (!latest) return
+
+        const verifiedHistory = toVerifiedHistoryLocation(latest.fix)
+        rememberVerifiedGpsLocation(selectedMarkerKey, verifiedHistory)
+        setApiVerifiedHistoryLocations((current) => {
+          const previous = current.get(selectedMarkerKey)
+          if (previous && previous.timestamp >= latest.fix.timestamp) return current
+          const next = new Map(current)
+          next.set(selectedMarkerKey, verifiedHistory)
+          return next
+        })
+
+        if (isFreshGpsTimestamp(latest.fix.timestamp)) {
+          const currentDevice = devicesRef.current.find((device) =>
+            String(device.id) === selectedMarkerKey ||
+            String(device.device_id) === selectedMarkerKey
+          )
+          if (currentDevice) {
+            applyGpsFix(currentDevice, latest.point)
+            setApiCurrentGpsDeviceIds((current) =>
+              current.has(selectedMarkerKey)
+                ? current
+                : new Set(current).add(selectedMarkerKey)
+            )
+          }
+        }
+      },
+      (error) => {
+        console.warn(
+          `[gps][dashboard] Unable to subscribe to live Firestore history for device ${historyDeviceId}.`,
+          error
+        )
+      }
+    )
+  }, [
+    selectedHistoryDeviceId,
+    selectedMarkerKey,
+    applyGpsFix,
+    rememberVerifiedGpsLocation,
+    syncLiveTrailLayers,
+  ])
 
   useEffect(() => {
     devicesRef.current = devices
@@ -782,11 +1201,13 @@ export default function DashboardLiveMap({
       lineJoin: 'round',
     }).addTo(map)
     const trailDots = L.layerGroup().addTo(map)
+    const trailEndpoints = L.layerGroup().addTo(map)
 
     mapInstanceRef.current = map
     markerGroupRef.current = markers
     liveTrailLineRef.current = trailLine
     liveTrailDotsRef.current = trailDots
+    liveTrailEndpointsRef.current = trailEndpoints
     tileLayerRef.current = initialTiles
     setMapForTracking(map)
 
@@ -811,6 +1232,7 @@ export default function DashboardLiveMap({
       markerGroupRef.current = null
       liveTrailLineRef.current = null
       liveTrailDotsRef.current = null
+      liveTrailEndpointsRef.current = null
       tileLayerRef.current = null
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
@@ -1104,139 +1526,34 @@ export default function DashboardLiveMap({
   }, [selectedDeviceId, selectedDevice, mapForTracking, lastReportedLocations])
 
   // ── Effect 4: Live GPS polling every 5 s ─────────────────────────────────
-  // Keep devices without a verified Firestore fix current.
+  // Always refresh the selected watch; use remaining poll slots for stale devices.
   useEffect(() => {
     if (deviceIdsKey.length === 0) return
 
     let isCancelled = false
     let isPolling = false
     const requestController = new AbortController()
-    const applyGpsFix = (device: Device, fix: GpsLocation) => {
-      const verifiedFix = normalizeVerifiedGpsFix(fix)
-      if (!verifiedFix) return
-      const { latitude, longitude, timestamp } = verifiedFix
-      if (!isAcceptableFix(latitude, longitude)) return
-
-      const markerKey = String(device.id)
-      let entry = markersMapRef.current.get(markerKey)
-      const cachedFix = lastVerifiedGpsLocationsRef.current.get(markerKey)
-      if (
-        (cachedFix && timestamp < cachedFix.timestamp) ||
-        (
-          cachedFix &&
-          timestamp === cachedFix.timestamp &&
-          (latitude !== cachedFix.latitude || longitude !== cachedFix.longitude)
-        ) ||
-        (entry?.latestFixAt !== null &&
-          entry?.latestFixAt !== undefined &&
-          timestamp <= entry.latestFixAt)
-      ) return
-      if (!entry) {
-        const markerGroup = markerGroupRef.current
-        if (!markerGroup) return
-        const markerDevice: Device = {
-          ...device,
-          last_latitude: latitude,
-          last_longitude: longitude,
-          gps_update_time: verifiedFix.recordedAt,
-          gps_fix_source: verifiedFix.source,
-          has_gps_fix: true,
-          gps_fix: true,
-        }
-        const rawName = markerDevice.device_name || markerDevice.wearer_name || `Watch #${markerDevice.id}`
-        const deviceName = String(rawName).toLowerCase().includes('demo')
-          ? `Watch #${markerDevice.id}`
-          : rawName
-        const marker = L.marker([latitude, longitude], {
-          icon: createDeviceIcon({
-            isOnline: markerDevice.online === true || markerDevice.is_online === true,
-            isSelected: false,
-            isStale: isStaleGps(timestamp),
-            heading: fix.heading ?? markerDevice.heading,
-            deviceName,
-          }),
-          zIndexOffset: 1000,
-        })
-        marker.bindPopup(createPopupHtml(markerDevice, latitude, longitude, fix), { maxWidth: 280 })
-        marker.on('click', () => onSelectDeviceRef.current?.(device))
-        marker.addTo(markerGroup)
-        entry = {
-          device: markerDevice,
-          marker,
-          currentLat: latitude,
-          currentLng: longitude,
-          latestFixAt: null,
-        }
-        markersMapRef.current.set(markerKey, entry)
-      }
-      const speed = fix.speed_kmh == null ? null : Number(fix.speed_kmh)
-
-      entry.latestFixAt = timestamp
-      entry.currentLat = latitude
-      entry.currentLng = longitude
-      animateMarkerTo(entry.marker, [latitude, longitude])
-      entry.device = {
-        ...entry.device,
-        last_latitude: latitude,
-        last_longitude: longitude,
-        gps_update_time: new Date(timestamp).toISOString(),
-        has_gps_fix: true,
-        gps_fix: true,
-        gps_fix_source: verifiedFix.source,
-        ...(fix.speed_kmh != null ? { speed_kmh: speed } : {}),
-        ...(fix.heading != null ? { heading: Number(fix.heading) } : {}),
-        ...(fix.battery_pct != null ? { battery_pct: Number(fix.battery_pct) } : {}),
-      }
-
-      const rawName = entry.device.device_name || entry.device.wearer_name || `Watch #${entry.device.id}`
-      const deviceName = String(rawName).toLowerCase().includes('demo')
-        ? `Watch #${entry.device.id}`
-        : rawName
-      entry.marker.setIcon(
-        createDeviceIcon({
-          isOnline: entry.device.online === true || entry.device.is_online === true,
-          isSelected: String(selectedDeviceId) === String(entry.device.id) ||
-            String(selectedDeviceId) === String(entry.device.device_id),
-          isStale: isStaleGps(entry.latestFixAt),
-          heading: fix.heading ?? entry.device.heading,
-          deviceName,
-        })
-      )
-      entry.marker.setPopupContent(createPopupHtml(entry.device, latitude, longitude, fix))
-      rememberVerifiedGpsLocation(markerKey, toVerifiedHistoryLocation(verifiedFix))
-      setApiVerifiedMarkerIds((current) => new Set(current).add(markerKey))
-      const actualPosition = entry.marker.getLatLng()
-      console.info('[gps][dashboard] verified marker update', {
-        deviceId: device.device_id || device.id,
-        apiCoordinates: { latitude, longitude },
-        gpsFix: fix.gps_fix ?? false,
-        gpsValid: fix.gps_valid ?? false,
-        coordinateSource: fix.coordinate_source ?? fix.gps_source ?? fix.source ?? null,
-        gpsTimestamp: verifiedFix.recordedAt,
-        actualMarkerPosition: {
-          latitude: actualPosition.lat,
-          longitude: actualPosition.lng,
-        },
-      })
-      if (
-        timestamp !== null &&
-        (String(selectedDeviceId) === String(device.id) ||
-          String(selectedDeviceId) === String(device.device_id))
-      ) {
-        recordSelectedTrailPoint(device, latitude, longitude, timestamp)
-      }
-    }
-
     const pollActiveWatches = async () => {
       if (isPolling || isCancelled) return
       isPolling = true
       const currentDevices = devicesRef.current
       const targets = currentDevices
-        .filter((device) => {
+        .map((device) => {
+          const isSelected = selectedDeviceId != null && (
+            String(selectedDeviceId) === String(device.id) ||
+            String(selectedDeviceId) === String(device.device_id)
+          )
           const fix = normalizeVerifiedGpsFix(device)
-          return !fix || !isFreshGpsTimestamp(fix.timestamp)
+          return {
+            device,
+            isSelected,
+            needsRefresh: !fix || !isFreshGpsTimestamp(fix.timestamp),
+          }
         })
+        .filter(({ isSelected, needsRefresh }) => isSelected || needsRefresh)
+        .sort((first, second) => Number(second.isSelected) - Number(first.isSelected))
         .slice(0, 5)
+        .map(({ device }) => device)
 
       try {
         for (const dev of targets) {
@@ -1278,10 +1595,24 @@ export default function DashboardLiveMap({
                 )
               )
             )
+            const newerNoFixPacket = Boolean(
+              cachedFix &&
+              snapshot.noFixReported &&
+              reportReceivedAt !== null &&
+              reportReceivedAt > cachedFix.timestamp
+            )
+            const cachedFixIsCurrent = Boolean(
+              cachedFix &&
+              isFreshGpsTimestamp(cachedFix.timestamp) &&
+              !newerNoFixPacket
+            )
             const hasCurrentFix = Boolean(
-              latestFix &&
-              isFreshGpsTimestamp(latestFix.timestamp) &&
-              apiFixNotOlder
+              cachedFixIsCurrent ||
+              (
+                latestFix &&
+                isFreshGpsTimestamp(latestFix.timestamp) &&
+                apiFixNotOlder
+              )
             )
             const existingMarkerPosition =
               markersMapRef.current.get(markerKey)?.marker.getLatLng() ??
@@ -1426,6 +1757,7 @@ export default function DashboardLiveMap({
   }, [
     deviceIdsKey,
     selectedDeviceId,
+    applyGpsFix,
     recordSelectedTrailPoint,
     rememberVerifiedGpsLocation,
   ])

@@ -140,13 +140,11 @@ function LoginPage() {
       </svg>
       <Card className="atlas-card" elevation={0}>
         <Box className="atlas-heading">
-          <svg width="58" height="58" viewBox="0 0 64 64" aria-hidden="true">
-            <path d="M45 8A25 25 0 1 0 56 43A22 22 0 0 1 17 42A24 24 0 0 1 45 8" fill="#238de5" />
-            <path d="M12 49Q33 60 57 42Q42 69 12 57Z" fill="#18bdf4" />
-            <circle cx="39" cy="20" r="5" fill="#ff9825" />
-            <path d="m39 27-2 12 7 11m-7-11-6 10m7-19-9 7m9-7 10 7" fill="none" stroke="#ff9825" strokeWidth="4" strokeLinecap="round" />
-          </svg>
-          <Typography className="atlas-brand">TRACKGUARD 360</Typography>
+          <img
+            className="atlas-logo"
+            src="/trackguard360-logo-light.svg"
+            alt="TrackGuard 360 GPS & Monitoring"
+          />
           <Typography component="h1" className="atlas-title">Welcome back</Typography>
           
         </Box>

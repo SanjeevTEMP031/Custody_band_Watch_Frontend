@@ -213,7 +213,8 @@ export function useSelectedGpsRoute(
     location: LastReportedGpsLocation | null,
     currentGpsAvailable: boolean
   ) => void,
-  includeHistory = true
+  includeHistory = true,
+  includeFirestoreHistory = true
 ): void {
   const onFreshPointRef = useRef(onFreshPoint)
   const onLastKnownPointRef = useRef(onLastKnownPoint)
@@ -299,15 +300,25 @@ export function useSelectedGpsRoute(
       if (cancelled) return
       try {
         const firestorePoint = firestoreLatestRef.current
-        const snapshot = firestorePoint
-          ? { latest: firestorePoint, lastReported: null }
-          : await getLatestGpsSnapshot(deviceId, requestController.signal)
+        const snapshot = await getLatestGpsSnapshot(deviceId, requestController.signal)
         const latest = snapshot.latest
-        const point = latest ? parsePoint(latest) : null
-        route.latestApiFix = point
-        route.currentFix = point && isFreshGpsTimestamp(point.timestamp) ? point : null
+        const apiPoint = latest ? parsePoint(latest) : null
+        const firestoreFix = firestorePoint ? parsePoint(firestorePoint) : null
+        const currentPoint = apiPoint && isFreshGpsTimestamp(apiPoint.timestamp)
+          ? apiPoint
+          : firestoreFix && isFreshGpsTimestamp(firestoreFix.timestamp)
+            ? firestoreFix
+            : null
+        const currentPointSupersededByNoFix = Boolean(
+          currentPoint &&
+          snapshot.noFixReported === true &&
+          snapshot.lastPacketReceivedAt !== null &&
+          snapshot.lastPacketReceivedAt > currentPoint.timestamp
+        )
+        route.latestApiFix = apiPoint
+        route.currentFix = currentPointSupersededByNoFix ? null : currentPoint
         route.latestHistoryMismatch = includeHistory &&
-          Boolean(point && !route.historyPointKeys.has(point.key))
+          Boolean(apiPoint && !route.historyPointKeys.has(apiPoint.key))
         if (route.currentFix && !route.livePoints.has(route.currentFix.key)) {
           route.livePoints.set(route.currentFix.key, route.currentFix)
           if (route.livePoints.size > 500) {
@@ -323,9 +334,11 @@ export function useSelectedGpsRoute(
           route.currentFix ? null : snapshot.lastReported,
           Boolean(route.currentFix)
         )
-        if (latest && point) {
-          if (route.currentFix) onFreshPointRef.current(latest)
-          else onLastKnownPointRef.current?.(latest)
+        if (route.currentFix) {
+          const currentLocation = route.currentFix === apiPoint ? latest : firestorePoint
+          if (currentLocation) onFreshPointRef.current(currentLocation)
+        } else if (latest && apiPoint) {
+          onLastKnownPointRef.current?.(latest)
         }
         onStatusChangeRef.current?.(getRouteStatus(route))
       } catch (error) {
@@ -457,7 +470,9 @@ export function useSelectedGpsRoute(
 
     let unsubscribeHistory = () => {}
     if (includeHistory) {
-      unsubscribeHistory = subscribeToHistory()
+      if (includeFirestoreHistory) {
+        unsubscribeHistory = subscribeToHistory()
+      }
       void loadApiHistory()
     }
     void pollLatest()
@@ -473,5 +488,5 @@ export function useSelectedGpsRoute(
       route.endMarker?.remove()
       if (routeRef.current === route) routeRef.current = null
     }
-  }, [enabled, map, deviceId, includeHistory])
+  }, [enabled, map, deviceId, includeHistory, includeFirestoreHistory])
 }
