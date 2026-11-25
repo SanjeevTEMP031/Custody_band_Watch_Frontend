@@ -121,6 +121,18 @@
   animation: pulseDot 2s infinite ease-in-out;
 }
 
+.system-status-pill.status-offline {
+  background: #fff7ed;
+  border-color: #fed7aa;
+  color: #c2410c;
+}
+
+.status-pulse-dot.status-pulse-dot-offline {
+  background: #f97316;
+  box-shadow: none;
+  animation: none;
+}
+
 @keyframes pulseDot {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.4; transform: scale(0.85); }

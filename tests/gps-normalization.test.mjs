@@ -577,6 +577,28 @@ test('keeps latest packet time separate from the last verified GPS fix', () => {
   assert.deepEqual(metadata, {
     receivedAt: Date.parse('2026-11-14T07:47:39.181920Z'),
     noFixReported: true,
+    gpsValid: false,
+    locationIsCurrent: null,
+    gpsStatus: null,
+    batteryPct: null,
+  })
+})
+
+test('preserves explicit current-fix flags and GPS telemetry from the latest response', () => {
+  const metadata = normalizeLatestGpsReportMetadata({
+    gps_valid: true,
+    location_is_current: true,
+    gps_status: 'A',
+    battery_percent: 44,
+  })
+
+  assert.deepEqual(metadata, {
+    receivedAt: null,
+    noFixReported: false,
+    gpsValid: true,
+    locationIsCurrent: true,
+    gpsStatus: 'A',
+    batteryPct: 44,
   })
 })
 

@@ -53,7 +53,7 @@ function AppRoutes() {
         <Route path="/admin/monitoring-center" element={<LivePeoplePage />} />
         <Route path="/admin/device-management" element={<DeviceManagementPage />} />
         <Route path="/admin/health-data" element={<HealthDataPage />} />
-        <Route path="/admin/geofence" element={<HealthDataPage geofenceView />} />
+        <Route path="/admin/geofence" element={<GeofencesPage />} />
         <Route path="/admin/add-device" element={<AddDevicePage />} />
         <Route path="/admin/bulk-sell" element={<BulkSellPage />} />
         <Route path="/admin/sim-cards" element={<SimCardManagementPage />} />

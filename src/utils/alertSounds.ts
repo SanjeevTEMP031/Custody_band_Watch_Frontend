@@ -5,6 +5,19 @@
  */
 
 let audioCtx: AudioContext | null = null
+let activeAlarmTimer: ReturnType<typeof setInterval> | null = null
+const ALERT_AUDIO_SETTING_EVENT = 'trackguard:alert-audio-setting'
+
+export function setAlertAudioEnabled(enabled: boolean): void {
+  localStorage.setItem('purview-alarm-sound', String(enabled))
+  window.dispatchEvent(new CustomEvent<boolean>(ALERT_AUDIO_SETTING_EVENT, { detail: enabled }))
+}
+
+export function subscribeToAlertAudioSetting(listener: (enabled: boolean) => void): () => void {
+  const handler = (event: Event) => listener((event as CustomEvent<boolean>).detail)
+  window.addEventListener(ALERT_AUDIO_SETTING_EVENT, handler)
+  return () => window.removeEventListener(ALERT_AUDIO_SETTING_EVENT, handler)
+}
 
 function getAudioContext(): AudioContext | null {
   if (typeof window === 'undefined') return null
@@ -20,13 +33,20 @@ function getAudioContext(): AudioContext | null {
   return audioCtx
 }
 
+export async function enableAlertAudio(): Promise<void> {
+  const ctx = getAudioContext()
+  if (!ctx) throw new Error('This browser does not support Web Audio.')
+  if (ctx.state !== 'running') await ctx.resume()
+  if (ctx.state !== 'running') throw new Error('Browser audio is still blocked. Check the browser audio settings.')
+}
+
 /**
  * Plays an audible notification sound based on alert severity.
  * @param severity 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'INFO'
  */
 export function playAlertSound(severity: string = 'HIGH') {
   try {
-    const enabled = localStorage.getItem('purview-alarm-sound') !== 'false'
+    const enabled = localStorage.getItem('purview-alarm-sound') === 'true'
     if (!enabled) return
 
     const ctx = getAudioContext()
@@ -50,6 +70,19 @@ export function playAlertSound(severity: string = 'HIGH') {
     }
   } catch (err) {
     console.debug('[AlertAudio] Unable to play sound:', err)
+  }
+}
+
+export function startAlertAlarm(severity: string = 'CRITICAL'): void {
+  stopAlertAlarm()
+  playAlertSound(severity)
+  activeAlarmTimer = setInterval(() => playAlertSound(severity), 2500)
+}
+
+export function stopAlertAlarm(): void {
+  if (activeAlarmTimer !== null) {
+    clearInterval(activeAlarmTimer)
+    activeAlarmTimer = null
   }
 }
 

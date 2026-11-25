@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Alert as MuiAlert, CircularProgress } from '@mui/material'
 import {
@@ -24,7 +24,11 @@ import {
 import { useApiData } from '../../hooks/useApiData'
 import { useRealtimeDevices } from '../../hooks/useRealtimeDevices'
 import { mergeDevicesWithFirestore } from '../../lib/firebase'
-import { playAlertSound } from '../../utils/alertSounds'
+import {
+  enableAlertAudio,
+  setAlertAudioEnabled,
+  subscribeToAlertAudioSetting,
+} from '../../utils/alertSounds'
 import AlertLocationDialog from './AlertLocationDialog'
 import DashboardLiveMap from './DashboardLiveMap'
 import './dashboard.css'
@@ -43,15 +47,14 @@ export default function DashboardPage() {
   const [busyAlerts, setBusyAlerts] = useState<(number | string)[]>([])
   const [sound, setSound] = useState(() => {
     try {
-      return localStorage.getItem('purview-alarm-sound') !== 'false'
+      return localStorage.getItem('purview-alarm-sound') === 'true'
     } catch {
-      return true
+      return false
     }
   })
   const [saved, setSaved] = useState(false)
 
-  const seenAlertIdsRef = useRef<Set<string | number>>(new Set())
-  const isInitialLoadDoneRef = useRef<boolean>(false)
+  useEffect(() => subscribeToAlertAudioSetting(setSound), [])
 
   // Subscribe to real-time Firestore device updates
   const { devices: realtimeDevices, loading: realtimeLoading } = useRealtimeDevices()
@@ -82,82 +85,10 @@ export default function DashboardPage() {
     [data]
   )
 
-  // 1. Play audible sound when new unresolved alerts arrive via API polling
-  useEffect(() => {
-    if (!alerts || alerts.length === 0) return
-
-    if (!isInitialLoadDoneRef.current) {
-      alerts.forEach(a => {
-        const k = a.id ?? a.alert_id
-        if (k != null) seenAlertIdsRef.current.add(k)
-      })
-      isInitialLoadDoneRef.current = true
-      return
-    }
-
-    // Inspect newly arrived alerts
-    for (const a of alerts) {
-      const k = a.id ?? a.alert_id
-      if (k != null && !seenAlertIdsRef.current.has(k)) {
-        seenAlertIdsRef.current.add(k)
-        if ((a.status || '').toLowerCase() !== 'resolved') {
-          playAlertSound(a.severity || 'HIGH')
-          break
-        }
-      }
-    }
-  }, [alerts])
-
-  // 2. Real-time WebSocket connection to /api/v1/alerts/live for zero-delay push sound
-  useEffect(() => {
-    let ws: WebSocket | null = null
-    let reconnectTimer: any = null
-
-    function initLiveAlertsWs() {
-      try {
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-        const host = window.location.port === '5173' || window.location.port === '3000'
-          ? `${window.location.hostname}:8000`
-          : window.location.host
-        const wsUrl = `${protocol}//${host}/api/v1/alerts/live`
-
-        ws = new WebSocket(wsUrl)
-
-        ws.onmessage = (event) => {
-          try {
-            const payload = JSON.parse(event.data)
-            if (payload.type === 'ALERT_NEW' && payload.alert) {
-              const newAlert = payload.alert
-              const k = newAlert.id ?? newAlert.alert_id
-              if (k != null && !seenAlertIdsRef.current.has(k)) {
-                seenAlertIdsRef.current.add(k)
-                playAlertSound(newAlert.severity || 'HIGH')
-              }
-              reload()
-            } else if (payload.type === 'ALERT_UPDATE') {
-              reload()
-            }
-          } catch {}
-        }
-
-        ws.onclose = () => {
-          reconnectTimer = setTimeout(initLiveAlertsWs, 6000)
-        }
-      } catch {}
-    }
-
-    initLiveAlertsWs()
-
-    return () => {
-      if (reconnectTimer) clearTimeout(reconnectTimer)
-      if (ws) ws.close()
-    }
-  }, [reload])
-
   const onlineCount = useMemo(
     () => devices.filter(d => {
-      if ((d as any).online === true || (d as any).is_online === true || (d as any).is_active === true) return true
-      const s = String(d.status || (d as any).connection_status || '').toLowerCase()
+      if (d.online === true || d.is_online === true || d.is_active === true) return true
+      const s = String(d.status || '').toLowerCase()
       return s === 'online' || s === 'active'
     }).length,
     [devices]
@@ -180,9 +111,9 @@ export default function DashboardPage() {
       const imeiMatch = (d.imei || '').toLowerCase().includes(q)
       const serialMatch = (d.serial_number || '').toLowerCase().includes(q)
       const personMatch = (
-        (d as any).custody_person_name ||
-        (d as any).wearer_name ||
-        (d as any).person_name ||
+        d.custody_person_name ||
+        d.wearer_name ||
+        d.person_name ||
         ''
       ).toLowerCase().includes(q)
       return nameMatch || imeiMatch || serialMatch || personMatch
@@ -329,8 +260,8 @@ export default function DashboardPage() {
               {searchResults.length > 0 ? (
                 <div className="search-results-list">
                   {searchResults.slice(0, 6).map(device => {
-                    const isOnline = (device.status || (device as any).connection_status || '').toLowerCase() === 'online' || (device as any).is_active === true
-                    const rawPerson = (device as any).custody_person_name || (device as any).wearer_name || null
+                    const isOnline = (device.status || '').toLowerCase() === 'online' || device.is_active === true || device.online === true
+                    const rawPerson = device.custody_person_name || device.wearer_name || null
                     const person = rawPerson && !String(rawPerson).toLowerCase().includes('demo') ? rawPerson : null
                     const rawDevName = device.device_name || 'Custody Band #' + device.id
                     const devName = String(rawDevName).toLowerCase().includes('demo') ? `Watch #${device.id}` : rawDevName
@@ -413,14 +344,24 @@ export default function DashboardPage() {
                 <button
                   type="button"
                   className={'sound-toggle-btn ' + (sound ? 'on' : 'off')}
-                  onClick={() => {
+                  onClick={async () => {
                     const next = !sound
+                    if (next) {
+                      try {
+                        await enableAlertAudio()
+                      } catch (reason) {
+                        setActionError(reason instanceof Error ? reason.message : 'Unable to enable browser audio.')
+                        return
+                      }
+                    }
                     setSound(next)
                     setSaved(false)
                     try {
-                      localStorage.setItem('purview-alarm-sound', String(next))
+                      setAlertAudioEnabled(next)
                       setSaved(true)
-                    } catch {}
+                    } catch {
+                      setActionError('Unable to save the alert audio preference in this browser.')
+                    }
                   }}
                   title="Toggle alarm audio"
                 >

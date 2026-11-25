@@ -101,7 +101,17 @@ interface RouteTrackingMapProps {
     speed_kmh?: number | null
     heading?: number | null
     timestamp?: string
+    gpsStatus?: string | null
+    isCurrent?: boolean
   } | null
+  monitoringRoutes?: Array<{
+    id: string
+    label: string
+    coordinates: [number, number][]
+    selected?: boolean
+  }>
+  actualTravelledPath?: TripPoint[]
+  fitBoundsKey?: string
   height?: string | number
   autoFitOnUpdate?: boolean
 }
@@ -177,7 +187,7 @@ function createEndIcon(distanceKm?: number): L.DivIcon {
   })
 }
 
-function createCurrentLocationIcon(heading?: number | null): L.DivIcon {
+function createCurrentLocationIcon(heading?: number | null, color = '#1d4ed8'): L.DivIcon {
   const rot = heading != null && Number.isFinite(heading) ? heading : 0
   return L.divIcon({
     className: 'trip-current-marker',
@@ -192,7 +202,7 @@ function createCurrentLocationIcon(heading?: number | null): L.DivIcon {
         <div style="
           position: absolute;
           inset: 0;
-          background: #2563eb;
+          background: ${color};
           opacity: 0.35;
           border-radius: 50%;
           animation: ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;
@@ -200,10 +210,10 @@ function createCurrentLocationIcon(heading?: number | null): L.DivIcon {
         <div style="
           position: absolute;
           inset: 4px;
-          background: #1d4ed8;
+          background: ${color};
           border: 2.5px solid #ffffff;
           border-radius: 50%;
-          box-shadow: 0 3px 10px rgba(29, 78, 216, 0.5);
+          box-shadow: 0 3px 10px ${color}80;
           display: flex;
           align-items: center;
           justify-content: center;
@@ -227,6 +237,9 @@ export default function RouteTrackingMap({
   routeColor = '#2563eb',
   playbackPoint = null,
   currentLocation,
+  monitoringRoutes,
+  actualTravelledPath = [],
+  fitBoundsKey,
   height = 540,
   autoFitOnUpdate = true,
 }: RouteTrackingMapProps) {
@@ -241,6 +254,7 @@ export default function RouteTrackingMap({
   const playbackMarkerGroupRef = useRef<L.LayerGroup | null>(null)
   const tripRouteGroupRef = useRef<L.LayerGroup | null>(null)
   const lastFittedTripIdRef = useRef<string | null>(null)
+  const lastFitBoundsKeyRef = useRef<string | undefined>(undefined)
 
   const [mapStyle, setMapStyle] = useState<MapTileProvider>('standard')
   const [pathStyle, setPathStyle] = useState<PathStyleOption>('blue-solid')
@@ -560,6 +574,42 @@ export default function RouteTrackingMap({
       mainLine.setLatLngs([])
     }
 
+    monitoringRoutes?.forEach((route) => {
+      const coordinates = route.coordinates.filter(([latitude, longitude]) =>
+        isValidGpsCoord(latitude, longitude)
+      )
+      if (coordinates.length < 2) return
+      L.polyline(coordinates, {
+        color: route.selected ? '#2563eb' : '#94a3b8',
+        weight: route.selected ? 6 : 3,
+        opacity: route.selected ? 0.95 : 0.65,
+        dashArray: route.selected ? undefined : '7 7',
+        lineCap: 'round',
+        lineJoin: 'round',
+      }).bindTooltip(route.label).addTo(tripRoutes)
+      allTripBounds.push(...coordinates)
+    })
+
+    const actualSegments = getDrawableTrailSegments(
+      actualTravelledPath.filter((point) =>
+        isValidGpsCoord(point.latitude, point.longitude)
+      )
+    )
+    actualSegments.forEach((segment) => {
+      const coordinates = segment.map(
+        (point): L.LatLngTuple => [point.latitude, point.longitude]
+      )
+      if (coordinates.length < 2) return
+      L.polyline(coordinates, {
+        color: '#16a34a',
+        weight: 5,
+        opacity: 0.95,
+        lineCap: 'round',
+        lineJoin: 'round',
+      }).bindTooltip('Recorded GPS path').addTo(tripRoutes)
+      allTripBounds.push(...coordinates)
+    })
+
     // In-progress journey: extend live polyline to the current live coordinate
     const latLngSegments: L.LatLngTuple[][] = gpsRouteSegments.map((segment) =>
       segment.map(({ latitude, longitude }) => [latitude, longitude])
@@ -652,18 +702,25 @@ export default function RouteTrackingMap({
 
     // --- C. CURRENT LOCATION MARKER (BLUE PULSE) ---
     if (liveCoord && (routes || !isTripCompleted || !endCoord)) {
+      const liveIsCurrent = 'isCurrent' in liveCoord && liveCoord.isCurrent === true
+      const liveGpsStatus = 'gpsStatus' in liveCoord ? liveCoord.gpsStatus : null
       const currentMarker = L.marker([liveCoord.latitude, liveCoord.longitude], {
-        icon: createCurrentLocationIcon(liveCoord.heading),
+        icon: createCurrentLocationIcon(
+          liveCoord.heading,
+          liveIsCurrent ? '#dc2626' : '#64748b'
+        ),
         zIndexOffset: 1100,
       })
 
+      const liveLabel = liveIsCurrent ? 'Current Live Location' : 'Last-known GPS location (stale)'
       const popupContent = `
         <div style="font-family: inherit; font-size: 13px; line-height: 1.4; padding: 2px;">
-          <div style="font-weight: 700; color: #2563eb; margin-bottom: 4px; display: flex; align-items: center; gap: 4px;">
-            <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#2563eb;"></span>
-            Current Live Location
+          <div style="font-weight: 700; color: ${liveIsCurrent ? '#dc2626' : '#64748b'}; margin-bottom: 4px; display: flex; align-items: center; gap: 4px;">
+            <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${liveIsCurrent ? '#dc2626' : '#64748b'};"></span>
+            ${liveLabel}
           </div>
           <div><strong>Coordinates:</strong> ${liveCoord.latitude.toFixed(5)}, ${liveCoord.longitude.toFixed(5)}</div>
+          <div><strong>GPS status:</strong> ${liveGpsStatus ?? (liveIsCurrent ? 'Valid' : 'Stale / no fix')}</div>
           ${liveCoord.speed_kmh != null ? `<div><strong>Speed:</strong> ${liveCoord.speed_kmh} km/h</div>` : ''}
           ${liveCoord.heading != null ? `<div><strong>Direction:</strong> ${liveCoord.heading}°</div>` : ''}
           <div><strong>Last Updated:</strong> ${liveCoord.timestamp ? new Date(liveCoord.timestamp).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }) : 'Live'}</div>
@@ -689,8 +746,19 @@ export default function RouteTrackingMap({
     // --- E. AUTO FIT BOUNDS ---
     const tripId = trip?.id ?? 'default'
     const isNewJourney = lastFittedTripIdRef.current !== tripId
+    const shouldFitRequestedBounds = fitBoundsKey !== undefined &&
+      fitBoundsKey !== lastFitBoundsKeyRef.current
 
-    if (searchRoute && searchRoute.path.length > 0) {
+    if (shouldFitRequestedBounds) {
+      lastFitBoundsKeyRef.current = fitBoundsKey
+      const bounds = [
+        ...allTripBounds,
+        ...latLngs,
+        ...(liveCoord ? [[liveCoord.latitude, liveCoord.longitude] as L.LatLngTuple] : []),
+      ]
+      if (bounds.length === 1) map.setView(bounds[0], 15)
+      else if (bounds.length > 1) map.fitBounds(L.latLngBounds(bounds), { padding: [50, 50], maxZoom: 16 })
+    } else if (searchRoute && searchRoute.path.length > 0) {
       map.fitBounds(searchRoute.path, { padding: [40, 40] })
     } else if (routes && allTripBounds.length > 0 && autoFitOnUpdate) {
       const bounds = L.latLngBounds(allTripBounds)
@@ -705,7 +773,7 @@ export default function RouteTrackingMap({
         const bounds = L.latLngBounds(boundsTarget)
         map.fitBounds(bounds, { padding: [50, 50], maxZoom: 16 })
       }
-    } else if (liveCoord && !isTripCompleted && !isNewJourney) {
+    } else if (autoFitOnUpdate && liveCoord && !isTripCompleted && !isNewJourney) {
       map.panTo([liveCoord.latitude, liveCoord.longitude], { animate: true })
     }
   }, [
@@ -725,6 +793,10 @@ export default function RouteTrackingMap({
     searchPoints,
     routes,
     routeColor,
+    monitoringRoutes,
+    actualTravelledPath,
+    fitBoundsKey,
+    autoFitOnUpdate,
   ])
 
   // Center on Start

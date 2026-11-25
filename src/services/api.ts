@@ -24,6 +24,15 @@ const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '/api/v1').replace(/\
 const HAS_API_SERVER_PROXY = import.meta.env.VITE_API_SERVER_PROXY === 'true'
 const ACCESS_TOKEN_KEY = 'trackin360-access-token'
 
+export function getApiWebSocketUrl(path: string): string {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`
+  const url = /^https?:\/\//i.test(API_BASE_URL)
+    ? new URL(`${API_BASE_URL}${normalizedPath}`)
+    : new URL(`${API_BASE_URL}${normalizedPath}`, window.location.origin)
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  return url.toString()
+}
+
 // =============================================================================
 // TYPES — aligned to backend OpenAPI schemas
 // =============================================================================
@@ -102,6 +111,7 @@ export interface Device {
   case_number?: string | null
   custody_person_id?: number | null
   custody_person_name?: string | null
+  person_name?: string | null
   // status
   status?: string | null
   is_active?: boolean
@@ -238,8 +248,10 @@ export interface Journey {
   id?: string | number
   device_id: string | number
   wearer_name?: string | null
-  status: 'active' | 'in_progress' | 'completed' | 'ended'
+  status: 'scheduled' | 'active' | 'in_progress' | 'paused' | 'completed' | 'ended' | 'cancelled'
   start_time: string
+  scheduled_departure?: string | null
+  scheduled_arrival?: string | null
   end_time?: string | null
   start_location?: JourneyLocation | null
   end_location?: JourneyLocation | null
@@ -251,8 +263,43 @@ export interface Journey {
   point_count?: number
   route_points?: JourneyPoint[]
   points?: JourneyPoint[]
+  selected_route_id?: string | null
+  route_corridor_meters?: number | null
   created_at?: string
   updated_at?: string
+}
+
+export interface JourneyCreateRequest {
+  device_id: string
+  origin_name?: string | null
+  destination_name?: string | null
+  origin_latitude?: number | null
+  origin_longitude?: number | null
+  destination_latitude?: number | null
+  destination_longitude?: number | null
+  scheduled_departure?: string | null
+  scheduled_arrival?: string | null
+  selected_route_id?: string | null
+  route_corridor_meters?: number | null
+  status?: string | null
+}
+
+export interface RouteAlternativesRequest {
+  origin_latitude: number
+  origin_longitude: number
+  destination_latitude: number
+  destination_longitude: number
+  origin_name?: string | null
+  destination_name?: string | null
+  journey_id?: string | null
+  waypoints?: Array<{ name?: string | null; latitude: number; longitude: number }> | null
+}
+
+export interface RouteSelectRequest {
+  route_id: string
+  journey_id?: string | null
+  approved_by?: string | null
+  notes?: string | null
 }
 
 export interface StartJourneyRequest {
@@ -271,31 +318,80 @@ export interface EndJourneyRequest {
   timestamp?: string
 }
 
-/** Backend GeofenceCreate schema (note: center_latitude/longitude + radius_meters) */
+export type GeofenceShape = 'CIRCLE' | 'POLYGON'
+
+export type GeofenceCoordinates = [number, number][]
+
+/** Request schemas verified against the configured FastAPI OpenAPI document. */
 export interface GeofenceCreate {
   name: string
-  fence_type?: 'INCLUSION' | 'EXCLUSION'  // default: INCLUSION
-  center_latitude: number
-  center_longitude: number
-  radius_meters?: number                   // default: 500, min: 10
-  assigned_device_id?: string | null       // watch IMEI
-  is_active?: boolean
+  description?: string | null
+  type?: GeofenceShape
+  fence_type?: 'INCLUSION' | 'EXCLUSION'
+  center_latitude?: number | null
+  center_longitude?: number | null
+  radius_meters?: number | null
+  polygon_coordinates?: GeofenceCoordinates | null
+  active?: boolean
+  entry_alert?: boolean
+  exit_alert?: boolean
+  device_ids?: string[] | null
+  assigned_device_id?: string | null
+}
+
+export interface GeofenceUpdate extends Partial<GeofenceCreate> {
+  is_active?: boolean | null
 }
 
 export interface Geofence {
-  id: number
+  id: number | string
   name: string
   fence_type: string
-  center_latitude: number
-  center_longitude: number
+  type?: GeofenceShape | string
+  description?: string | null
+  center_latitude?: number | null
+  center_longitude?: number | null
+  polygon_coordinates?: GeofenceCoordinates | null
   // legacy aliases (some backends still return these)
-  latitude: number
-  longitude: number
+  latitude?: number | null
+  longitude?: number | null
   radius_meters?: number
   radius_m?: number
   assigned_device_id?: string | null
-  is_active: boolean
+  device_ids?: string[] | null
+  devices?: Array<string | number | Device>
+  active?: boolean
+  is_active?: boolean
+  entry_alert?: boolean
+  exit_alert?: boolean
   created_at?: string | null
+}
+
+export interface GeofenceAlertFilters {
+  status?: string
+  severity?: string
+  device_id?: string
+  geofence_id?: string | number
+  skip?: number
+  limit?: number
+}
+
+export interface GeofenceEventFilters {
+  event_type?: string
+  device_id?: string
+  skip?: number
+  limit?: number
+}
+
+export interface GeofenceAssignedDevice {
+  device_id: string
+  device_name?: string | null
+  imei?: string | null
+  id?: number | string
+}
+
+export interface AssignGeofenceDevicesRequest {
+  device_ids: string[]
 }
 
 export type FenceType = 'INCLUSION' | 'EXCLUSION'
@@ -317,6 +413,8 @@ export interface GeofenceValidateRequest {
 export interface ApiAlert {
   id: number | string
   alert_id?: string | null
+  event_id?: number | string | null
+  event_type?: string | null
   type: string
   alert_type?: string
   title?: string
@@ -347,6 +445,15 @@ export interface ApiAlert {
   resolved_at?: string | null
   resolution_notes?: string | null
   notes?: string | null
+  geofence_id?: string | number | null
+  geofence_name?: string | null
+  fence_type?: string | null
+  zone_state?: string | null
+  violation_status?: string | null
+  gps_valid?: boolean | null
+  gps_status?: string | null
+  requires_alarm?: boolean
+  acknowledged?: boolean
 }
 
 export interface DashboardStats {
@@ -711,6 +818,35 @@ export const getDevice = async (deviceId: string | number): Promise<Device> => {
   return normaliseDevice(raw, 0)
 }
 
+export interface DeviceAlertStatus {
+  device_id?: string
+  connectivity_status?: string | null
+  active_alert_count?: number
+  has_critical_alert?: boolean
+  active_alerts?: unknown[]
+  recent_alerts?: unknown[]
+  current_live_location?: {
+    latitude?: number | null
+    longitude?: number | null
+    timestamp?: string | null
+    gps_valid?: boolean | null
+  } | null
+  last_known_location?: {
+    latitude?: number | null
+    longitude?: number | null
+    location_source?: string | null
+    location_timestamp?: string | null
+    location_age_seconds?: number | null
+    location_accuracy_m?: number | null
+    location_is_stale?: boolean | null
+  } | null
+  [key: string]: unknown
+}
+
+/** Backend connection, alert, and location summary for one device. */
+export const getDeviceAlertStatus = (deviceId: string | number, signal?: AbortSignal) =>
+  request<DeviceAlertStatus>(`/devices/${encodeURIComponent(String(deviceId))}/alert-status`, { signal })
+
 export const createDevice = (payload: DeviceCreate) =>
   request<Device>('/devices', { method: 'POST', body: JSON.stringify(payload) })
 
@@ -743,6 +879,10 @@ export interface LatestGpsSnapshot {
   lastReported: LastReportedGpsLocation | null
   lastPacketReceivedAt: number | null
   noFixReported: boolean | null
+  gpsValid: boolean | null
+  locationIsCurrent: boolean | null
+  gpsStatus: string | null
+  batteryPct: number | null
 }
 
 /** Latest verified fix and a separate display-only historical location. */
@@ -799,6 +939,10 @@ export const getLatestGpsSnapshot = async (
         lastReported,
         lastPacketReceivedAt: reportMetadata.receivedAt,
         noFixReported: reportMetadata.noFixReported,
+        gpsValid: reportMetadata.gpsValid,
+        locationIsCurrent: reportMetadata.locationIsCurrent,
+        gpsStatus: reportMetadata.gpsStatus,
+        batteryPct: reportMetadata.batteryPct,
       }
     }
     const raw = selection.selected.record as Record<string, unknown>
@@ -833,6 +977,10 @@ export const getLatestGpsSnapshot = async (
       lastReported,
       lastPacketReceivedAt: reportMetadata.receivedAt,
       noFixReported: reportMetadata.noFixReported,
+      gpsValid: reportMetadata.gpsValid,
+      locationIsCurrent: reportMetadata.locationIsCurrent,
+      gpsStatus: reportMetadata.gpsStatus,
+      batteryPct: reportMetadata.batteryPct,
     }
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') {
@@ -841,16 +989,13 @@ export const getLatestGpsSnapshot = async (
         lastReported: null,
         lastPacketReceivedAt: null,
         noFixReported: null,
+        gpsValid: null,
+        locationIsCurrent: null,
+        gpsStatus: null,
+        batteryPct: null,
       }
     }
-    if (error instanceof ApiError && error.configurationError) throw error
-    console.warn('Unable to load latest GPS fix.', error)
-    return {
-      latest: null,
-      lastReported: null,
-      lastPacketReceivedAt: null,
-      noFixReported: null,
-    }
+    throw error
   }
 }
 
@@ -971,24 +1116,100 @@ export const listLocationHistory = (
 // GEOFENCES  —  /api/v1/geofences
 // =============================================================================
 
-export const listGeofences = (skip = 0, limit = 100) =>
-  request<Geofence[]>(`/geofences?skip=${skip}&limit=${limit}`)
+export interface ListGeofencesParams {
+  active?: boolean
+  device_id?: string
+  skip?: number
+  limit?: number
+}
 
-export const getGeofence = (id: number) => request<Geofence>(`/geofences/${id}`)
+function buildQueryString(values: object): string {
+  const params = new URLSearchParams()
+  const entries = Object.entries(values) as Array<[string, string | number | boolean | null | undefined]>
+  entries.forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') {
+      params.set(key, String(value))
+    }
+  })
+  const queryString = params.toString()
+  return queryString ? `?${queryString}` : ''
+}
+
+export const listGeofences = (skipOrParams: number | ListGeofencesParams = 0, limit = 100) => {
+  const params = typeof skipOrParams === 'number'
+    ? { skip: skipOrParams, limit }
+    : skipOrParams
+  return request<Geofence[]>(`/geofences${buildQueryString(params)}`)
+}
+
+export const getGeofences = (params: ListGeofencesParams = {}) => listGeofences(params)
+
+export const getGeofence = (id: number | string) =>
+  request<Geofence>(`/geofences/${encodeURIComponent(String(id))}`)
 
 export const createGeofence = (payload: GeofenceCreate) =>
   request<Geofence>('/geofences', { method: 'POST', body: JSON.stringify(payload) })
 
-export const deleteGeofence = (id: number) => request<unknown>(`/geofences/${id}`, { method: 'DELETE' })
+export const updateGeofence = (id: number | string, payload: GeofenceUpdate) =>
+  request<Geofence>(`/geofences/${encodeURIComponent(String(id))}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  })
 
-export const validateGeofencePosition = (payload: GeofenceValidateRequest) =>
-  request<unknown>('/geofences/validate-position', { method: 'POST', body: JSON.stringify(payload) })
+export const deleteGeofence = (id: number | string) =>
+  request<unknown>(`/geofences/${encodeURIComponent(String(id))}`, { method: 'DELETE' })
 
-// Legacy alias — the backend no longer has PATCH, use createGeofence or deleteGeofence
-export const updateGeofence = (_id: number, _payload: unknown) => {
-  console.warn('updateGeofence: backend does not support PATCH; delete and re-create the geofence instead.')
-  return Promise.reject(new Error('Geofence PATCH not supported — please delete and re-create.'))
-}
+export const getGeofenceDevices = (id: number | string, signal?: AbortSignal) =>
+  request<GeofenceAssignedDevice[]>(
+    `/geofences/${encodeURIComponent(String(id))}/devices`,
+    { signal }
+  )
+
+export const assignDevicesToGeofence = (id: number | string, deviceIds: string[]) =>
+  request<unknown>(`/geofences/${encodeURIComponent(String(id))}/assign-devices`, {
+    method: 'POST',
+    body: JSON.stringify({ device_ids: deviceIds } satisfies AssignGeofenceDevicesRequest),
+  })
+
+export const removeDeviceFromGeofence = (id: number | string, deviceId: string | number) =>
+  request<unknown>(
+    `/geofences/${encodeURIComponent(String(id))}/devices/${encodeURIComponent(String(deviceId))}`,
+    { method: 'DELETE' }
+  )
+
+export const getGeofenceEvents = (
+  id: number | string,
+  filters: GeofenceEventFilters = {}
+) => request<Record<string, unknown>[]>(`/geofences/${encodeURIComponent(String(id))}/events${buildQueryString(filters)}`)
+
+export const getGeofenceAlerts = (filters: GeofenceAlertFilters = {}) =>
+  request<ApiAlert[]>(`/geofences/alerts${buildQueryString(filters)}`)
+
+export const acknowledgeGeofenceAlert = (alertId: number | string, notes?: string) =>
+  request<ApiAlert>(`/geofences/alerts/${encodeURIComponent(String(alertId))}/acknowledge`, {
+    method: 'POST',
+    body: JSON.stringify({ notes: notes ?? null }),
+  })
+
+export const resolveGeofenceAlert = (alertId: number | string, notes?: string) =>
+  request<ApiAlert>(`/geofences/alerts/${encodeURIComponent(String(alertId))}/resolve`, {
+    method: 'POST',
+    body: JSON.stringify({ notes: notes ?? null }),
+  })
+
+export const validateGeofencePosition = (payload: GeofenceValidateRequest, signal?: AbortSignal) =>
+  request<unknown>('/geofences/validate-position', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    signal,
+  })
+
+/** Ask the backend to evaluate a verified current fix against assigned geofences. */
+export const evaluateDeviceGeofences = (payload: GeofenceValidateRequest, signal?: AbortSignal) =>
+  validateGeofencePosition(payload, signal)
+
+export const getDeviceGeofenceState = (payload: GeofenceValidateRequest) =>
+  evaluateDeviceGeofences(payload)
 
 // =============================================================================
 // ALERTS  —  /api/v1/alerts
@@ -1184,8 +1405,79 @@ export const testWebhook = () =>
   request<unknown>('/integrations/webhooks/test', { method: 'POST' })
 
 // =============================================================================
-// JOURNEYS  — kept for backwards compat (may need backend route if added later)
+// JOURNEYS
 // =============================================================================
+
+export const getJourneyRouteAlternatives = (body: RouteAlternativesRequest, signal?: AbortSignal) =>
+  request<unknown>('/journeys/routes/alternatives', {
+    method: 'POST',
+    body: JSON.stringify(body),
+    signal,
+  })
+
+export const createScheduledJourney = (body: JourneyCreateRequest, signal?: AbortSignal) =>
+  request<Journey>('/journeys', {
+    method: 'POST',
+    body: JSON.stringify(body),
+    signal,
+  })
+
+export const selectJourneyRoute = (
+  journeyId: string | number,
+  body: RouteSelectRequest,
+  signal?: AbortSignal
+) =>
+  request<unknown>(`/journeys/${encodeURIComponent(String(journeyId))}/route/select`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    signal,
+  })
+
+export const startScheduledJourney = (journeyId: string | number, signal?: AbortSignal) =>
+  request<Journey>(`/journeys/${encodeURIComponent(String(journeyId))}/start`, {
+    method: 'POST',
+    signal,
+  })
+
+export const listJourneys = (
+  deviceId: string | number,
+  status?: string,
+  signal?: AbortSignal
+): Promise<Journey[]> => {
+  const params = new URLSearchParams({ device_id: String(deviceId), limit: '100' })
+  if (status) params.set('status', status)
+  return request<Journey[]>(`/journeys?${params.toString()}`, { signal })
+}
+
+export const getJourneyLivePosition = (journeyId: string | number, signal?: AbortSignal) =>
+  request<unknown>(`/journeys/${encodeURIComponent(String(journeyId))}/live`, { signal })
+
+export const getJourneyTravelledPath = (journeyId: string | number, signal?: AbortSignal) =>
+  request<unknown>(`/journeys/${encodeURIComponent(String(journeyId))}/path`, { signal })
+
+export const getJourneyApprovedRoute = (journeyId: string | number, signal?: AbortSignal) =>
+  request<unknown>(`/journeys/${encodeURIComponent(String(journeyId))}/route`, { signal })
+
+export const getJourneyAlerts = (journeyId: string | number, signal?: AbortSignal) =>
+  request<unknown[]>(`/journeys/${encodeURIComponent(String(journeyId))}/alerts`, { signal })
+
+export const pauseJourney = (journeyId: string | number, signal?: AbortSignal) =>
+  request<Journey>(`/journeys/${encodeURIComponent(String(journeyId))}/pause`, {
+    method: 'POST',
+    signal,
+  })
+
+export const completeJourney = (journeyId: string | number, signal?: AbortSignal) =>
+  request<Journey>(`/journeys/${encodeURIComponent(String(journeyId))}/complete`, {
+    method: 'POST',
+    signal,
+  })
+
+export const cancelJourney = (journeyId: string | number, signal?: AbortSignal) =>
+  request<Journey>(`/journeys/${encodeURIComponent(String(journeyId))}/cancel`, {
+    method: 'POST',
+    signal,
+  })
 
 export const startJourney = async (body: StartJourneyRequest): Promise<Journey> =>
   request<Journey>('/journeys/start', { method: 'POST', body: JSON.stringify(body) })
@@ -1193,8 +1485,18 @@ export const startJourney = async (body: StartJourneyRequest): Promise<Journey> 
 export const endJourney = async (body: EndJourneyRequest): Promise<Journey> =>
   request<Journey>('/journeys/end', { method: 'POST', body: JSON.stringify(body) })
 
-export const getActiveJourney = async (deviceId: string | number): Promise<Journey | null> =>
-  request<Journey | null>(`/journeys/active/${deviceId}`).catch(() => null)
+export const getActiveJourney = async (deviceId: string | number): Promise<Journey | null> => {
+  const result = await request<Journey | { active: boolean; journey: Journey | null } | null>(
+    `/journeys/active/${encodeURIComponent(String(deviceId))}`,
+  )
+  if (result === null) return null
+  if ('active' in result) {
+    if (result.active === false) return null
+    if (result.journey == null) throw new Error('Invalid active journey response: missing journey record.')
+    return result.journey
+  }
+  return result
+}
 
 export const getDeviceJourneys = async (deviceId: string | number): Promise<Journey[]> => {
   const res = await request<Journey[] | { items: Journey[] }>(`/journeys/device/${deviceId}`).catch(() => [])

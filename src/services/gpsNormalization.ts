@@ -28,6 +28,10 @@ export interface LastReportedGpsLocation {
 export interface LatestGpsReportMetadata {
   receivedAt: number | null
   noFixReported: boolean | null
+  gpsValid: boolean | null
+  locationIsCurrent: boolean | null
+  gpsStatus: string | null
+  batteryPct: number | null
 }
 
 export interface VerifiedHistoryGpsLocation {
@@ -523,6 +527,18 @@ export function normalizeLatestGpsReportMetadata(value: unknown): LatestGpsRepor
   const latestLocation = asRecord(latest?.location) ??
     asRecord(latest?.location_on_demand) ??
     asRecord(latest?.sos_alarm)
+  const booleanValue = (value: unknown): boolean | null => {
+    if (typeof value === 'boolean') return value
+    const normalized = String(value ?? '').trim().toUpperCase()
+    if (['1', 'TRUE', 'YES', 'VALID', 'A', 'ACTIVE'].includes(normalized)) return true
+    if (['0', 'FALSE', 'NO', 'INVALID', 'V', 'VOID'].includes(normalized)) return false
+    return null
+  }
+  const numericValue = (value: unknown): number | null => {
+    if (value == null || value === '') return null
+    const number = Number(value)
+    return Number.isFinite(number) ? number : null
+  }
   const receivedAt = parseGpsTimestamp(firstValue(
     record?.last_packet_received,
     record?.last_seen,
@@ -544,7 +560,37 @@ export function normalizeLatestGpsReportMetadata(value: unknown): LatestGpsRepor
       ? false
       : null
 
-  return { receivedAt, noFixReported }
+  return {
+    receivedAt,
+    noFixReported,
+    gpsValid: booleanValue(firstValue(
+      record?.gps_valid,
+      latest?.gps_valid,
+      latestLocation?.gps_valid
+    )),
+    locationIsCurrent: booleanValue(firstValue(
+      record?.location_is_current,
+      latest?.location_is_current,
+      latestLocation?.location_is_current
+    )),
+    gpsStatus: String(firstValue(
+      record?.gps_status,
+      latest?.gps_status,
+      latestLocation?.gps_status,
+      latestLocation?.status
+    ) ?? '').trim() || null,
+    batteryPct: numericValue(firstValue(
+      record?.battery_pct,
+      record?.battery_percent,
+      record?.battery,
+      latest?.battery_pct,
+      latest?.battery_percent,
+      latest?.battery,
+      latestLocation?.battery_pct,
+      latestLocation?.battery_percent,
+      latestLocation?.battery
+    )),
+  }
 }
 
 export function selectNewestLastReportedGpsLocation(

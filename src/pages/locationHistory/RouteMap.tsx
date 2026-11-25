@@ -39,17 +39,109 @@ export interface OsrmResponse {
   }[];
 }
 
-// Free geocoding (OpenStreetMap Nominatim): address -> { lat, lng }
-export async function geocode(query: string): Promise<Coords> {
-  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(query)}`;
-  const res = await fetch(url, {
-    headers: {
-      'Accept-Language': 'en',
-    },
-  });
-  const data: NominatimResult[] = await res.json();
-  if (!data.length) throw new Error(`Could not find "${query}"`);
-  return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+const OLC_ALPHABET = "23456789CFGHJMPQRVWX";
+
+export function decodeFullPlusCode(code: string): Coords | null {
+  const cleaned = code.replace("+", "").toUpperCase();
+  if (cleaned.length < 8) return null;
+  let lat = -90.0;
+  let lng = -180.0;
+  let latRes = 20.0;
+  let lngRes = 20.0;
+  for (let i = 0; i < Math.min(10, cleaned.length); i += 2) {
+    const latVal = OLC_ALPHABET.indexOf(cleaned[i]);
+    const lngVal = OLC_ALPHABET.indexOf(cleaned[i + 1]);
+    if (latVal === -1 || lngVal === -1) return null;
+    latRes /= 20.0;
+    lngRes /= 20.0;
+    lat += latVal * latRes * 20.0;
+    lng += lngVal * lngRes * 20.0;
+  }
+  return { lat: +(lat + latRes * 10.0).toFixed(6), lng: +(lng + lngRes * 10.0).toFixed(6) };
+}
+
+export function decodeShortPlusCode(shortCode: string, refLat = 17.442, refLng = 78.384): Coords | null {
+  const latBlock = Math.floor((refLat + 90.0) / 20.0);
+  const latSub = Math.floor(((refLat + 90.0) % 20.0) / 1.0);
+  const lngBlock = Math.floor((refLng + 180.0) / 20.0);
+  const lngSub = Math.floor(((refLng + 180.0) % 20.0) / 1.0);
+  if (latBlock < 0 || latBlock >= 20 || lngBlock < 0 || lngBlock >= 20) return null;
+  const prefix = "" + OLC_ALPHABET[latBlock] + OLC_ALPHABET[lngBlock] + OLC_ALPHABET[latSub] + OLC_ALPHABET[lngSub];
+  return decodeFullPlusCode(prefix + shortCode);
+}
+
+// Resilient geocoding supporting Google Plus Codes, GPS coordinates, and Nominatim addresses
+export async function geocode(rawQuery: string, refLat = 17.442, refLng = 78.384): Promise<Coords> {
+  const query = (rawQuery || "").trim();
+  if (!query) throw new Error("Please enter a location, Plus Code, or GPS coordinates.");
+
+  // 1. Direct coordinate match: "17.442059, 78.384363" or "lat: 17.442059, lon: 78.384363"
+  const coordMatch = query.match(/(?:lat[:=\s]*)?(-?\d+\.\d+)[,\s]+(?:lon[:=\s]*|lng[:=\s]*)?(-?\d+\.\d+)/i);
+  if (coordMatch) {
+    const lat = parseFloat(coordMatch[1]);
+    const lng = parseFloat(coordMatch[2]);
+    if (!isNaN(lat) && !isNaN(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+      return { lat, lng };
+    }
+  }
+
+  // 2. Full Plus Code: e.g. "7J9WC9RM+PP5"
+  const fullPlusMatch = query.match(/\b([23456789CFGHJMPQRVWX]{8}\+[23456789CFGHJMPQRVWX]{2,4})\b/i);
+  if (fullPlusMatch) {
+    const decoded = decodeFullPlusCode(fullPlusMatch[1]);
+    if (decoded) return decoded;
+  }
+
+  // 3. Short Plus Code: e.g. "C9RM+PP5"
+  const shortPlusMatch = query.match(/\b([23456789CFGHJMPQRVWX]{4,7}\+[23456789CFGHJMPQRVWX]{1,4})\b/i);
+  if (shortPlusMatch) {
+    const decoded = decodeShortPlusCode(shortPlusMatch[1], refLat, refLng);
+    if (decoded) return decoded;
+  }
+
+  // 4. Address Geocoding via Nominatim with fallback relaxation
+  const cleaned = query
+    .replace(/\b[23456789CFGHJMPQRVWX]{4,8}\+[23456789CFGHJMPQRVWX]{0,4}\b[,\s]*/gi, "")
+    .trim();
+
+  const candidates: string[] = [];
+  if (cleaned) candidates.push(cleaned);
+
+  // Without postal code
+  const noPincode = cleaned.replace(/\b\d{5,6}\b/g, "").replace(/,\s*,/g, ",").trim();
+  if (noPincode && !candidates.includes(noPincode)) candidates.push(noPincode);
+
+  // Address parts relaxation
+  const parts = cleaned.split(",").map(p => p.trim()).filter(Boolean);
+  if (parts.length >= 3) {
+    const relaxed1 = `${parts[0]}, ${parts[parts.length - 1]}`;
+    if (!candidates.includes(relaxed1)) candidates.push(relaxed1);
+    const relaxed2 = `${parts[1]}, ${parts[parts.length - 1]}`;
+    if (!candidates.includes(relaxed2)) candidates.push(relaxed2);
+    const relaxed3 = parts.slice(1).join(", ");
+    if (!candidates.includes(relaxed3)) candidates.push(relaxed3);
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(candidate)}`;
+      const res = await fetch(url, {
+        headers: {
+          "Accept-Language": "en",
+        },
+      });
+      if (res.ok) {
+        const data: NominatimResult[] = await res.json();
+        if (data && data.length > 0 && data[0].lat && data[0].lon) {
+          return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+        }
+      }
+    } catch {
+      // Continue to next candidate
+    }
+  }
+
+  throw new Error(`Could not find "${query}". Please verify address or enter latitude, longitude directly.`);
 }
 
 // Free routing (OSRM public demo server): two points -> path + distance + time

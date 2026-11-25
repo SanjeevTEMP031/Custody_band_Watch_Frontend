@@ -30,8 +30,8 @@ export const DEFAULT_GPS_TRAIL_FILTERS: GpsTrailFilters = {
 }
 
 // Fallback history grouping is only for records without a persisted journey_id.
-// A 10-minute inactivity boundary tolerates short GPS/network interruptions while splitting distinct trips.
-export const DEFAULT_GPS_JOURNEY_INACTIVITY_MS = 10 * 60_000
+// Group by gaps between fixes, not total journey duration.
+export const DEFAULT_GPS_JOURNEY_INACTIVITY_MS = 30 * 60_000
 
 export interface GpsTrailAnalysis<T extends GpsTrailPoint> {
   segments: T[][]
